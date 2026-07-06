@@ -1,0 +1,5 @@
+/* Display names for the input source and its input modes (keys are
+   TISInputSourceIDs). Without these the input menu shows the raw IDs. */
+"dev.togatoga.inputmethod.Kashiko" = "Kashiko";
+"dev.togatoga.inputmethod.Kashiko.Japanese" = "Hiragana (Kashiko)";
+"dev.togatoga.inputmethod.Kashiko.Roman" = "Alphanumeric (Kashiko)";

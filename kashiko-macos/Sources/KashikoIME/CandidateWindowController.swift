@@ -1,0 +1,297 @@
+import Cocoa
+
+/// Custom candidate window (borderless non-activating NSPanel).
+///
+/// The engine pre-paginates: `show` receives only the visible page plus
+/// page metadata, so this controller just renders rows. An optional aux
+/// line (reading hint / model info from the engine) is shown as a footer.
+class CandidateWindowController {
+    // Visual scale of the panel. Candidate rows use a larger type size
+    // than the footers (page indicator / aux line), matching the system
+    // Japanese IME's proportions.
+    private static let candidateFontSize: CGFloat = 18
+    private static let footerFontSize: CGFloat = 13
+    private static let minPanelWidth: CGFloat = 160
+    /// Hard cap on panel width so a long candidate cannot stretch the window
+    /// across (or off) the screen. Fallback used when no screen is available.
+    private static let maxPanelWidth: CGFloat = 640
+
+    private let panel: NSPanel
+    private let stackView: NSStackView
+    private var rowViews: [NSView] = []
+    private var auxText: String?
+    private var hintText: String?
+
+    private struct PageState {
+        let candidates: [CandidateItem]
+        let cursor: Int
+        let page: Int
+        let totalPages: Int
+    }
+    private var pageState: PageState?
+    var liveMode: Bool = false
+
+    init() {
+        panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 100),
+            styleMask: [.nonactivatingPanel, .borderless],
+            backing: .buffered,
+            defer: true
+        )
+        panel.level = .popUpMenu
+        panel.hidesOnDeactivate = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.ignoresMouseEvents = true
+        panel.contentView?.wantsLayer = true
+        panel.contentView?.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        panel.contentView?.layer?.cornerRadius = 16
+        panel.contentView?.layer?.masksToBounds = true
+
+        stackView = NSStackView()
+        stackView.orientation = .vertical
+        stackView.alignment = .leading
+        stackView.spacing = 2
+        stackView.edgeInsets = NSEdgeInsets(top: 6, left: 12, bottom: 6, right: 12)
+        stackView.translatesAutoresizingMaskIntoConstraints = false
+
+        panel.contentView?.addSubview(stackView)
+        if let contentView = panel.contentView {
+            NSLayoutConstraint.activate([
+                stackView.topAnchor.constraint(equalTo: contentView.topAnchor),
+                stackView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+                stackView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+                // No bottom constraint: let stackView height be driven by its content
+            ])
+        }
+    }
+
+    var isVisible: Bool { panel.isVisible }
+
+    /// `cursorRect: nil` reuses the rect from the previous `show` — the
+    /// caller can skip its (synchronous, per-keystroke) client IPC while
+    /// the panel is already on screen, since the composition anchor
+    /// doesn't move mid-composition.
+    func show(
+        candidates: [CandidateItem], cursor: Int, page: Int, totalPages: Int, cursorRect: NSRect?, liveMode: Bool = false
+    ) {
+        self.liveMode = liveMode
+        self.hintText = nil
+        pageState = PageState(
+            candidates: candidates, cursor: cursor, page: page, totalPages: totalPages)
+        render(cursorRect: cursorRect)
+    }
+
+    /// Show a minimal hint-only panel (for backspace cursor context when there are no candidates)
+    func showHintOnly(_ text: String, cursorRect: NSRect?) {
+        pageState = PageState(candidates: [], cursor: 0, page: 0, totalPages: 1)
+        self.hintText = text
+        self.auxText = nil
+        renderHintOnly(cursorRect: cursorRect)
+    }
+
+    /// Update the aux footer; re-renders in place if the window is visible.
+    /// Pass `deferRender: true` when a `show`/`hide` follows in the same
+    /// action batch, so the panel is rendered once per batch instead of
+    /// once for the aux change and again for the candidates.
+    func setAux(_ text: String?, deferRender: Bool = false) {
+        auxText = text
+        if !deferRender, panel.isVisible, pageState != nil {
+            render(cursorRect: nil)
+        }
+    }
+
+    func hide() {
+        pageState = nil
+        hintText = nil
+        panel.orderOut(nil)
+    }
+
+    private func render(cursorRect: NSRect?) {
+        clearRows()
+        guard let state = pageState, !state.candidates.isEmpty else {
+            hide()
+            return
+        }
+
+        for (index, candidate) in state.candidates.enumerated() {
+            addCandidateRow(candidate, number: liveMode ? nil : index + 1, selected: index == state.cursor)
+        }
+        if !liveMode && state.totalPages > 1 {
+            addFooterLabel("[\(state.page + 1)/\(state.totalPages)]")
+        }
+        if let aux = auxText, !aux.isEmpty {
+            if liveMode {
+                addHintLabel(aux)
+            } else {
+                addFooterLabel(aux)
+            }
+        }
+
+        positionPanel(cursorRect: cursorRect)
+    }
+
+    /// Render a hint-only panel (just the cursor context text, no candidates)
+    private func renderHintOnly(cursorRect: NSRect?) {
+        clearRows()
+        guard let hint = hintText, !hint.isEmpty else {
+            panel.orderOut(nil)
+            return
+        }
+        addHintLabel(hint)
+        positionPanel(cursorRect: cursorRect)
+    }
+
+    private func clearRows() {
+        for view in rowViews {
+            stackView.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        rowViews.removeAll()
+    }
+
+    private func addCandidateRow(_ candidate: CandidateItem, number: Int?, selected: Bool) {
+        let displayText: String
+        if let num = number {
+            displayText = "\(num). \(candidate.text)"
+        } else {
+            displayText = candidate.text
+        }
+        // A small negative baseline offset nudges the glyphs themselves down
+        // within the label's frame. Container padding alone (below) can't
+        // fully center CJK text vertically — the font's line-height reserves
+        // descent space the glyphs never use, so text still sits high even
+        // with zero bottom padding.
+        let text = NSMutableAttributedString(
+            string: displayText,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: Self.candidateFontSize),
+                .foregroundColor: selected ? NSColor.white : NSColor.labelColor,
+                .baselineOffset: -1.5,
+            ]
+        )
+        if let description = candidate.description {
+            text.append(
+                NSAttributedString(
+                    string: "  \(description)",
+                    attributes: [
+                        .font: NSFont.systemFont(ofSize: Self.footerFontSize),
+                        .foregroundColor: selected
+                            ? NSColor.white.withAlphaComponent(0.8)
+                            : NSColor.secondaryLabelColor,
+                        .baselineOffset: -1.5,
+                    ]
+                ))
+        }
+
+        let label = NSTextField(labelWithAttributedString: text)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        // Keep each candidate on one line; long candidates truncate rather
+        // than wrap (which would inflate the panel height/width).
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.cell?.usesSingleLineMode = true
+        label.backgroundColor = .clear
+        label.drawsBackground = false
+
+        // The highlight is drawn on a container view (not the text field
+        // itself) with explicit symmetric padding, so the selected text sits
+        // exactly where the unselected text does — NSTextField's own
+        // drawsBackground fill has asymmetric internal cell padding that
+        // makes the text look shifted within the highlight.
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.wantsLayer = true
+        container.layer?.backgroundColor =
+            (selected ? NSColor.selectedContentBackgroundColor : .clear).cgColor
+        container.layer?.cornerRadius = 4
+        container.addSubview(label)
+        // Top/bottom padding is intentionally asymmetric (not 2/2): CJK glyphs
+        // reserve little space below the baseline compared to Latin descenders,
+        // so a symmetric split leaves visible text sitting high inside the
+        // highlight. Shifting more padding to the top (same total, so row
+        // height is unaffected) pulls the text down to the highlight's center.
+        NSLayoutConstraint.activate([
+            label.topAnchor.constraint(equalTo: container.topAnchor, constant: 4),
+            label.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: 0),
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 4),
+            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -4),
+        ])
+
+        stackView.addArrangedSubview(container)
+        rowViews.append(container)
+    }
+
+    private func addFooterLabel(_ text: String) {
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.systemFont(ofSize: Self.footerFontSize)
+        label.textColor = NSColor.secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        stackView.addArrangedSubview(label)
+        rowViews.append(label)
+    }
+
+    /// Compact hint label used in live mode to show cursor context during backspace
+    private func addHintLabel(_ text: String) {
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        label.textColor = NSColor.secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        stackView.addArrangedSubview(label)
+        rowViews.append(label)
+    }
+
+    private var lastCursorRect: NSRect = .zero
+
+    private func positionPanel(cursorRect: NSRect?) {
+        if let rect = cursorRect {
+            lastCursorRect = rect
+        }
+        let cursorRect = lastCursorRect
+
+        stackView.layoutSubtreeIfNeeded()
+        let contentSize = stackView.fittingSize
+        let screen = NSScreen.main
+        // Cap width at 80% of the screen (or the fallback constant) so a long
+        // candidate cannot stretch the panel across the display.
+        let widthCap = screen.map { $0.visibleFrame.width * 0.8 } ?? Self.maxPanelWidth
+        let panelWidth = min(max(contentSize.width + 16, Self.minPanelWidth), widthCap)
+        let panelHeight = contentSize.height + 8
+
+        guard cursorRect != .zero else {
+            panel.setFrame(
+                NSRect(x: 100, y: 100, width: panelWidth, height: panelHeight), display: true)
+            panel.orderFront(nil)
+            return
+        }
+
+        // Flip above the cursor when the panel would fall off the bottom of
+        // the screen.
+        let showAbove: Bool
+        if let screen = screen {
+            showAbove = cursorRect.origin.y - panelHeight < screen.visibleFrame.origin.y
+        } else {
+            showAbove = false
+        }
+
+        let originY: CGFloat
+        if showAbove {
+            originY = cursorRect.origin.y + cursorRect.size.height
+        } else {
+            originY = cursorRect.origin.y - panelHeight
+        }
+
+        // Clamp X so the panel stays fully on-screen even for wide candidates.
+        var originX = cursorRect.origin.x
+        if let screen = screen {
+            let frame = screen.visibleFrame
+            originX = min(originX, frame.maxX - panelWidth)
+            originX = max(originX, frame.minX)
+        }
+
+        panel.setFrame(
+            NSRect(x: originX, y: originY, width: panelWidth, height: panelHeight),
+            display: true)
+        panel.orderFront(nil)
+    }
+}

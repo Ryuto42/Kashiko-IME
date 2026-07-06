@@ -1,0 +1,88 @@
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Rust
+target/
+**/*.rs.bk
+
+# Swift / macOS App
+.build/
+build/
+out/
+kashiko-macos/.build/
+kashiko-macos/out/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata/
+*.xccheckout
+*.moved-aside
+DerivedData/
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.claude/
+*.xcsettings
+
+# Python
+__pycache__/
+*.pyc
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.gch
+*.pch
+
+# User Data, Dictionaries & Privacy (Security)
+# !! CRITICAL: Never commit user dictionaries, learning data, or language models !!
+*.bin
+*.gguf
+*.tgz
+*.cache
+user_dict.txt
+user_dictionary/
+learning_cache/
+custom_dict/
+private/
+secret/
+*.log
+
+# Except for tracked static data
+data/
+!kashiko-engine/data/
+
+# Secrets / Environment / Security
+.env
+.env.*
+*.pem
+*.key
+secrets.json
+credentials.json
+config.local.json
+
+# Prerequisites
+*.d
+*.json
+.fake
