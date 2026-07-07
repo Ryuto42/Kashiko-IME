@@ -39,10 +39,13 @@ impl InputMethodEngine {
                 return result;
             }
 
+            // Pause live conversion so the preedit shows the raw romaji/kana
+            // buffer instead of a stale kanji guess while backspacing.
+            self.live.text.clear();
             let preedit = self.set_composing_state();
             return EngineResult::consumed()
                 .with_action(EngineAction::UpdatePreedit(preedit))
-                .with_action(EngineAction::UpdateAuxText(self.format_aux_composing()));
+                .with_action(EngineAction::HideAuxText);
         }
 
         // Remove character before cursor from composed_hiragana
@@ -73,17 +76,7 @@ impl InputMethodEngine {
             return result;
         }
 
-        // Get the result then force-inject the cursor hint into aux text
-        // regardless of which code path refresh_input_state() took.
-        let mut result = self.refresh_input_state();
-        let aux = self.format_aux_composing();
-        if !aux.is_empty() {
-            result.actions.retain(|a| {
-                !matches!(a, EngineAction::UpdateAuxText(_) | EngineAction::HideAuxText)
-            });
-            result.actions.push(EngineAction::UpdateAuxText(aux));
-        }
-        result
+        self.refresh_input_state()
     }
 
 

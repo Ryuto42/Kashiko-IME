@@ -142,56 +142,9 @@ impl InputMethodEngine {
         }
     }
 
-    /// Build the backspace cursor-position hint string.
-    /// Shows up to 6 chars total centered on the cursor, with ▏ as the cursor marker.
-    fn build_backspace_hint(&self) -> String {
-        if !self.last_key_was_backspace || self.input_buf.text.is_empty() {
-            return String::new();
-        }
-        let chars: Vec<char> = self.input_buf.text.chars().collect();
-        let total = chars.len();
-        let pos = self.input_buf.cursor_pos.min(total);
-
-        // Target 2 chars before and 3 after the cursor (6 total). When one
-        // side runs out of characters near a buffer edge, the leftover
-        // capacity slides to the other side so the window still shows up to
-        // 6 chars whenever the buffer has that many.
-        const BEFORE_TARGET: usize = 2;
-        const AFTER_TARGET: usize = 3;
-        let mut before = pos.min(BEFORE_TARGET);
-        let mut after = (total - pos).min(AFTER_TARGET);
-        let mut remaining = (BEFORE_TARGET + AFTER_TARGET) - before - after;
-        let add_before = remaining.min(pos - before);
-        before += add_before;
-        remaining -= add_before;
-        after += remaining.min(total - pos - after);
-        let start = pos - before;
-        let end = (pos + after).min(total);
-
-        let cursor_offset = pos - start;
-        let mut marked = String::new();
-        for (i, ch) in chars[start..end].iter().enumerate() {
-            if i == cursor_offset {
-                marked.push('▏');
-            }
-            marked.push(*ch);
-        }
-        if cursor_offset == end - start {
-            marked.push('▏');
-        }
-
-        // Append any pending romaji buffer (unconverted chars like 'kygh') after cursor
-        let romaji_buf = self.converters.romaji.buffer();
-        if !romaji_buf.is_empty() {
-            marked.push_str(romaji_buf);
-        }
-
-        marked
-    }
-
     /// Format aux text for composing input mode
     pub(super) fn format_aux_composing(&self) -> String {
-        self.build_backspace_hint()
+        String::new()
     }
 
     /// Get token count for a reading (returns None if converter not initialized)
@@ -228,7 +181,7 @@ impl InputMethodEngine {
     /// Note: token count is not shown here to avoid performance overhead on every keystroke
     /// Timing shows inference_ms/process_key_ms (process_key_ms is from previous keystroke)
     pub(super) fn format_aux_suggest(&self, _reading: &str) -> String {
-        self.build_backspace_hint()
+        String::new()
     }
 
     /// Truncate context to safe size for API calls

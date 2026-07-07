@@ -114,12 +114,9 @@ class KashikoInputController: IMKInputController {
             }
         }
 
-        // Extract aux text from this batch for hint-only detection
-        var batchAuxText: String? = nil
         for action in actions {
             switch action {
             case .updateAux(let text):
-                batchAuxText = text
                 Self.candidateWindow.setAux(text, deferRender: updatesCandidates)
             case .hideAux:
                 Self.candidateWindow.setAux(nil, deferRender: updatesCandidates)
@@ -127,8 +124,6 @@ class KashikoInputController: IMKInputController {
                 break
             }
         }
-
-        let hasShowCandidates = actions.contains { if case .showCandidates = $0 { return true }; return false }
 
         for action in actions {
             switch action {
@@ -148,35 +143,17 @@ class KashikoInputController: IMKInputController {
                 // where composition started instead of where the caret now is.
                 var lineHeightRect = NSRect.zero
                 client.attributes(forCharacterIndex: 0, lineHeightRectangle: &lineHeightRect)
-                let cursorRect: NSRect? = lineHeightRect
-                // In live mode, if candidates is empty but we have a backspace hint,
-                // show hint-only instead of hiding (ShowCandidates([]) would normally call hide())
-                if candidates.isEmpty && !isConversionMode,
-                   let hint = batchAuxText, !hint.isEmpty {
-                    Self.candidateWindow.showHintOnly(hint, cursorRect: cursorRect)
-                } else {
-                    Self.candidateWindow.show(
-                        candidates: candidates,
-                        cursor: cursor,
-                        page: page,
-                        totalPages: totalPages,
-                        cursorRect: cursorRect,
-                        liveMode: !isConversionMode
-                    )
-                }
+                Self.candidateWindow.show(
+                    candidates: candidates,
+                    cursor: cursor,
+                    page: page,
+                    totalPages: totalPages,
+                    cursorRect: lineHeightRect,
+                    liveMode: !isConversionMode
+                )
 
             case .hideCandidates:
-                // If this batch also carries a non-empty aux hint and we're in live mode,
-                // show the hint-only panel instead of hiding entirely.
-                if !hasShowCandidates,
-                   !isConversionMode,
-                   let hint = batchAuxText, !hint.isEmpty {
-                    var lineHeightRect = NSRect.zero
-                    client.attributes(forCharacterIndex: 0, lineHeightRectangle: &lineHeightRect)
-                    Self.candidateWindow.showHintOnly(hint, cursorRect: lineHeightRect)
-                } else {
-                    Self.candidateWindow.hide()
-                }
+                Self.candidateWindow.hide()
 
             case .updateAux, .hideAux:
                 break  // applied above

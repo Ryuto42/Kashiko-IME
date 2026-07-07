@@ -38,6 +38,7 @@ DerivedData/
 *.swp
 *.swo
 .claude/
+CLAUDE.md
 *.xcsettings
 
 # Python

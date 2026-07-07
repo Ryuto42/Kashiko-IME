@@ -67,6 +67,7 @@ impl InputMethodEngine {
         if self.input_mode == InputMode::Alphabet
             && !self.live.text.is_empty()
             && !kashiko_engine::contains_kana(&self.input_buf.text)
+            && !self.last_key_was_backspace
         {
             let preedit = self.set_composing_state();
             let aux = self.format_aux_composing();
@@ -95,6 +96,22 @@ impl InputMethodEngine {
             self.chunks.clear();
             None
         };
+
+        // Backspace pauses live conversion display: `chunked_auto_suggest`
+        // above still ran (so the chunk cache stays correctly partitioned
+        // for when typing resumes), but its result is discarded here rather
+        // than shown — the user sees the raw hiragana/romaji buffer instead
+        // of a re-guessed kanji conversion while backspacing. Live
+        // conversion resumes on the next non-backspace key, since that path
+        // clears `last_key_was_backspace` before calling this function.
+        if self.last_key_was_backspace {
+            self.live.text.clear();
+            let preedit = self.set_composing_state();
+            return EngineResult::consumed()
+                .with_action(EngineAction::UpdatePreedit(preedit))
+                .with_action(EngineAction::HideCandidates)
+                .with_action(EngineAction::HideAuxText);
+        }
 
         let Some((candidates, _reading)) = candidates else {
             // No kanji-conversion suggestion. Still surface learning/dict/

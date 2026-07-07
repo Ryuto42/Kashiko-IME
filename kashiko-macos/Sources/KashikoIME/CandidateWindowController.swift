@@ -20,7 +20,6 @@ class CandidateWindowController {
     private let stackView: NSStackView
     private var rowViews: [NSView] = []
     private var auxText: String?
-    private var hintText: String?
 
     private struct PageState {
         let candidates: [CandidateItem]
@@ -76,18 +75,9 @@ class CandidateWindowController {
         candidates: [CandidateItem], cursor: Int, page: Int, totalPages: Int, cursorRect: NSRect?, liveMode: Bool = false
     ) {
         self.liveMode = liveMode
-        self.hintText = nil
         pageState = PageState(
             candidates: candidates, cursor: cursor, page: page, totalPages: totalPages)
         render(cursorRect: cursorRect)
-    }
-
-    /// Show a minimal hint-only panel (for backspace cursor context when there are no candidates)
-    func showHintOnly(_ text: String, cursorRect: NSRect?) {
-        pageState = PageState(candidates: [], cursor: 0, page: 0, totalPages: 1)
-        self.hintText = text
-        self.auxText = nil
-        renderHintOnly(cursorRect: cursorRect)
     }
 
     /// Update the aux footer; re-renders in place if the window is visible.
@@ -103,7 +93,6 @@ class CandidateWindowController {
 
     func hide() {
         pageState = nil
-        hintText = nil
         panel.orderOut(nil)
     }
 
@@ -121,24 +110,9 @@ class CandidateWindowController {
             addFooterLabel("[\(state.page + 1)/\(state.totalPages)]")
         }
         if let aux = auxText, !aux.isEmpty {
-            if liveMode {
-                addHintLabel(aux)
-            } else {
-                addFooterLabel(aux)
-            }
+            addFooterLabel(aux)
         }
 
-        positionPanel(cursorRect: cursorRect)
-    }
-
-    /// Render a hint-only panel (just the cursor context text, no candidates)
-    private func renderHintOnly(cursorRect: NSRect?) {
-        clearRows()
-        guard let hint = hintText, !hint.isEmpty else {
-            panel.orderOut(nil)
-            return
-        }
-        addHintLabel(hint)
         positionPanel(cursorRect: cursorRect)
     }
 
@@ -225,16 +199,6 @@ class CandidateWindowController {
     private func addFooterLabel(_ text: String) {
         let label = NSTextField(labelWithString: text)
         label.font = NSFont.systemFont(ofSize: Self.footerFontSize)
-        label.textColor = NSColor.secondaryLabelColor
-        label.translatesAutoresizingMaskIntoConstraints = false
-        stackView.addArrangedSubview(label)
-        rowViews.append(label)
-    }
-
-    /// Compact hint label used in live mode to show cursor context during backspace
-    private func addHintLabel(_ text: String) {
-        let label = NSTextField(labelWithString: text)
-        label.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
         label.textColor = NSColor.secondaryLabelColor
         label.translatesAutoresizingMaskIntoConstraints = false
         stackView.addArrangedSubview(label)
