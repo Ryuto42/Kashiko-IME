@@ -180,6 +180,14 @@ impl InputMethodEngine {
     ///
     /// `skip_learning` is set by the Tab path to omit learning-cache
     /// candidates (Space/Down keep the default learning-included behavior).
+    ///
+    /// `initial_selection`: `-1` moves to the previous candidate (Up), `1`
+    /// means "advance past a live-conversion duplicate" (Space/Down) — if
+    /// the top candidate is exactly the text live conversion was already
+    /// showing, the user has already seen it, so land on the second
+    /// candidate instead of re-selecting the one they just looked at. `0`
+    /// (Tab, and re-entry from `resize_conversion`) always keeps the first
+    /// candidate selected.
     pub(super) fn start_conversion(
         &mut self,
         skip_learning: bool,
@@ -242,7 +250,7 @@ impl InputMethodEngine {
         {
             candidates.insert(
                 0,
-                AnnotatedCandidate::new(prev_suggest_text, CandidateSource::Model),
+                AnnotatedCandidate::new(prev_suggest_text.clone(), CandidateSource::Model),
             );
         }
 
@@ -279,7 +287,13 @@ impl InputMethodEngine {
         );
 
         if initial_selection == 1 {
-            candidate_list.move_next();
+            let top_is_live_duplicate = candidate_list
+                .candidates()
+                .first()
+                .is_some_and(|c| !prev_suggest_text.is_empty() && c.text == prev_suggest_text);
+            if top_is_live_duplicate {
+                candidate_list.move_next();
+            }
         } else if initial_selection == -1 {
             candidate_list.move_prev();
         }

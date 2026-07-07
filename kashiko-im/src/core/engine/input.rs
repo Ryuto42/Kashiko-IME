@@ -337,7 +337,10 @@ impl InputMethodEngine {
             // can escape stale or unwanted learned entries (mozc binds Tab to a
             // different conversion path — PredictAndConvert — in the same spirit).
             Keysym::TAB => self.start_conversion(true, None, 0),
-            Keysym::SPACE | Keysym::DOWN => self.start_conversion(false, None, 0),
+            // `1` here means "advance past a live-conversion duplicate" (see
+            // `start_conversion`'s doc comment) rather than an unconditional
+            // move to the next candidate.
+            Keysym::SPACE | Keysym::DOWN => self.start_conversion(false, None, 1),
             Keysym::UP => self.start_conversion(false, None, -1),
             Keysym::LEFT => self.move_caret_left(),
             Keysym::RIGHT => self.move_caret_right(),
