@@ -85,10 +85,11 @@ fn strategy_explicit_adaptive_true_returns_light_model() {
 #[test]
 fn strategy_explicit_short_reading_returns_parallel_beam() {
     let config = default_strategy_config();
-    // adaptive=false, reading_tokens=5 <= 10 → ParallelBeam
+    // adaptive=false, reading_tokens=5 <= 10 → ParallelBeam with the full
+    // candidate budget (short input is not capped by config.beam_width)
     assert_eq!(
         determine_conversion_strategy(5, 9, true, false, &config),
-        ConversionStrategy::ParallelBeam { beam_width: 3 },
+        ConversionStrategy::ParallelBeam { beam_width: 9 },
     );
 }
 
@@ -108,7 +109,7 @@ fn strategy_explicit_reading_boundary_at_threshold() {
     // reading_tokens == threshold → ParallelBeam (<=)
     assert_eq!(
         determine_conversion_strategy(10, 9, true, false, &config),
-        ConversionStrategy::ParallelBeam { beam_width: 3 },
+        ConversionStrategy::ParallelBeam { beam_width: 9 },
     );
     // reading_tokens == threshold + 1 → LightModelOnly
     assert_eq!(
@@ -130,12 +131,13 @@ fn strategy_beam_width_capped_by_num_candidates() {
 }
 
 #[test]
-fn strategy_beam_width_capped_by_beam_width() {
+fn strategy_beam_width_not_capped_for_short_input() {
     let config = strategy_config(10, 3);
-    // num_candidates=9 > beam_width=3 → beam_width = min(9, 3) = 3
+    // Short input intentionally ignores config.beam_width (it only caps the
+    // long-input LightModelOnly path): num_candidates=9 → beam_width = 9.
     assert_eq!(
         determine_conversion_strategy(5, 9, true, false, &config),
-        ConversionStrategy::ParallelBeam { beam_width: 3 },
+        ConversionStrategy::ParallelBeam { beam_width: 9 },
     );
 }
 

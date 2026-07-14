@@ -27,6 +27,12 @@ struct InitResult: Decodable {
     let modelName: String
 }
 
+/// Params of the server-initiated `update_candidates` notification: pushed
+/// after a key response when the deep typo search finds extra candidates.
+struct UpdateCandidatesParams: Decodable {
+    let actions: [EngineAction]
+}
+
 enum EngineAction: Decodable {
     case updatePreedit(text: String, caret: Int, attributes: [PreeditAttr])
     case showCandidates(candidates: [CandidateItem], cursor: Int, page: Int, totalPages: Int)

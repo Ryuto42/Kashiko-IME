@@ -26,6 +26,11 @@ class EngineClient {
     private let lock = NSLock()
     private var pendingRequests: [Int: (Data?) -> Void] = [:]
 
+    /// Called (on the reader queue) when the server pushes an
+    /// `update_candidates` notification — deep-search results arriving after
+    /// the synchronous key response.
+    var onUpdateCandidates: (([EngineAction]) -> Void)?
+
     /// `autoInit` re-sends `init` whenever the server (re)starts. Tests
     /// disable it to avoid loading models.
     init(serverProcess: EngineProcess, autoInit: Bool = true) {
@@ -186,6 +191,16 @@ class EngineClient {
             return
         }
         guard let id = json["id"] as? Int else {
+            // Server-initiated notification (no id).
+            if json["method"] as? String == "update_candidates",
+                let params = json["params"],
+                let data = try? JSONSerialization.data(withJSONObject: params),
+                let decoded = try? makeProtocolDecoder().decode(
+                    UpdateCandidatesParams.self, from: data)
+            {
+                onUpdateCandidates?(decoded.actions)
+                return
+            }
             self.debugLog("response without id: \(json)")
             NSLog("KashikoIME: response without id: \(json)")
             return

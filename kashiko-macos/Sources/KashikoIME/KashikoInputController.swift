@@ -11,6 +11,33 @@ import InputMethodKit
 class KashikoInputController: IMKInputController {
     static let candidateWindow = CandidateWindowController()
 
+    /// Apply an asynchronous `update_candidates` push from the engine (deep
+    /// typo-search results). Runs without an IMK client, so it only touches
+    /// the candidate window — the panel redraws at its last anchor position.
+    /// Ignored when the panel has already been dismissed by a later key.
+    static func applyAsyncCandidateUpdate(_ actions: [EngineAction]) {
+        guard candidateWindow.isVisible else { return }
+        for action in actions {
+            switch action {
+            case .showCandidates(let candidates, let cursor, let page, let totalPages):
+                candidateWindow.show(
+                    candidates: candidates,
+                    cursor: cursor,
+                    page: page,
+                    totalPages: totalPages,
+                    cursorRect: nil,
+                    liveMode: false
+                )
+            case .updateAux(let text):
+                candidateWindow.setAux(text)
+            case .hideAux:
+                candidateWindow.setAux(nil)
+            default:
+                break  // preedit/commit updates need a client; never pushed
+            }
+        }
+    }
+
     /// Mirrors whether the engine currently shows a preedit (updated from
     /// engine actions). Used to decide when to refresh surrounding text.
     private var hasPreedit = false

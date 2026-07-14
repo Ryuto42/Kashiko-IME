@@ -125,25 +125,36 @@ class CandidateWindowController {
     }
 
     private func addCandidateRow(_ candidate: CandidateItem, number: Int?, selected: Bool) {
-        let displayText: String
-        if let num = number {
-            displayText = "\(num). \(candidate.text)"
-        } else {
-            displayText = candidate.text
-        }
         // A small negative baseline offset nudges the glyphs themselves down
         // within the label's frame. Container padding alone (below) can't
         // fully center CJK text vertically — the font's line-height reserves
         // descent space the glyphs never use, so text still sits high even
         // with zero bottom padding.
-        let text = NSMutableAttributedString(
-            string: displayText,
-            attributes: [
-                .font: NSFont.systemFont(ofSize: Self.candidateFontSize),
-                .foregroundColor: selected ? NSColor.white : NSColor.labelColor,
-                .baselineOffset: -1.5,
-            ]
-        )
+        let text = NSMutableAttributedString()
+        // The number prefix is deliberately smaller and dimmer than the
+        // candidate text — it's a selection shortcut, not content.
+        if let num = number {
+            text.append(
+                NSAttributedString(
+                    string: "\(num). ",
+                    attributes: [
+                        .font: NSFont.systemFont(ofSize: Self.footerFontSize),
+                        .foregroundColor: selected
+                            ? NSColor.white.withAlphaComponent(0.6)
+                            : NSColor.tertiaryLabelColor,
+                        .baselineOffset: -1.5,
+                    ]
+                ))
+        }
+        text.append(
+            NSAttributedString(
+                string: candidate.text,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: Self.candidateFontSize),
+                    .foregroundColor: selected ? NSColor.white : NSColor.labelColor,
+                    .baselineOffset: -1.5,
+                ]
+            ))
         if let description = candidate.description {
             text.append(
                 NSAttributedString(

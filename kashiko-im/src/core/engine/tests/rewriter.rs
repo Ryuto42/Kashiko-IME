@@ -93,15 +93,17 @@ fn assert_not_contains(texts: &[String], forbidden: &str) {
 }
 
 // ---------- half-width katakana variants ----------
+// Half-width katakana is intentionally excluded from the conversion list
+// (user preference — it only adds noise next to the full-width forms).
 
 #[test]
-fn single_hiragana_emits_half_width_katakana() {
-    assert_contains(&conversion_texts("あ"), "ｱ");
+fn single_hiragana_does_not_emit_half_width_katakana() {
+    assert_not_contains(&conversion_texts("あ"), "ｱ");
 }
 
 #[test]
-fn hiragana_word_emits_half_width_katakana() {
-    assert_contains(&conversion_texts("がっこう"), "ｶﾞｯｺｳ");
+fn hiragana_word_does_not_emit_half_width_katakana() {
+    assert_not_contains(&conversion_texts("がっこう"), "ｶﾞｯｺｳ");
 }
 
 #[test]
@@ -255,9 +257,10 @@ fn kagikakko_reading_emits_paired_brackets_in_conversion() {
 
 #[test]
 fn katakana_variants_carry_width_form_description() {
-    // mozc-style width annotation: full-width katakana → `[全]カタカナ`,
-    // half-width katakana → `[半]カタカナ`. The hiragana fallback also picks
-    // up `[全]ひらがな` since hiragana is intrinsically full-width.
+    // mozc-style width annotation: full-width katakana → `[全]カタカナ`.
+    // The hiragana fallback also picks up `[全]ひらがな` since hiragana is
+    // intrinsically full-width. Half-width katakana is excluded from the
+    // conversion list entirely.
     let mut engine = composing_engine("あ");
     let candidates = engine.build_conversion_candidates("あ", 9, false, None);
 
@@ -275,11 +278,9 @@ fn katakana_variants_carry_width_form_description() {
         "full-width katakana variant `ア` should be annotated as `[全]カタカナ`",
     );
 
-    let half = candidates.iter().find(|c| c.text == "ｱ").unwrap();
-    assert_eq!(
-        half.description.as_deref(),
-        Some("[半]カタカナ"),
-        "half-width katakana variant `ｱ` should be annotated as `[半]カタカナ`",
+    assert!(
+        !candidates.iter().any(|c| c.text == "ｱ"),
+        "half-width katakana variant `ｱ` must not appear in the conversion list",
     );
 }
 
@@ -302,11 +303,11 @@ fn typing_three_dots_emits_ellipsis_in_auto_suggest_and_conversion() {
 }
 
 #[test]
-fn typing_a_then_space_emits_half_width_katakana() {
+fn typing_a_then_space_does_not_emit_half_width_katakana() {
     let mut engine = InputMethodEngine::new();
     type_string(&mut engine, "a");
 
     let result = engine.process_key(&press_key(Keysym::SPACE));
     assert!(result.consumed);
-    assert_contains(&conversion_state_texts(&engine), "ｱ");
+    assert_not_contains(&conversion_state_texts(&engine), "ｱ");
 }

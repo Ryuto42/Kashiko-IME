@@ -181,6 +181,53 @@ pub fn is_pure_full_katakana(text: &str) -> bool {
             .all(|c| matches!(c, '\u{30A1}'..='\u{30FA}' | '\u{30FC}'))
 }
 
+/// Whether `converted` contains a run of `min_run`+ consecutive hiragana that
+/// also appears verbatim in `reading` — a strong signal the model passed that
+/// stretch through *unconverted* (it couldn't make sense of it), which is what
+/// a typo region looks like. e.g. reading `できないようらなけす` (typo of
+/// `…ようなら…`) yields the candidate `できないようらな消す`, whose 7-char
+/// run `できないようらな` is a substring of the reading → returns true. The
+/// correctly-converted `出来ないようなら消す` does *not* contain such a run
+/// (`ないようなら` is not in that typo'd reading) → returns false.
+///
+/// Kanji output naturally breaks up hiragana runs, so a genuine conversion
+/// (with okurigana ≤ a few kana between kanji) stays under the threshold while
+/// a passed-through typo stretch trips it.
+pub fn has_long_unconverted_run(converted: &str, reading: &str, min_run: usize) -> bool {
+    longest_passthrough_run(converted, reading, min_run).is_some()
+}
+
+/// The longest hiragana run in `converted` (at least `min_run` chars) that
+/// also appears verbatim in `reading` — i.e. the stretch the model passed
+/// through unconverted. Returns `None` when no such run exists. Used both to
+/// flag low-quality candidates (see [`has_long_unconverted_run`]) and to
+/// locate the typo region for kana-level correction search.
+pub fn longest_passthrough_run(converted: &str, reading: &str, min_run: usize) -> Option<String> {
+    let is_hira = |c: char| matches!(c, '\u{3041}'..='\u{3096}');
+    let mut best: Option<String> = None;
+    let mut run = String::new();
+    let consider = |run: &str, best: &mut Option<String>| {
+        if run.chars().count() >= min_run
+            && reading.contains(run)
+            && best
+                .as_ref()
+                .is_none_or(|b| run.chars().count() > b.chars().count())
+        {
+            *best = Some(run.to_string());
+        }
+    };
+    for c in converted.chars() {
+        if is_hira(c) {
+            run.push(c);
+        } else {
+            consider(&run, &mut best);
+            run.clear();
+        }
+    }
+    consider(&run, &mut best);
+    best
+}
+
 /// Convert full-width katakana to half-width katakana.
 ///
 /// Voiced characters expand into two half-width characters (base + ﾞ/ﾟ).
@@ -264,6 +311,33 @@ mod tests {
         assert!(!is_pure_hiragana("あア")); // mixed
         assert!(!is_pure_hiragana("あ漢"));
         assert!(!is_pure_hiragana("ーあ")); // prolonged mark is katakana block
+    }
+
+    #[test]
+    fn test_has_long_unconverted_run() {
+        // Typo passthrough: the model left the mistyped stretch
+        // (`できないようらな` = 8 hiragana) as raw kana, and it's present in the
+        // reading. Trips at the production threshold of 7.
+        let reading = "できないようらなけす";
+        assert!(has_long_unconverted_run("できないようらな消す", reading, 7));
+        // The correctly-converted candidate breaks the run with kanji and its
+        // remaining hiragana ("ないようなら") is NOT in the typo'd reading.
+        assert!(!has_long_unconverted_run("出来ないようなら消す", reading, 7));
+        // A normal conversion with only short okurigana runs is fine.
+        assert!(!has_long_unconverted_run(
+            "私は学校に行きます",
+            "わたしはがっこうにいきます",
+            7
+        ));
+        // Ordinary adverb+particle hiragana chain (`はとてもいい` = 6) must NOT
+        // trip the threshold — this is the false-positive guard.
+        assert!(!has_long_unconverted_run(
+            "今日はとてもいい日",
+            "きょうはとてもいいひ",
+            7
+        ));
+        // Run must actually appear in the reading to count.
+        assert!(!has_long_unconverted_run("あいうえお", "かきくけこ", 7));
     }
 
     #[test]

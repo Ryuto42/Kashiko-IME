@@ -56,6 +56,16 @@ fn main() {
             // stdout closed: frontend is gone
             break;
         }
+        // Post-response work: the deep typo search runs after the synchronous
+        // reply so the frontend gets quick candidates immediately, then the
+        // search findings arrive as an update_candidates notification.
+        if let Some(note) = server.poll_deep_search()
+            && writeln!(stdout, "{note}")
+                .and_then(|_| stdout.flush())
+                .is_err()
+        {
+            break;
+        }
     }
 
     tracing::info!("stdin closed, saving learning cache and exiting");

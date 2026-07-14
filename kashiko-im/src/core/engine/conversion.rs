@@ -11,6 +11,16 @@ use super::*;
 /// Maximum number of learning candidates to show
 const MAX_LEARNING_CANDIDATES: usize = 3;
 
+/// Minimum length of a passed-through hiragana run (present verbatim in the
+/// reading) for a model candidate to count as a low-quality "typo passthrough"
+/// and for a full-sentence conversion to be deemed a failure worth splitting.
+/// See `kashiko_engine::has_long_unconverted_run`.
+///
+/// Set to 7 so ordinary Japanese hiragana chains (adverb + particles, e.g.
+/// `はとてもいい` = 6) don't trip it, while a genuinely garbled stretch left
+/// unconverted (e.g. `できないようらな` = 8) does.
+const UNCONVERTED_RUN_MIN: usize = 7;
+
 /// Mozc-style width/script annotation for a pure-kana candidate, or `None`
 /// if the text mixes scripts or contains kanji/punctuation. Used to label
 /// `あ` / `ア` / `ｱ` candidates in the conversion list.
@@ -131,8 +141,18 @@ impl InputMethodEngine {
                 let Some(light_converter) = self.converters.light_kanji.as_ref() else {
                     return vec![];
                 };
+                // Cap the beam like the other multi-candidate strategies do:
+                // asking the light model for the full `num_candidates` (9)
+                // floods long-input conversion with low-probability
+                // near-duplicates. Beam output is probability-ordered, so
+                // keeping the top `beam_width` drops the unlikely tail.
+                let n = if num_candidates > 1 {
+                    num_candidates.min(self.config.beam_width.max(1))
+                } else {
+                    num_candidates
+                };
                 light_converter
-                    .convert(&katakana, api_context, num_candidates)
+                    .convert(&katakana, api_context, n)
                     .unwrap_or_default()
             }
             ConversionStrategy::MainModelOnly => converter
@@ -208,12 +228,14 @@ impl InputMethodEngine {
         } else {
             None
         };
-        let split_idx = split_index.or(auto_split).unwrap_or(total_chars);
-        let reading: String = full_reading.chars().take(split_idx).collect();
+        let mut split_idx = split_index.or(auto_split).unwrap_or(total_chars);
+        let mut reading: String = full_reading.chars().take(split_idx).collect();
 
-        // Reuse the cached chunk conversion for long input (and whenever we
-        // auto-split) to skip a redundant model pass. Short input keeps the
-        // full inference so it still gets multiple candidates.
+        // For long input (and whenever we auto-split), hand the cached chunk
+        // conversion to the candidate builder so the text the user was just
+        // looking at is guaranteed to stay the first candidate; the builder
+        // still runs a fresh (light-model) pass on top of it for alternatives
+        // and typo-corrected guesses.
         let cached_model = if auto_split.is_some() || total_chars > self.config.short_input_threshold
         {
             self.cached_prefix_conversion(split_idx)
@@ -224,7 +246,7 @@ impl InputMethodEngine {
         // Save auto-suggest/live conversion result before clearing state.
         // This ensures the candidate that was displayed during input is preserved
         // in the conversion candidate list even if the re-inference uses a different strategy.
-        let prev_suggest_text = std::mem::take(&mut self.live.text);
+        let mut prev_suggest_text = std::mem::take(&mut self.live.text);
 
         self.converters.romaji.reset();
         self.input_buf.cursor_pos = 0;
@@ -233,13 +255,118 @@ impl InputMethodEngine {
             return EngineResult::consumed();
         }
 
+        // Mid-text romaji typo (auto_split fired): before falling back to the
+        // split-at-typo behavior, ask the model what the user *meant* — strip
+        // the stray ASCII letters out of the reading and convert the cleaned
+        // whole. If the model produces a real conversion, present that as the
+        // candidate list for the full buffer (committing it drops the stray
+        // chars); only when the model can't make sense of it do we keep the
+        // old split behavior (prefix converted, tail left raw).
+        let mut candidates: Option<Vec<AnnotatedCandidate>> = None;
+        if auto_split.is_some() {
+            let cleaned: String = full_reading
+                .chars()
+                .filter(|c| !c.is_ascii_alphabetic())
+                .collect();
+            if kashiko_engine::contains_kana(&cleaned) {
+                let cleaned_candidates = self.build_conversion_candidates(
+                    &cleaned,
+                    self.config.num_candidates,
+                    skip_learning,
+                    None,
+                );
+                let has_real_conversion = cleaned_candidates
+                    .iter()
+                    .any(|c| c.source == CandidateSource::Model && c.text != cleaned);
+                if has_real_conversion {
+                    candidates = Some(cleaned_candidates);
+                    reading = cleaned;
+                    split_idx = total_chars;
+                    // The live text shown during typing contained the stray
+                    // romaji — don't resurface it over the corrected list.
+                    prev_suggest_text.clear();
+                }
+            }
+        }
+
         // Get candidates from kanji converter (use full num_candidates for explicit conversion)
-        let mut candidates = self.build_conversion_candidates(
-            &reading,
-            self.config.num_candidates,
-            skip_learning,
-            cached_model,
-        );
+        let mut candidates = match candidates {
+            Some(c) => c,
+            None => self.build_conversion_candidates(
+                &reading,
+                self.config.num_candidates,
+                skip_learning,
+                cached_model,
+            ),
+        };
+
+        // Conversion-failure fallbacks: we tried to convert the whole reading
+        // but the best result still passes a garbled stretch through as raw
+        // hiragana (a typo the model couldn't handle). Two recovery attempts,
+        // in order:
+        //
+        // 1. Kana-typo correction search — try small edits (deletions /
+        //    adjacent swaps) in the garbled region and convert each; clean
+        //    results are shown as "what you probably meant" candidates for
+        //    the whole buffer (e.g. `…だったっため…` → `…だったためと思われます`).
+        // 2. Dictionary-prefix split — isolate the longest dictionary-word
+        //    head (`出来ない` out of `できないようらなけす`) and leave the rest
+        //    underlined for manual fixing.
+        let mut typo_suspected = auto_split.is_some();
+        if split_index.is_none() && split_idx == total_chars {
+            let garbled_top = candidates.first().and_then(|c| {
+                kashiko_engine::has_long_unconverted_run(&c.text, &reading, UNCONVERTED_RUN_MIN)
+                    .then(|| c.text.clone())
+            });
+            if let Some(garbled_top) = garbled_top {
+                typo_suspected = true;
+                let corrections = self.kana_typo_corrections(&reading, &garbled_top);
+                if !corrections.is_empty() {
+                    // Corrections lead; keep only the clean survivors of the
+                    // original list (fallback hiragana/katakana stay via the
+                    // exemption below, the garbled passthroughs drop).
+                    let mut merged = corrections;
+                    for c in candidates {
+                        let is_garbled = kashiko_engine::has_long_unconverted_run(
+                            &c.text,
+                            &reading,
+                            UNCONVERTED_RUN_MIN,
+                        ) && c.source != CandidateSource::Fallback;
+                        if !is_garbled && !merged.iter().any(|m| m.text == c.text) {
+                            merged.push(c);
+                        }
+                    }
+                    candidates = merged;
+                    prev_suggest_text.clear();
+                } else if let Some(prefix_len) = self.dictionary_prefix_split(&full_reading) {
+                    let prefix_reading: String =
+                        full_reading.chars().take(prefix_len).collect();
+                    let prefix_candidates = self.build_conversion_candidates(
+                        &prefix_reading,
+                        self.config.num_candidates,
+                        skip_learning,
+                        None,
+                    );
+                    let prefix_is_clean = prefix_candidates.first().is_some_and(|c| {
+                        c.text != prefix_reading
+                            && !kashiko_engine::has_long_unconverted_run(
+                                &c.text,
+                                &prefix_reading,
+                                UNCONVERTED_RUN_MIN,
+                            )
+                    });
+                    if prefix_is_clean {
+                        candidates = prefix_candidates;
+                        split_idx = prefix_len;
+                        reading = prefix_reading;
+                        // The saved live-conversion text is for the *whole*
+                        // reading, so it must not be reinserted over the
+                        // now-shorter prefix.
+                        prev_suggest_text.clear();
+                    }
+                }
+            }
+        }
 
         // If the previous auto-suggest result is not in the new candidates, insert it at the top
         // so it doesn't disappear when the conversion strategy changes.
@@ -298,7 +425,23 @@ impl InputMethodEngine {
             candidate_list.move_prev();
         }
 
-        self.enter_conversion_state(&full_reading, candidate_list, split_idx)
+        // Typo suspected on a whole-buffer conversion: schedule the deep
+        // correction search. It runs *after* this synchronous response is
+        // written, and its findings are pushed to the frontend as an
+        // `update_candidates` notification, so the quick candidates appear
+        // immediately and better guesses stream in behind the loading aux.
+        // Split conversions are excluded — appending whole-reading candidates
+        // to a prefix-scoped list would corrupt the commit scope.
+        let deep_pending = typo_suspected && split_idx == total_chars;
+        self.deep_search_reading = deep_pending.then(|| full_reading.clone());
+
+        let mut result = self.enter_conversion_state(&full_reading, candidate_list, split_idx);
+        if deep_pending {
+            result = result.with_action(EngineAction::UpdateAuxText(
+                "候補を検索中…".to_string(),
+            ));
+        }
+        result
     }
 
     /// Transition to Conversion state with the given reading and candidate list.
@@ -381,6 +524,364 @@ impl InputMethodEngine {
         candidates
     }
 
+    /// Longest dictionary-word reading that is a *proper* prefix of `reading`
+    /// (non-empty and strictly shorter than the whole reading), or `None`.
+    ///
+    /// Used to isolate the cleanly-convertible head of a phrase when the
+    /// full-reading conversion failed because of a typo in the tail: converting
+    /// just this prefix (e.g. `できない` out of `できないようらなけす`) lets the
+    /// good part commit while the garbled remainder stays raw for re-editing.
+    /// Checks user then system dictionaries via their trie prefix search.
+    fn dictionary_prefix_split(&self, reading: &str) -> Option<usize> {
+        let total = reading.chars().count();
+        let mut best = 0usize;
+        for dict in [self.dicts.user.as_ref(), self.dicts.system.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            for res in dict.common_prefix_search(reading) {
+                let len = res.reading.chars().count();
+                // Require at least 2 chars so we never split off a lone kana.
+                if (2..total).contains(&len) && len > best {
+                    best = len;
+                }
+            }
+        }
+        (best > 0).then_some(best)
+    }
+
+    /// Kana-level typo correction search: when the model can't convert
+    /// `reading` cleanly (its best output passes a garbled stretch through as
+    /// raw kana), guess what the user *meant* by trying small edits — single
+    /// deletions and adjacent swaps inside the garbled region (the classic
+    /// double-`っ` and transposition typos) — and converting each edited
+    /// reading. Edits whose conversion comes out clean are returned as
+    /// candidates carrying their edited reading (so learning records the
+    /// corrected kana, not the typo). Costs up to `MAX_TYPO_VARIANTS` greedy
+    /// model passes; only runs on the already-rare "conversion failed" path.
+    fn kana_typo_corrections(
+        &mut self,
+        reading: &str,
+        garbled_top: &str,
+    ) -> Vec<AnnotatedCandidate> {
+        const MAX_TYPO_VARIANTS: usize = 12;
+        const MAX_CORRECTIONS: usize = 3;
+
+        let chars: Vec<char> = reading.chars().collect();
+        // Restrict edits to the garbled region so the variant count stays
+        // bounded on long input; fall back to the whole reading if the run
+        // can't be located (e.g. the top candidate IS the raw reading).
+        let (start, end) = kashiko_engine::longest_passthrough_run(
+            garbled_top,
+            reading,
+            UNCONVERTED_RUN_MIN,
+        )
+        .and_then(|run| {
+            let byte_pos = reading.find(&run)?;
+            let start = reading[..byte_pos].chars().count();
+            Some((start, start + run.chars().count()))
+        })
+        .unwrap_or((0, chars.len()));
+
+        let mut variants: Vec<String> = Vec::new();
+        // Single-character deletions (stray extra kana, e.g. `だったっため`).
+        for i in start..end {
+            variants.push(
+                chars[..i].iter().chain(&chars[i + 1..]).collect(),
+            );
+        }
+        // Adjacent transpositions (e.g. `ようらな` → `ようなら`).
+        for i in start..end.saturating_sub(1) {
+            if chars[i] != chars[i + 1] {
+                let mut v = chars.clone();
+                v.swap(i, i + 1);
+                variants.push(v.into_iter().collect());
+            }
+        }
+        variants.dedup();
+        variants.truncate(MAX_TYPO_VARIANTS);
+
+        let ctx = self.truncate_context_for_api();
+        let mut seen = HashSet::new();
+        let mut corrections = Vec::new();
+        for variant in variants {
+            if corrections.len() >= MAX_CORRECTIONS {
+                break;
+            }
+            let Some(converted) = self
+                .run_kana_kanji_conversion(&variant, &ctx, 1)
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            if converted != variant
+                && !kashiko_engine::has_long_unconverted_run(
+                    &converted,
+                    &variant,
+                    UNCONVERTED_RUN_MIN,
+                )
+                && seen.insert(converted.clone())
+            {
+                corrections.push(
+                    AnnotatedCandidate::new(converted, CandidateSource::Model)
+                        .with_reading(Some(variant)),
+                );
+            }
+        }
+        corrections
+    }
+
+    /// Deep typo-correction search, run by the server *after* the synchronous
+    /// key response has been written. Explores a wider edit space than the
+    /// quick in-response pass (base reading with a wide main-model beam, plus
+    /// single deletions / adjacent swaps / adjacent-pair deletions around the
+    /// typo region) and merges any clean findings into the live candidate
+    /// list. The server pushes the returned actions to the frontend as an
+    /// `update_candidates` notification, so candidates "stream in" while the
+    /// user is looking at the quick results.
+    ///
+    /// Returns `None` when no search was scheduled or the conversion state
+    /// has moved on; returns a `HideAuxText`-only result when the search ran
+    /// but found nothing (to clear the loading indicator).
+    pub fn run_deep_typo_search(&mut self) -> Option<EngineResult> {
+        const MAX_KEYBOARD_VARIANTS: usize = 14;
+        /// Chars of context on each side of the typo point included in the
+        /// keyboard-edit region.
+        const REGION_MARGIN: usize = 4;
+
+        let original = self.deep_search_reading.take()?;
+        // Bail out unless we're still on the same whole-buffer conversion.
+        let InputState::Conversion { split_index, .. } = &self.state else {
+            return None;
+        };
+        if *split_index != self.input_buf.text.chars().count() || self.input_buf.text != original
+        {
+            return None;
+        }
+        let existing: Vec<String> = match &self.state {
+            InputState::Conversion { candidates, .. } => {
+                candidates.candidates().iter().map(|c| c.text.clone()).collect()
+            }
+            _ => return None,
+        };
+
+        let cleaned: String = original
+            .chars()
+            .filter(|c| !c.is_ascii_alphabetic())
+            .collect();
+        if !kashiko_engine::contains_kana(&cleaned) {
+            return None;
+        }
+
+        // Typo region *in the original reading* (stray ASCII included — the
+        // leftover keystrokes are evidence for the keyboard edits): around
+        // the first ASCII char when the typo was romaji leftovers, else the
+        // garbled run of the current top candidate, else the whole reading.
+        let orig_chars: Vec<char> = original.chars().collect();
+        let (start, end) = match original.chars().position(|c| c.is_ascii_alphabetic()) {
+            Some(p) => (
+                p.saturating_sub(REGION_MARGIN),
+                (p + 1 + REGION_MARGIN).min(orig_chars.len()),
+            ),
+            None => existing
+                .first()
+                .and_then(|top| {
+                    let run = kashiko_engine::longest_passthrough_run(
+                        top,
+                        &original,
+                        UNCONVERTED_RUN_MIN,
+                    )?;
+                    let byte_pos = original.find(&run)?;
+                    let s = original[..byte_pos].chars().count();
+                    Some((s, s + run.chars().count()))
+                })
+                .unwrap_or((0, orig_chars.len())),
+        };
+        let prefix: String = orig_chars[..start].iter().collect();
+        let region: String = orig_chars[start..end].iter().collect();
+        let suffix: String = orig_chars[end..].iter().collect();
+
+        // Phased search with reserved budgets, most → least promising. The
+        // keyboard edits get first claim on the result slots: they model how
+        // the typo physically happened, and letting the base beam fill the
+        // list first was exactly how the intended correction got crowded out.
+        //   Phase 1: keyboard-aware romaji-space edits of the typo region
+        //            (transpositions / neighbor keys / deletions / vowel
+        //            insertions); the most likely edits get a small beam.
+        //   Phase 2: plain kana-space deletions and swaps as a coarse net.
+        //   Phase 3: the cleaned base with a wide main-model beam — capped
+        //            hard, since the quick pass already showed its top picks.
+        const MAX_TOTAL_RESULTS: usize = 6;
+        const KB_BEAM_VARIANTS: usize = 4;
+        const MAX_BASE_RESULTS: usize = 2;
+
+        let kb_variants: Vec<String> =
+            kashiko_engine::typo::keyboard_typo_variants(&region, MAX_KEYBOARD_VARIANTS)
+                .into_iter()
+                .map(|kb| format!("{prefix}{kb}{suffix}"))
+                .collect();
+
+        let chars: Vec<char> = cleaned.chars().collect();
+        let ascii_before_start = orig_chars[..start]
+            .iter()
+            .filter(|c| c.is_ascii_alphabetic())
+            .count();
+        let cstart = start - ascii_before_start;
+        let cend = (cstart + (end - start)).min(chars.len());
+        let mut kana_variants: Vec<String> = Vec::new();
+        for i in cstart..cend.min(chars.len()) {
+            kana_variants.push(chars[..i].iter().chain(&chars[i + 1..]).collect());
+        }
+        let swap_end = cend.min(chars.len()).saturating_sub(1);
+        for i in cstart..swap_end {
+            if chars[i] != chars[i + 1] {
+                let mut v = chars.clone();
+                v.swap(i, i + 1);
+                kana_variants.push(v.into_iter().collect());
+            }
+        }
+
+        self.ensure_kanji_converter();
+        let ctx = self.truncate_context_for_api();
+        let mut seen: HashSet<String> = existing.into_iter().collect();
+        let mut uniq: HashSet<String> = HashSet::new();
+        let mut found: Vec<Candidate> = Vec::new();
+
+        let run_phase = |engine: &mut Self,
+                             variants: &[String],
+                             beam_first: usize,
+                             beam: usize,
+                             phase_cap: usize,
+                             found: &mut Vec<Candidate>,
+                             seen: &mut HashSet<String>,
+                             uniq: &mut HashSet<String>| {
+            let mut phase_found = 0usize;
+            for (i, variant) in variants.iter().enumerate() {
+                if phase_found >= phase_cap || found.len() >= MAX_TOTAL_RESULTS {
+                    break;
+                }
+                if !kashiko_engine::contains_kana(variant)
+                    || variant.chars().any(|c| c.is_ascii_alphabetic())
+                    || !uniq.insert(variant.clone())
+                {
+                    continue;
+                }
+                let n = if i < KB_BEAM_VARIANTS { beam_first } else { beam };
+                for out in engine.deep_convert(variant, &ctx, n) {
+                    if out != *variant
+                        && !kashiko_engine::has_long_unconverted_run(
+                            &out,
+                            variant,
+                            UNCONVERTED_RUN_MIN,
+                        )
+                        && !kashiko_engine::has_unrenderable_char(&out)
+                        && seen.insert(out.clone())
+                    {
+                        found.push(Candidate {
+                            text: out,
+                            reading: Some(variant.clone()),
+                            source_label: Some(CandidateSource::Model.label().to_string()),
+                            description: None,
+                        });
+                        phase_found += 1;
+                        if phase_found >= phase_cap || found.len() >= MAX_TOTAL_RESULTS {
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+
+        // Phase 1: keyboard edits — first claim on the budget.
+        run_phase(
+            self, &kb_variants, 3, 1, MAX_TOTAL_RESULTS, &mut found, &mut seen, &mut uniq,
+        );
+        // Phase 2: coarse kana edits fill what's left.
+        let remaining = MAX_TOTAL_RESULTS.saturating_sub(found.len());
+        run_phase(
+            self, &kana_variants, 1, 1, remaining, &mut found, &mut seen, &mut uniq,
+        );
+        // Phase 3: base beam extras, hard-capped.
+        let base = [cleaned.clone()];
+        run_phase(
+            self, &base, 5, 5, MAX_BASE_RESULTS.min(MAX_TOTAL_RESULTS.saturating_sub(found.len())),
+            &mut found, &mut seen, &mut uniq,
+        );
+
+        let InputState::Conversion { candidates, .. } = &mut self.state else {
+            return None;
+        };
+        if found.is_empty() {
+            // Nothing new — just clear the loading indicator.
+            return Some(EngineResult::consumed().with_action(EngineAction::HideAuxText));
+        }
+        // Insert findings *above* the hiragana/katakana fallback entries so
+        // those always stay at the bottom, and keep the user's currently
+        // selected candidate selected — the list grows, it never jumps.
+        let selected_text = candidates.selected_text().map(str::to_string);
+        let mut all: Vec<Candidate> = candidates.candidates().to_vec();
+        let insert_at = all
+            .iter()
+            .position(|c| {
+                matches!(c.description.as_deref(), Some("[全]ひらがな") | Some("[全]カタカナ"))
+            })
+            .unwrap_or(all.len());
+        all.splice(insert_at..insert_at, found);
+        let mut list = CandidateList::new(all);
+        if let Some(sel) = selected_text
+            && let Some(idx) = list.candidates().iter().position(|c| c.text == sel)
+        {
+            list.select(idx);
+        }
+        *candidates = list.clone();
+        Some(
+            EngineResult::consumed()
+                .with_action(EngineAction::ShowCandidates(list))
+                .with_action(EngineAction::HideAuxText),
+        )
+    }
+
+    /// Direct main-model conversion for the deep search, bypassing the
+    /// adaptive strategy (which would downshift long input to the light
+    /// model — the deep pass explicitly wants the strong model).
+    fn deep_convert(&mut self, reading: &str, ctx: &str, num_candidates: usize) -> Vec<String> {
+        if !kashiko_engine::contains_kana(reading) {
+            return vec![];
+        }
+        let Some(converter) = self.converters.kanji.as_ref() else {
+            return vec![];
+        };
+        let katakana = kashiko_engine::hiragana_to_katakana(reading);
+        converter.convert(&katakana, ctx, num_candidates).unwrap_or_default()
+    }
+
+    /// Whether the current input buffer (the not-yet-converted remainder after
+    /// a partial commit) is worth converting as its own segment, judged by the
+    /// model itself: a single greedy pass must produce something different
+    /// from the raw reading and free of long passed-through kana runs.
+    ///
+    /// Costs one extra greedy inference (~tens of ms) — an accepted trade for
+    /// the segment-by-segment conversion flow.
+    fn remainder_converts(&mut self) -> bool {
+        let reading = self.input_buf.text.clone();
+        if reading.is_empty() || !kashiko_engine::contains_kana(&reading) {
+            return false;
+        }
+        self.ensure_kanji_converter();
+        let ctx = self.truncate_context_for_api();
+        self.run_kana_kanji_conversion(&reading, &ctx, 1)
+            .first()
+            .is_some_and(|out| {
+                out != &reading
+                    && !kashiko_engine::has_long_unconverted_run(
+                        out,
+                        &reading,
+                        UNCONVERTED_RUN_MIN,
+                    )
+            })
+    }
+
     /// Build conversion candidates for a reading from multiple sources.
     ///
     /// Combines learning cache, dictionaries, and model inference results
@@ -409,13 +910,25 @@ impl InputMethodEngine {
             debug!("Failed to initialize kanji converter: {}", e);
         }
 
-        // Reuse the conversion already computed during live typing (cached
-        // chunks) when provided, avoiding a redundant model pass on Space.
-        let candidates = match cached_model {
-            Some(cached) => cached,
-            None => {
-                let api_context = self.truncate_context_for_api();
-                self.run_kana_kanji_conversion(reading, &api_context, num_candidates)
+        // The cached live-typing conversion (chunked greedy) is kept as the
+        // guaranteed-first model candidate, but a fresh whole-reading pass
+        // still runs to produce *alternatives* — cache-only conversion left
+        // long input with a single AI candidate and nothing to pick from.
+        // The strategy layer already downshifts long input to the light
+        // model, so the extra pass stays within the Space-key latency budget.
+        let candidates = {
+            let api_context = self.truncate_context_for_api();
+            let fresh = self.run_kana_kanji_conversion(reading, &api_context, num_candidates);
+            match cached_model {
+                Some(mut cached) => {
+                    for c in fresh {
+                        if !cached.contains(&c) {
+                            cached.push(c);
+                        }
+                    }
+                    cached
+                }
+                None => fresh,
             }
         };
 
@@ -556,6 +1069,55 @@ impl InputMethodEngine {
                 builder.candidates.retain(|c| {
                     c.source == CandidateSource::Fallback
                         || c.text.chars().count() <= SHORT_INPUT_MAX_CANDIDATE_LEN
+                });
+            }
+        }
+
+        // 10. Drop candidates containing a character virtually no font can
+        //     render (rare historical kana from the system dictionary, or a
+        //     stray model control token) — regardless of source, so a
+        //     dictionary/model result can't surface the same "missing
+        //     glyph" box that learning entries are already filtered for
+        //     (see `LearningCache::is_learnable`).
+        builder
+            .candidates
+            .retain(|c| !kashiko_engine::has_unrenderable_char(&c.text));
+
+        // 10b. Half-width katakana variants are never shown in the conversion
+        //      list (user preference — they only add noise next to the
+        //      full-width forms). Matched by the rewriter's annotation and,
+        //      as a fallback, by codepoint (U+FF61–FF9F) in case a half-width
+        //      form arrives unlabelled from the dictionary or model.
+        builder.candidates.retain(|c| {
+            c.description.as_deref() != Some("[半]カタカナ")
+                && !(!c.text.is_empty()
+                    && c.text.chars().all(|ch| ('\u{FF61}'..='\u{FF9F}').contains(&ch)))
+        });
+
+        // 11. Drop low-quality model guesses: when the user mistypes mid-phrase
+        //     (e.g. `できないようらな…`), the model often emits a candidate that
+        //     just passes the garbled stretch through as raw hiragana
+        //     (`できないようらな消す`). Those are meaningless and were the ones
+        //     leaking into the list despite the learning filter. Only Model-
+        //     source candidates are eligible, and only when a cleaner
+        //     alternative survives — never leave the list empty.
+        {
+            let clean_exists = builder.candidates.iter().any(|c| {
+                c.source != CandidateSource::Model
+                    || !kashiko_engine::has_long_unconverted_run(
+                        &c.text,
+                        reading,
+                        UNCONVERTED_RUN_MIN,
+                    )
+            });
+            if clean_exists {
+                builder.candidates.retain(|c| {
+                    c.source != CandidateSource::Model
+                        || !kashiko_engine::has_long_unconverted_run(
+                            &c.text,
+                            reading,
+                            UNCONVERTED_RUN_MIN,
+                        )
                 });
             }
         }
@@ -761,13 +1323,24 @@ impl InputMethodEngine {
             self.live.text.clear();
             self.chunks.clear();
 
-            // Set state to composing with remaining text
-            let composing_result = self.refresh_input_state();
+            // Chained segment conversion: ask the model whether the remainder
+            // converts cleanly on its own. If it does, jump straight into
+            // Conversion state for it (the segment-by-segment flow: Enter
+            // commits `テーマに沿って`, and `できている` immediately shows its
+            // own candidates). If the model can't make sense of it (a typo
+            // tail like `ようらなけす`), fall back to plain composing so the
+            // user can edit the raw kana. The extra greedy model pass here is
+            // an accepted latency cost.
+            let follow_up = if self.remainder_converts() {
+                self.start_conversion(false, None, 0)
+            } else {
+                self.refresh_input_state()
+            };
 
             let mut result = EngineResult::consumed()
                 .with_action(EngineAction::Commit(text))
                 .with_action(EngineAction::HideCandidates);
-            result.actions.extend(composing_result.actions);
+            result.actions.extend(follow_up.actions);
             result
         } else {
             // Full commit: no remaining text

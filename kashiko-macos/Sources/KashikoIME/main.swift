@@ -70,6 +70,14 @@ _ = server  // keep the IMKServer alive
 let engineProcess = EngineProcess()
 let engineClient = EngineClient(serverProcess: engineProcess)
 
+// Deep typo-search results are pushed by the engine after the synchronous
+// key response; apply them to the candidate window on the main thread.
+engineClient.onUpdateCandidates = { actions in
+    DispatchQueue.main.async {
+        KashikoInputController.applyAsyncCandidateUpdate(actions)
+    }
+}
+
 engineProcess.start()
 engineClient.startReaderLoop()
 // Model loading takes seconds (and downloads from HuggingFace on the very

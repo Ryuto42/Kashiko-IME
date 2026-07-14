@@ -4,14 +4,15 @@ pub mod kanji;
 pub mod learning;
 pub mod rewriter;
 pub mod romaji;
+pub mod typo;
 
 pub use dict::{Candidate as DictCandidate, DictEntry, Dictionary, LookupResult};
 pub use kana::{
-    contains_kana, hiragana_to_katakana, is_pure_full_katakana, is_pure_hiragana,
-    katakana_to_hiragana, normalize_nfkc,
+    contains_kana, has_long_unconverted_run, hiragana_to_katakana, is_pure_full_katakana,
+    is_pure_hiragana, katakana_to_hiragana, longest_passthrough_run, normalize_nfkc,
 };
 pub use kanji::{Backend, KanaKanjiConverter};
-pub use learning::LearningCache;
+pub use learning::{LearningCache, has_unrenderable_char};
 pub use rewriter::{
     AlphabetRewriter, EmojiRewriter, HalfWidthKatakanaRewriter, RewriteOutput, Rewriter,
     RewriterChain, SymbolRewriter, description as symbol_description,

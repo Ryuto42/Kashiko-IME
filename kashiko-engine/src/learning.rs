@@ -90,6 +90,11 @@ impl LearningCache {
         if surface.chars().any(|c| c.is_ascii_alphabetic()) {
             return false;
         }
+        // Unrenderable characters (rare historical kana, stray model control
+        // tokens) — see `has_unrenderable_char`.
+        if has_unrenderable_char(surface) {
+            return false;
+        }
         // Feature 3-1: unconverted — identical to reading, or contains no kanji
         // despite being non-trivially long.
         if surface == reading {
@@ -322,6 +327,30 @@ fn is_kanji(c: char) -> bool {
     )
 }
 
+/// Whether `text` contains a character virtually no system font can render,
+/// so learning it would only ever surface as a "missing glyph" box.
+///
+/// Covers two sources of garbage surfaces:
+/// - Kana Supplement / Kana Extended-A / Small Kana Extension
+///   (U+1B000–U+1B16F): historical hentaigana variants that appear in the
+///   Mozc-derived system dictionary but have no glyph in any common font.
+///   These can end up learned if a user accidentally selects one.
+/// - Private Use Area (U+E000–U+F8FF, and the supplementary PUA-A/B planes):
+///   covers the jinen model's internal control tokens
+///   (`CONTEXT_TOKEN`/`INPUT_START_TOKEN`/`OUTPUT_START_TOKEN`, U+EE00–EE02;
+///   see `kashiko-engine/README.md`) in case one ever leaks into decoded
+///   model output instead of being stripped.
+pub fn has_unrenderable_char(text: &str) -> bool {
+    text.chars().any(|c| {
+        matches!(c,
+            '\u{1B000}'..='\u{1B16F}' // Kana Supplement / Kana Extended-A
+            | '\u{E000}'..='\u{F8FF}' // Private Use Area
+            | '\u{F0000}'..='\u{FFFFD}' // Supplementary PUA-A
+            | '\u{100000}'..='\u{10FFFD}' // Supplementary PUA-B
+        )
+    })
+}
+
 /// Current time as Unix timestamp in seconds.
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -348,6 +377,28 @@ mod tests {
         // "今日" should have higher score (frequency 2 vs 1)
         assert_eq!(results[0].0, "今日");
         assert_eq!(results[1].0, "京");
+    }
+
+    #[test]
+    fn test_has_unrenderable_char() {
+        // Kana Supplement hentaigana variant (the actual corrupted entry found
+        // in a real learning.tsv for reading "を").
+        assert!(has_unrenderable_char("\u{1B118}"));
+        // jinen model's internal control tokens (Private Use Area).
+        assert!(has_unrenderable_char("\u{EE00}"));
+        assert!(has_unrenderable_char("\u{EE01}"));
+        assert!(has_unrenderable_char("\u{EE02}"));
+        // Normal kanji/kana/symbols are unaffected.
+        assert!(!has_unrenderable_char("今日"));
+        assert!(!has_unrenderable_char("あいう"));
+        assert!(!has_unrenderable_char("…"));
+    }
+
+    #[test]
+    fn test_record_rejects_unrenderable_char() {
+        let mut cache = LearningCache::new(100);
+        cache.record("を", "\u{1B118}");
+        assert!(cache.lookup("を").is_empty());
     }
 
     #[test]
@@ -384,6 +435,7 @@ mod tests {
         writeln!(file, "きょう\t今日\t3\t1700000000").unwrap();
         writeln!(file, "ながいよみ\tきょうのてんきははれです\t1\t1700000000").unwrap();
         writeln!(file, "ろーまじ\t今日k\t1\t1700000000").unwrap();
+        writeln!(file, "を\t\u{1B118}\t2\t1783581429").unwrap();
         file.flush().unwrap();
 
         let cache = LearningCache::load(file.path(), 100).unwrap();
@@ -391,6 +443,7 @@ mod tests {
         assert_eq!(cache.lookup("きょう").len(), 1);
         assert!(cache.lookup("ながいよみ").is_empty());
         assert!(cache.lookup("ろーまじ").is_empty());
+        assert!(cache.lookup("を").is_empty());
     }
 
     #[test]

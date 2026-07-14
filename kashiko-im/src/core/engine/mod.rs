@@ -157,6 +157,12 @@ pub struct InputMethodEngine {
     learning: Option<LearningCache>,
     /// Whether the last key processed was backspace (used for aux hint display)
     last_key_was_backspace: bool,
+    /// Reading flagged for the post-response deep typo search. Set by
+    /// `start_conversion` when a typo-recovery path fired; consumed by the
+    /// server (via `run_deep_typo_search`) right after the synchronous
+    /// key response is written, so better corrections can be pushed to the
+    /// frontend asynchronously as an `update_candidates` notification.
+    deep_search_reading: Option<String>,
 }
 
 impl InputMethodEngine {
@@ -182,6 +188,7 @@ impl InputMethodEngine {
             dicts: Dictionaries::default(),
             last_key_was_backspace: false,
             learning: None,
+            deep_search_reading: None,
         }
     }
 

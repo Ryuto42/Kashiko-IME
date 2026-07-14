@@ -71,9 +71,14 @@ fn determine_adaptive_strategy(
             // Main model was too slow — use light model only
             ConversionStrategy::LightModelOnly
         } else if reading_tokens <= config.short_input_threshold {
-            // Short input + main model is fast enough: parallel beam search
+            // Short input + main model is fast enough: parallel beam search.
+            // Short readings use the full candidate budget rather than the
+            // `beam_width` cap — a narrow beam on e.g. `かけている` surfaces
+            // only 欠けて/掛けて and misses 書けて/賭けて, and short input is
+            // cheap enough that a wide beam stays within the latency budget.
+            // (`beam_width` still caps the long-input LightModelOnly path.)
             ConversionStrategy::ParallelBeam {
-                beam_width: num_candidates.min(config.beam_width),
+                beam_width: num_candidates,
             }
         } else {
             // Long input: proactively use light model

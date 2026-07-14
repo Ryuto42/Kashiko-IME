@@ -163,6 +163,24 @@ impl ImServer {
         .map_err(internal_error)
     }
 
+    /// Run pending post-response work (the deep typo search scheduled by the
+    /// last key) and return a JSON-RPC `update_candidates` notification line
+    /// to push to the frontend, or `None` when there is nothing to do.
+    ///
+    /// Called by the main loop right after the synchronous response has been
+    /// written, so the frontend shows the quick candidates first and receives
+    /// the deep-search findings as a follow-up.
+    pub fn poll_deep_search(&mut self) -> Option<String> {
+        let result = self.engine.run_deep_typo_search()?;
+        let actions: Vec<Action> = result.actions.into_iter().map(to_action).collect();
+        let note = json!({
+            "jsonrpc": "2.0",
+            "method": "update_candidates",
+            "params": { "actions": actions },
+        });
+        Some(note.to_string())
+    }
+
     fn key_result(&self, result: EngineResult) -> Result<Value, RpcError> {
         let actions = result.actions.into_iter().map(to_action).collect();
         serde_json::to_value(KeyResult {
