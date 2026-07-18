@@ -1,8 +1,0 @@
-[Addon]
-Name=Kashiko
-Category=InputMethod
-Library=kashiko
-Type=SharedLibrary
-OnDemand=True
-Configurable=True
-Version=0.1.0

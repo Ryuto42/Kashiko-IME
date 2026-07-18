@@ -1,7 +1,7 @@
 //! Conversion state handling (candidates, commit). The live-conversion
 //! chunking lives in the sibling `chunk` module.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
 use tracing::debug;
@@ -10,6 +10,40 @@ use super::*;
 
 /// Maximum number of learning candidates to show
 const MAX_LEARNING_CANDIDATES: usize = 3;
+
+/// One unit of deep-search work — at most a couple of model calls, so the
+/// server can serve key events between tasks instead of stalling behind the
+/// whole search.
+pub(super) enum DeepTask {
+    /// Convert `variant` with a `beam`-wide pass; keep at most `cap` results.
+    Convert {
+        variant: String,
+        beam: usize,
+        cap: usize,
+    },
+    /// Convert the tail segment with the prefix conversion as left context,
+    /// producing full-sentence tail alternatives.
+    TailBeam {
+        prefix_reading: String,
+        tail_reading: String,
+        beam: usize,
+    },
+}
+
+/// An in-flight deep search, advanced one task per `step_deep_search` call.
+pub(super) struct DeepSearchJob {
+    /// The request the job was started for; the job cancels itself when the
+    /// buffer or conversion scope no longer matches (committed / re-edited /
+    /// resized).
+    request: DeepSearchRequest,
+    /// The scoped reading with stray ASCII stripped (used as the recorded
+    /// reading for combined tail candidates).
+    reading: String,
+    queue: VecDeque<DeepTask>,
+    found: Vec<Candidate>,
+    seen: HashSet<String>,
+    max_results: usize,
+}
 
 /// Minimum length of a passed-through hiragana run (present verbatim in the
 /// reading) for a model candidate to count as a low-quality "typo passthrough"
@@ -255,19 +289,64 @@ impl InputMethodEngine {
             return EngineResult::consumed();
         }
 
-        // Mid-text romaji typo (auto_split fired): before falling back to the
-        // split-at-typo behavior, ask the model what the user *meant* — strip
-        // the stray ASCII letters out of the reading and convert the cleaned
-        // whole. If the model produces a real conversion, present that as the
-        // candidate list for the full buffer (committing it drops the stray
-        // chars); only when the model can't make sense of it do we keep the
-        // old split behavior (prefix converted, tail left raw).
+        // Stray romaji anywhere in the reading (including position 0, e.g.
+        // `wたし` — a missed vowel key): before falling back to the
+        // split-at-typo behavior, ask the model what the user *meant*, via
+        // BOTH interpretations of the leftover keystroke:
+        //   - completion: the vowel was never pressed — finish the romaji
+        //     with each vowel (`w`→わ…) and convert (`wたし` → わたし → 私);
+        //   - strip: the key was hit by accident — remove the ASCII and
+        //     convert the cleaned whole (`wたし` → たし → 足し).
+        // Both result sets are shown (completions first); committing either
+        // consumes the whole buffer, stray chars included. Only when neither
+        // produces a real conversion do we keep the old split behavior
+        // (prefix converted, tail left raw).
+        let has_stray_ascii = full_reading.chars().any(|c| c.is_ascii_alphabetic())
+            && kashiko_engine::contains_kana(&full_reading);
         let mut candidates: Option<Vec<AnnotatedCandidate>> = None;
-        if auto_split.is_some() {
+        if split_index.is_none() && has_stray_ascii {
+            /// Above this reading length the sync completion passes are
+            /// skipped (the async deep search covers them) to keep the
+            /// Space-key response fast.
+            const SYNC_COMPLETION_MAX_CHARS: usize = 15;
+            const MAX_SYNC_COMPLETIONS: usize = 3;
+
+            let mut combined: Vec<AnnotatedCandidate> = Vec::new();
+
+            // Completion pattern (one greedy pass per vowel, short input only).
+            if total_chars <= SYNC_COMPLETION_MAX_CHARS {
+                let api_context = self.truncate_context_for_api();
+                for variant in kashiko_engine::typo::romaji_completion_variants(&full_reading) {
+                    if combined.len() >= MAX_SYNC_COMPLETIONS {
+                        break;
+                    }
+                    if let Some(out) = self
+                        .run_kana_kanji_conversion(&variant, &api_context, 1)
+                        .into_iter()
+                        .next()
+                        && out != variant
+                        && !kashiko_engine::has_long_unconverted_run(
+                            &out,
+                            &variant,
+                            UNCONVERTED_RUN_MIN,
+                        )
+                        && !kashiko_engine::has_unrenderable_char(&out)
+                        && !combined.iter().any(|c| c.text == out)
+                    {
+                        combined.push(
+                            AnnotatedCandidate::new(out, CandidateSource::Model)
+                                .with_reading(Some(variant)),
+                        );
+                    }
+                }
+            }
+
+            // Strip pattern.
             let cleaned: String = full_reading
                 .chars()
                 .filter(|c| !c.is_ascii_alphabetic())
                 .collect();
+            let mut has_real_conversion = !combined.is_empty();
             if kashiko_engine::contains_kana(&cleaned) {
                 let cleaned_candidates = self.build_conversion_candidates(
                     &cleaned,
@@ -275,17 +354,26 @@ impl InputMethodEngine {
                     skip_learning,
                     None,
                 );
-                let has_real_conversion = cleaned_candidates
+                has_real_conversion |= cleaned_candidates
                     .iter()
                     .any(|c| c.source == CandidateSource::Model && c.text != cleaned);
-                if has_real_conversion {
-                    candidates = Some(cleaned_candidates);
-                    reading = cleaned;
-                    split_idx = total_chars;
-                    // The live text shown during typing contained the stray
-                    // romaji — don't resurface it over the corrected list.
-                    prev_suggest_text.clear();
+                for c in cleaned_candidates {
+                    if !combined.iter().any(|m| m.text == c.text) {
+                        combined.push(c);
+                    }
                 }
+            }
+
+            if has_real_conversion && !combined.is_empty() {
+                candidates = Some(combined);
+                reading = full_reading
+                    .chars()
+                    .filter(|c| !c.is_ascii_alphabetic())
+                    .collect();
+                split_idx = total_chars;
+                // The live text shown during typing contained the stray
+                // romaji — don't resurface it over the corrected list.
+                prev_suggest_text.clear();
             }
         }
 
@@ -312,7 +400,7 @@ impl InputMethodEngine {
         // 2. Dictionary-prefix split — isolate the longest dictionary-word
         //    head (`出来ない` out of `できないようらなけす`) and leave the rest
         //    underlined for manual fixing.
-        let mut typo_suspected = auto_split.is_some();
+        let mut typo_suspected = has_stray_ascii || auto_split.is_some();
         if split_index.is_none() && split_idx == total_chars {
             let garbled_top = candidates.first().and_then(|c| {
                 kashiko_engine::has_long_unconverted_run(&c.text, &reading, UNCONVERTED_RUN_MIN)
@@ -391,6 +479,26 @@ impl InputMethodEngine {
             return EngineResult::consumed().with_action(EngineAction::UpdatePreedit(preedit));
         }
 
+        // How many "real" conversions (not the always-present hiragana/
+        // katakana fallbacks or symbol variants) the quick pass produced.
+        // A thin list means the model likely has unexplored alternatives —
+        // schedule the deep search to keep inferring in the background.
+        let real_candidate_count = candidates
+            .iter()
+            .filter(|c| {
+                !matches!(
+                    c.source,
+                    CandidateSource::Fallback | CandidateSource::Rewriter
+                )
+            })
+            .count();
+        // Whether the best candidate still passes a garbled stretch through
+        // (or is just the raw reading) — the "conversion failed" signal used
+        // to trigger the deep recovery search below.
+        let top_garbled = candidates.first().is_some_and(|c| {
+            kashiko_engine::has_long_unconverted_run(&c.text, &reading, UNCONVERTED_RUN_MIN)
+        });
+
         // Map AnnotatedCandidate → public Candidate. The two annotation
         // slots are kept disjoint so descriptions never duplicate between the
         // aux text and the candidate's right-side comment:
@@ -425,18 +533,37 @@ impl InputMethodEngine {
             candidate_list.move_prev();
         }
 
-        // Typo suspected on a whole-buffer conversion: schedule the deep
-        // correction search. It runs *after* this synchronous response is
-        // written, and its findings are pushed to the frontend as an
-        // `update_candidates` notification, so the quick candidates appear
-        // immediately and better guesses stream in behind the loading aux.
-        // Split conversions are excluded — appending whole-reading candidates
-        // to a prefix-scoped list would corrupt the commit scope.
-        let deep_pending = typo_suspected && split_idx == total_chars;
-        self.deep_search_reading = deep_pending.then(|| full_reading.clone());
+        // Schedule the post-response deep search, scoped to whatever is
+        // actually being converted — the whole buffer OR the prefix segment
+        // of a manual Left/Right resize. It runs *after* this synchronous
+        // response is written, and its findings are pushed to the frontend
+        // as an `update_candidates` notification, so the quick candidates
+        // appear immediately and extra guesses stream in behind the loading
+        // aux. Two triggers:
+        //   - a typo is suspected → keyboard-edit correction search;
+        //   - the quick list is thin → widen the beam / tail alternatives.
+        const MIN_QUICK_REAL_CANDIDATES: usize = 4;
+        // Signals recomputed against the *scoped* reading, so a resized
+        // segment whose conversion failed (only fallback candidates) also
+        // gets the recovery search.
+        let scoped_raw: String = full_reading.chars().take(split_idx).collect();
+        let scope_has_ascii = scoped_raw.chars().any(|c| c.is_ascii_alphabetic());
+        let kind = if typo_suspected || scope_has_ascii || top_garbled {
+            Some(DeepSearchKind::TypoCorrection)
+        } else if real_candidate_count < MIN_QUICK_REAL_CANDIDATES {
+            Some(DeepSearchKind::MoreAlternatives)
+        } else {
+            None
+        };
+        self.deep_search = kind.map(|kind| DeepSearchRequest {
+            reading: scoped_raw,
+            buffer: full_reading.clone(),
+            scope: split_idx,
+            kind,
+        });
 
         let mut result = self.enter_conversion_state(&full_reading, candidate_list, split_idx);
-        if deep_pending {
+        if self.deep_search.is_some() {
             result = result.with_action(EngineAction::UpdateAuxText(
                 "候補を検索中…".to_string(),
             ));
@@ -632,31 +759,95 @@ impl InputMethodEngine {
         corrections
     }
 
-    /// Deep typo-correction search, run by the server *after* the synchronous
-    /// key response has been written. Explores a wider edit space than the
-    /// quick in-response pass (base reading with a wide main-model beam, plus
-    /// single deletions / adjacent swaps / adjacent-pair deletions around the
-    /// typo region) and merges any clean findings into the live candidate
-    /// list. The server pushes the returned actions to the frontend as an
-    /// `update_candidates` notification, so candidates "stream in" while the
-    /// user is looking at the quick results.
+    /// Undo the last conversion commit (reconversion): take the committed
+    /// surface back out of the application and restore the reading in
+    /// Conversion state, candidate window and all. The `DeleteSurrounding`
+    /// action leads the batch so the frontend replaces the committed text
+    /// with the restored marked text.
     ///
-    /// Returns `None` when no search was scheduled or the conversion state
-    /// has moved on; returns a `HideAuxText`-only result when the search ran
-    /// but found nothing (to clear the loading indicator).
-    pub fn run_deep_typo_search(&mut self) -> Option<EngineResult> {
-        const MAX_KEYBOARD_VARIANTS: usize = 14;
-        /// Chars of context on each side of the typo point included in the
-        /// keyboard-edit region.
-        const REGION_MARGIN: usize = 4;
+    /// Works reliably in standard Cocoa text views (Notes, TextEdit, …);
+    /// apps without proper `replacementRange` support (some Electron /
+    /// terminal apps) may ignore the deletion.
+    pub(super) fn reconvert_last_commit(
+        &mut self,
+        reading: String,
+        surface: String,
+    ) -> EngineResult {
+        self.converters.romaji.reset();
+        self.input_buf.clear();
+        self.input_buf.insert(&reading);
+        self.live.text.clear();
+        self.chunks.clear();
+        let mut result = self.start_conversion(false, None, 0);
+        result
+            .actions
+            .insert(0, EngineAction::DeleteSurrounding(surface));
+        result
+    }
 
-        let original = self.deep_search_reading.take()?;
-        // Bail out unless we're still on the same whole-buffer conversion.
+    /// Whether deep-search work is scheduled or in flight. The server main
+    /// loop uses this to decide between blocking on stdin and stepping the
+    /// search, so key events are served between model calls.
+    pub fn deep_search_pending(&self) -> bool {
+        self.deep_search.is_some() || self.deep_job.is_some()
+    }
+
+    /// Advance the pending deep search by one task (at most a couple of
+    /// model calls). Returns `Some(result)` exactly once, when the search
+    /// finishes and the candidate list has been updated — the result
+    /// carries the actions to push to the frontend as an
+    /// `update_candidates` notification. Returns `None` while idle, still
+    /// working, or when the job was canceled.
+    ///
+    /// The job cancels itself silently whenever the conversion it was
+    /// started for is no longer on screen — the user committed a candidate,
+    /// kept typing, or dismissed the conversion — so no model time is spent
+    /// on a conversion that is already over.
+    pub fn step_deep_search(&mut self) -> Option<EngineResult> {
+        // Lazily build the job from the scheduled request.
+        if self.deep_job.is_none()
+            && let Some(request) = self.deep_search.take()
+        {
+            self.deep_job = self.build_deep_job(request);
+        }
+        let job = self.deep_job.as_ref()?;
+
+        // Cancel when the conversion has moved on (committed / re-edited /
+        // resized to a different segment).
+        let still_valid = matches!(
+            &self.state,
+            InputState::Conversion { split_index, .. }
+                if *split_index == job.request.scope
+        ) && self.input_buf.text == job.request.buffer;
+        if !still_valid {
+            self.deep_job = None;
+            return None;
+        }
+
+        let mut job = self.deep_job.take()?;
+        let done = match job.queue.pop_front() {
+            None => true,
+            Some(task) => {
+                self.run_deep_task(task, &mut job);
+                job.queue.is_empty() || job.found.len() >= job.max_results
+            }
+        };
+        if done {
+            Some(self.finish_deep_job(job))
+        } else {
+            self.deep_job = Some(job);
+            None
+        }
+    }
+
+    /// Build the task queue for a scheduled deep search. No model calls —
+    /// just cheap variant generation. `None` when the conversion has already
+    /// moved on or the reading isn't searchable.
+    fn build_deep_job(&mut self, request: DeepSearchRequest) -> Option<DeepSearchJob> {
         let InputState::Conversion { split_index, .. } = &self.state else {
             return None;
         };
-        if *split_index != self.input_buf.text.chars().count() || self.input_buf.text != original
-        {
+        if *split_index != request.scope || self.input_buf.text != request.buffer {
             return None;
         }
         let existing: Vec<String> = match &self.state {
@@ -665,7 +856,9 @@ impl InputMethodEngine {
             }
             _ => return None,
         };
-
+        // The scoped reading under conversion, raw and ASCII-stripped forms.
+        let original = request.reading.clone();
+        let kind = request.kind;
         let cleaned: String = original
             .chars()
             .filter(|c| !c.is_ascii_alphabetic())
@@ -673,160 +866,218 @@ impl InputMethodEngine {
         if !kashiko_engine::contains_kana(&cleaned) {
             return None;
         }
+        self.ensure_kanji_converter();
 
-        // Typo region *in the original reading* (stray ASCII included — the
-        // leftover keystrokes are evidence for the keyboard edits): around
-        // the first ASCII char when the typo was romaji leftovers, else the
-        // garbled run of the current top candidate, else the whole reading.
-        let orig_chars: Vec<char> = original.chars().collect();
-        let (start, end) = match original.chars().position(|c| c.is_ascii_alphabetic()) {
-            Some(p) => (
-                p.saturating_sub(REGION_MARGIN),
-                (p + 1 + REGION_MARGIN).min(orig_chars.len()),
-            ),
-            None => existing
-                .first()
-                .and_then(|top| {
-                    let run = kashiko_engine::longest_passthrough_run(
-                        top,
-                        &original,
-                        UNCONVERTED_RUN_MIN,
-                    )?;
-                    let byte_pos = original.find(&run)?;
-                    let s = original[..byte_pos].chars().count();
-                    Some((s, s + run.chars().count()))
-                })
-                .unwrap_or((0, orig_chars.len())),
-        };
-        let prefix: String = orig_chars[..start].iter().collect();
-        let region: String = orig_chars[start..end].iter().collect();
-        let suffix: String = orig_chars[end..].iter().collect();
-
-        // Phased search with reserved budgets, most → least promising. The
-        // keyboard edits get first claim on the result slots: they model how
-        // the typo physically happened, and letting the base beam fill the
-        // list first was exactly how the intended correction got crowded out.
-        //   Phase 1: keyboard-aware romaji-space edits of the typo region
-        //            (transpositions / neighbor keys / deletions / vowel
-        //            insertions); the most likely edits get a small beam.
-        //   Phase 2: plain kana-space deletions and swaps as a coarse net.
-        //   Phase 3: the cleaned base with a wide main-model beam — capped
-        //            hard, since the quick pass already showed its top picks.
         const MAX_TOTAL_RESULTS: usize = 6;
-        const KB_BEAM_VARIANTS: usize = 4;
-        const MAX_BASE_RESULTS: usize = 2;
+        let mut queue: VecDeque<DeepTask> = VecDeque::new();
+        let mut uniq: HashSet<String> = HashSet::new();
+        let mut push_convert = |queue: &mut VecDeque<DeepTask>, variant: String, beam: usize, cap: usize| {
+            if kashiko_engine::contains_kana(&variant)
+                && !variant.chars().any(|c| c.is_ascii_alphabetic())
+                && uniq.insert(variant.clone())
+            {
+                queue.push_back(DeepTask::Convert { variant, beam, cap });
+            }
+        };
 
-        let kb_variants: Vec<String> =
-            kashiko_engine::typo::keyboard_typo_variants(&region, MAX_KEYBOARD_VARIANTS)
-                .into_iter()
-                .map(|kb| format!("{prefix}{kb}{suffix}"))
-                .collect();
+        match kind {
+            DeepSearchKind::TypoCorrection => {
+                const MAX_KEYBOARD_VARIANTS: usize = 14;
+                /// Chars of context on each side of the typo point included
+                /// in the keyboard-edit region.
+                const REGION_MARGIN: usize = 4;
 
-        let chars: Vec<char> = cleaned.chars().collect();
-        let ascii_before_start = orig_chars[..start]
-            .iter()
-            .filter(|c| c.is_ascii_alphabetic())
-            .count();
-        let cstart = start - ascii_before_start;
-        let cend = (cstart + (end - start)).min(chars.len());
-        let mut kana_variants: Vec<String> = Vec::new();
-        for i in cstart..cend.min(chars.len()) {
-            kana_variants.push(chars[..i].iter().chain(&chars[i + 1..]).collect());
-        }
-        let swap_end = cend.min(chars.len()).saturating_sub(1);
-        for i in cstart..swap_end {
-            if chars[i] != chars[i + 1] {
-                let mut v = chars.clone();
-                v.swap(i, i + 1);
-                kana_variants.push(v.into_iter().collect());
+                // Typo region *in the original reading* (stray ASCII
+                // included): around the first ASCII char when the typo was
+                // romaji leftovers, else the garbled run of the current top
+                // candidate, else the whole reading.
+                let orig_chars: Vec<char> = original.chars().collect();
+                let (start, end) =
+                    match original.chars().position(|c| c.is_ascii_alphabetic()) {
+                        Some(p) => (
+                            p.saturating_sub(REGION_MARGIN),
+                            (p + 1 + REGION_MARGIN).min(orig_chars.len()),
+                        ),
+                        None => existing
+                            .first()
+                            .and_then(|top| {
+                                let run = kashiko_engine::longest_passthrough_run(
+                                    top,
+                                    &original,
+                                    UNCONVERTED_RUN_MIN,
+                                )?;
+                                let byte_pos = original.find(&run)?;
+                                let s = original[..byte_pos].chars().count();
+                                Some((s, s + run.chars().count()))
+                            })
+                            .unwrap_or((0, orig_chars.len())),
+                    };
+                let prefix: String = orig_chars[..start].iter().collect();
+                let region: String = orig_chars[start..end].iter().collect();
+                let suffix: String = orig_chars[end..].iter().collect();
+
+                // Task order, most → least promising: completions (finish
+                // the interrupted keystroke), keyboard edits of the region,
+                // coarse kana edits, and finally base-beam extras.
+                for v in kashiko_engine::typo::romaji_completion_variants(&original) {
+                    push_convert(&mut queue, v, 3, 2);
+                }
+                for (i, kb) in
+                    kashiko_engine::typo::keyboard_typo_variants(&region, MAX_KEYBOARD_VARIANTS)
+                        .into_iter()
+                        .enumerate()
+                {
+                    let beam = if i < 4 { 3 } else { 1 };
+                    push_convert(&mut queue, format!("{prefix}{kb}{suffix}"), beam, 2);
+                }
+                let chars: Vec<char> = cleaned.chars().collect();
+                let ascii_before_start = orig_chars[..start]
+                    .iter()
+                    .filter(|c| c.is_ascii_alphabetic())
+                    .count();
+                let cstart = start - ascii_before_start;
+                let cend = (cstart + (end - start)).min(chars.len());
+                for i in cstart..cend.min(chars.len()) {
+                    push_convert(
+                        &mut queue,
+                        chars[..i].iter().chain(&chars[i + 1..]).collect(),
+                        1,
+                        1,
+                    );
+                }
+                let swap_end = cend.min(chars.len()).saturating_sub(1);
+                for i in cstart..swap_end {
+                    if chars[i] != chars[i + 1] {
+                        let mut v = chars.clone();
+                        v.swap(i, i + 1);
+                        push_convert(&mut queue, v.into_iter().collect(), 1, 1);
+                    }
+                }
+                push_convert(&mut queue, cleaned, 5, 2);
+            }
+            DeepSearchKind::MoreAlternatives => {
+                // Wide main-model beam over the whole reading, then tail
+                // alternatives (`かき` → 書き/下記/柿) with the prefix held
+                // fixed.
+                let tail_split = self.split_tail_for_alternatives(&cleaned);
+                push_convert(&mut queue, cleaned.clone(), 8, 4);
+                if let Some((prefix_reading, tail_reading)) = tail_split {
+                    queue.push_back(DeepTask::TailBeam {
+                        prefix_reading,
+                        tail_reading,
+                        beam: 6,
+                    });
+                }
             }
         }
 
-        self.ensure_kanji_converter();
-        let ctx = self.truncate_context_for_api();
-        let mut seen: HashSet<String> = existing.into_iter().collect();
-        let mut uniq: HashSet<String> = HashSet::new();
-        let mut found: Vec<Candidate> = Vec::new();
+        let reading = original
+            .chars()
+            .filter(|c| !c.is_ascii_alphabetic())
+            .collect();
+        (!queue.is_empty()).then(|| DeepSearchJob {
+            request,
+            reading,
+            queue,
+            found: Vec::new(),
+            seen: existing.into_iter().collect(),
+            max_results: MAX_TOTAL_RESULTS,
+        })
+    }
 
-        let run_phase = |engine: &mut Self,
-                             variants: &[String],
-                             beam_first: usize,
-                             beam: usize,
-                             phase_cap: usize,
-                             found: &mut Vec<Candidate>,
-                             seen: &mut HashSet<String>,
-                             uniq: &mut HashSet<String>| {
-            let mut phase_found = 0usize;
-            for (i, variant) in variants.iter().enumerate() {
-                if phase_found >= phase_cap || found.len() >= MAX_TOTAL_RESULTS {
-                    break;
-                }
-                if !kashiko_engine::contains_kana(variant)
-                    || variant.chars().any(|c| c.is_ascii_alphabetic())
-                    || !uniq.insert(variant.clone())
-                {
-                    continue;
-                }
-                let n = if i < KB_BEAM_VARIANTS { beam_first } else { beam };
-                for out in engine.deep_convert(variant, &ctx, n) {
-                    if out != *variant
-                        && !kashiko_engine::has_long_unconverted_run(
-                            &out,
-                            variant,
-                            UNCONVERTED_RUN_MIN,
-                        )
-                        && !kashiko_engine::has_unrenderable_char(&out)
-                        && seen.insert(out.clone())
-                    {
-                        found.push(Candidate {
-                            text: out,
-                            reading: Some(variant.clone()),
-                            source_label: Some(CandidateSource::Model.label().to_string()),
-                            description: None,
-                        });
-                        phase_found += 1;
-                        if phase_found >= phase_cap || found.len() >= MAX_TOTAL_RESULTS {
-                            break;
-                        }
+    /// Execute one deep-search task, appending clean findings to the job.
+    fn run_deep_task(&mut self, task: DeepTask, job: &mut DeepSearchJob) {
+        let ctx = self.truncate_context_for_api();
+        fn accept(job: &mut DeepSearchJob, out: String, variant: &str) -> bool {
+            if out != variant
+                && !kashiko_engine::has_long_unconverted_run(&out, variant, UNCONVERTED_RUN_MIN)
+                && !kashiko_engine::has_unrenderable_char(&out)
+                && job.seen.insert(out.clone())
+            {
+                job.found.push(Candidate {
+                    text: out,
+                    reading: Some(variant.to_string()),
+                    source_label: Some(CandidateSource::Model.label().to_string()),
+                    description: None,
+                });
+                true
+            } else {
+                false
+            }
+        }
+
+        match task {
+            DeepTask::Convert { variant, beam, cap } => {
+                let mut added = 0usize;
+                for out in self.deep_convert(&variant, &ctx, beam) {
+                    if added >= cap || job.found.len() >= job.max_results {
+                        break;
+                    }
+                    if accept(job, out, &variant) {
+                        added += 1;
                     }
                 }
             }
-        };
+            DeepTask::TailBeam {
+                prefix_reading,
+                tail_reading,
+                beam,
+            } => {
+                let prefix_conv = self
+                    .cached_prefix_conversion(prefix_reading.chars().count())
+                    .and_then(|v| v.into_iter().next());
+                let prefix_conv = match prefix_conv {
+                    Some(p) => Some(p),
+                    None => self
+                        .deep_convert(&prefix_reading, &ctx, 1)
+                        .into_iter()
+                        .next(),
+                };
+                let Some(prefix_conv) = prefix_conv else {
+                    return;
+                };
+                let reading = job.reading.clone();
+                let tail_ctx = self.lctx_for(&ctx, &prefix_conv);
+                for tail_out in self.deep_convert(&tail_reading, &tail_ctx, beam) {
+                    if job.found.len() >= job.max_results {
+                        break;
+                    }
+                    accept(job, format!("{prefix_conv}{tail_out}"), &reading);
+                }
+            }
+        }
+    }
 
-        // Phase 1: keyboard edits — first claim on the budget.
-        run_phase(
-            self, &kb_variants, 3, 1, MAX_TOTAL_RESULTS, &mut found, &mut seen, &mut uniq,
-        );
-        // Phase 2: coarse kana edits fill what's left.
-        let remaining = MAX_TOTAL_RESULTS.saturating_sub(found.len());
-        run_phase(
-            self, &kana_variants, 1, 1, remaining, &mut found, &mut seen, &mut uniq,
-        );
-        // Phase 3: base beam extras, hard-capped.
-        let base = [cleaned.clone()];
-        run_phase(
-            self, &base, 5, 5, MAX_BASE_RESULTS.min(MAX_TOTAL_RESULTS.saturating_sub(found.len())),
-            &mut found, &mut seen, &mut uniq,
-        );
-
+    /// Merge the finished job's findings into the live candidate list and
+    /// build the notification result (always at least `HideAuxText`, to
+    /// clear the loading indicator).
+    fn finish_deep_job(&mut self, job: DeepSearchJob) -> EngineResult {
+        let found = job.found;
         let InputState::Conversion { candidates, .. } = &mut self.state else {
-            return None;
+            return EngineResult::consumed().with_action(EngineAction::HideAuxText);
         };
         if found.is_empty() {
             // Nothing new — just clear the loading indicator.
-            return Some(EngineResult::consumed().with_action(EngineAction::HideAuxText));
+            return EngineResult::consumed().with_action(EngineAction::HideAuxText);
         }
-        // Insert findings *above* the hiragana/katakana fallback entries so
-        // those always stay at the bottom, and keep the user's currently
-        // selected candidate selected — the list grows, it never jumps.
+        // Insert findings right after the currently selected candidate so
+        // they are visible on the *current page* — inserting at the bottom
+        // (above the fallbacks) buried them on page 2 whenever the quick
+        // pass had already filled page 1, which made the deep results look
+        // like they never arrived. Capped at the hiragana/katakana fallback
+        // position so those always stay at the very bottom, and the user's
+        // currently selected candidate stays selected — the list grows
+        // below the selection, it never jumps.
         let selected_text = candidates.selected_text().map(str::to_string);
+        let cursor = candidates.cursor();
         let mut all: Vec<Candidate> = candidates.candidates().to_vec();
-        let insert_at = all
+        let fallback_at = all
             .iter()
             .position(|c| {
                 matches!(c.description.as_deref(), Some("[全]ひらがな") | Some("[全]カタカナ"))
             })
             .unwrap_or(all.len());
+        let insert_at = (cursor + 1).min(fallback_at);
         all.splice(insert_at..insert_at, found);
         let mut list = CandidateList::new(all);
         if let Some(sel) = selected_text
@@ -835,11 +1086,42 @@ impl InputMethodEngine {
             list.select(idx);
         }
         *candidates = list.clone();
-        Some(
-            EngineResult::consumed()
-                .with_action(EngineAction::ShowCandidates(list))
-                .with_action(EngineAction::HideAuxText),
-        )
+        EngineResult::consumed()
+            .with_action(EngineAction::ShowCandidates(list))
+            .with_action(EngineAction::HideAuxText)
+    }
+
+    /// Split `reading` into `(prefix, tail)` for tail-alternative generation:
+    /// the last live-conversion chunk when the chunk cache still matches the
+    /// reading, else the trailing hiragana run (2..=8 chars, strictly shorter
+    /// than the whole reading). `None` when no sensible tail exists.
+    fn split_tail_for_alternatives(&self, reading: &str) -> Option<(String, String)> {
+        // Chunk-aligned split (multi-chunk long input).
+        if self.chunks.len() >= 2 {
+            let concat: String = self.chunks.iter().map(|c| c.reading.as_str()).collect();
+            if concat == reading
+                && let Some(last) = self.chunks.last()
+            {
+                let tail = last.reading.clone();
+                let prefix_len = reading.chars().count() - tail.chars().count();
+                if prefix_len > 0 && !tail.is_empty() {
+                    let prefix: String = reading.chars().take(prefix_len).collect();
+                    return Some((prefix, tail));
+                }
+            }
+        }
+        // Trailing hiragana run.
+        let chars: Vec<char> = reading.chars().collect();
+        let is_hira = |c: char| matches!(c, '\u{3041}'..='\u{3096}');
+        let mut n = 0usize;
+        while n < chars.len() && n < 8 && is_hira(chars[chars.len() - 1 - n]) {
+            n += 1;
+        }
+        (n >= 2 && n < chars.len()).then(|| {
+            let prefix: String = chars[..chars.len() - n].iter().collect();
+            let tail: String = chars[chars.len() - n..].iter().collect();
+            (prefix, tail)
+        })
     }
 
     /// Direct main-model conversion for the deep search, bypassing the
@@ -1315,6 +1597,15 @@ impl InputMethodEngine {
             }
         }
 
+        // Remember full commits for one key so Ctrl+Backspace can take the
+        // text back into conversion mode (undo commit). Partial commits are
+        // excluded — their remainder is already back in composition.
+        if remaining.is_none()
+            && let Some(reading) = &reading
+        {
+            self.last_commit = Some((reading.clone(), text.clone()));
+        }
+
         if let Some(remaining) = remaining {
             // Partial commit: commit selected segment, keep remainder for further conversion
             self.state = InputState::Empty;
@@ -1461,23 +1752,74 @@ impl InputMethodEngine {
         self.navigate_candidate(CandidateList::prev_page)
     }
 
-    /// Resize the conversion segment using Left/Right arrow keys
+    /// Word-boundary positions (in chars, ascending; the last one equals the
+    /// reading length) from greedy longest-match dictionary segmentation.
+    /// Consecutive characters with no dictionary entry (okurigana tails,
+    /// interjections, ...) are merged into a single segment so the
+    /// boundaries stay word-sized instead of degrading to per-character.
+    fn word_boundaries(&self, reading: &str) -> Vec<usize> {
+        let chars: Vec<char> = reading.chars().collect();
+        let longest_at = |pos: usize| -> usize {
+            let rest: String = chars[pos..].iter().collect();
+            let mut best = 0usize;
+            for dict in [self.dicts.user.as_ref(), self.dicts.system.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                for res in dict.common_prefix_search(&rest) {
+                    best = best.max(res.reading.chars().count());
+                }
+            }
+            best
+        };
+
+        let mut boundaries = Vec::new();
+        let mut pos = 0usize;
+        while pos < chars.len() {
+            let matched = longest_at(pos);
+            if matched > 0 {
+                pos += matched;
+            } else {
+                // Swallow the run of unmatched chars into one segment.
+                pos += 1;
+                while pos < chars.len() && longest_at(pos) == 0 {
+                    pos += 1;
+                }
+            }
+            boundaries.push(pos.min(chars.len()));
+        }
+        boundaries
+    }
+
+    /// Resize the conversion segment using Left/Right arrow keys, jumping
+    /// between dictionary word boundaries (`すべての|あぷりで|…`) instead of
+    /// one character at a time. Wraps around at either end, mirroring the
+    /// old per-character behavior.
     fn resize_conversion(&mut self, delta: isize) -> EngineResult {
         if let InputState::Conversion { split_index, .. } = self.state {
-            let full_len = self.input_buf.text.chars().count();
-            let mut new_split = if delta < 0 {
-                split_index.saturating_sub(delta.unsigned_abs())
+            let full_reading = self.input_buf.text.clone();
+            let full_len = full_reading.chars().count();
+            let boundaries = self.word_boundaries(&full_reading);
+            let new_split = if delta < 0 {
+                // Nearest boundary left of the current split; wrap to the
+                // full reading when already at the first word.
+                boundaries
+                    .iter()
+                    .rev()
+                    .find(|&&b| b < split_index)
+                    .copied()
+                    .unwrap_or(full_len)
             } else {
-                split_index.saturating_add(delta.unsigned_abs())
+                // Nearest boundary right of the current split; wrap to the
+                // first word when already covering the whole reading.
+                boundaries
+                    .iter()
+                    .find(|&&b| b > split_index)
+                    .copied()
+                    .unwrap_or_else(|| boundaries.first().copied().unwrap_or(full_len))
             };
 
-            if new_split > full_len {
-                new_split = 1;
-            } else if new_split < 1 {
-                new_split = full_len;
-            }
-
-            if new_split != split_index {
+            if new_split != split_index && new_split > 0 {
                 // Restart conversion with the new split index
                 return self.start_conversion(false, Some(new_split), 0);
             }
@@ -1516,6 +1858,11 @@ impl InputMethodEngine {
         // Record learning before committing
         if let Some(reading) = &reading {
             self.record_learning(reading, &selected_text);
+        }
+
+        // Remember the commit for one key (Ctrl+Backspace undo).
+        if let Some(reading) = &reading {
+            self.last_commit = Some((reading.clone(), selected_text.clone()));
         }
 
         // Commit immediately after digit selection

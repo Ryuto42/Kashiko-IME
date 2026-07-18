@@ -38,6 +38,10 @@ enum EngineAction: Decodable {
     case showCandidates(candidates: [CandidateItem], cursor: Int, page: Int, totalPages: Int)
     case hideCandidates
     case commit(text: String)
+    /// Undo commit (reconversion): replace this just-committed text, which
+    /// sits immediately before the caret, with the marked text from the
+    /// following updatePreedit in the same batch.
+    case deleteSurrounding(text: String)
     case updateAux(text: String)
     case hideAux
 
@@ -67,6 +71,8 @@ enum EngineAction: Decodable {
             self = .hideCandidates
         case "commit":
             self = .commit(text: try container.decode(String.self, forKey: .text))
+        case "delete_surrounding":
+            self = .deleteSurrounding(text: try container.decode(String.self, forKey: .text))
         case "update_aux":
             self = .updateAux(text: try container.decode(String.self, forKey: .text))
         case "hide_aux":

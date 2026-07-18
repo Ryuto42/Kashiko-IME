@@ -1347,15 +1347,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kashiko-fcitx5"
-version = "0.1.0"
-dependencies = [
- "kashiko-im",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "kashiko-im"
 version = "0.1.0"
 dependencies = [

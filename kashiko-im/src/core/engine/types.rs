@@ -18,6 +18,10 @@ pub enum EngineAction {
     HideCandidates,
     /// Commit text to the application
     Commit(String),
+    /// Take back the given just-committed text (undo commit / reconversion):
+    /// the frontend replaces this text — sitting immediately before the
+    /// caret — with the marked text from the accompanying preedit update.
+    DeleteSurrounding(String),
     /// Update auxiliary text (e.g., reading hint, mode indicator)
     UpdateAuxText(String),
     /// Hide auxiliary text

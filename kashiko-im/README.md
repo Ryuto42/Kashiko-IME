@@ -1,9 +1,8 @@
 # kashiko-im
 
-fcitx5（Linux）および macOS Swift フロントエンドで共有される日本語IMEエンジン。ローマ字→ひらがな変換、GPT-2ベースのニューラルかな漢字変換、学習キャッシュ、システム辞書を提供します。
+macOS Swift フロントエンドから使われる日本語IMEエンジン。ローマ字→ひらがな変換、GPT-2ベースのニューラルかな漢字変換、学習キャッシュ、システム辞書を提供します。
 
 フロントエンドのインストール手順:
-- Linux (fcitx5): [kashiko-fcitx5](../kashiko-fcitx5/README.md)
 - macOS: [kashiko-macos](../kashiko-macos/README.md)
 
 ## Features

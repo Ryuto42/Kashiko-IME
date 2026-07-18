@@ -32,19 +32,60 @@ fn main() {
     }
 
     let mut server = ImServer::new();
-    let stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
+
+    // stdin is read on its own thread and fed through a channel so the main
+    // loop can interleave deep-search steps with request handling: while a
+    // search is pending, each iteration first drains any waiting request
+    // (keys stay responsive — worst case they wait one model call), and only
+    // steps the search when the channel is idle.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin().lock();
+        for line in stdin.lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("stdin read error: {e}");
+                    break;
+                }
+            }
+        }
+    });
 
     tracing::info!("kashiko-imserver started (pid={})", std::process::id());
 
-    for line in stdin.lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(e) => {
-                tracing::error!("stdin read error: {e}");
-                break;
+    'main: loop {
+        let line = if server.deep_search_pending() {
+            match rx.try_recv() {
+                Ok(line) => Some(line),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // No request waiting: advance the search by one step.
+                    // The step cancels itself if the conversion was already
+                    // committed, so no time is wasted on finished input.
+                    if let Some(note) = server.step_deep_search()
+                        && writeln!(stdout, "{note}")
+                            .and_then(|_| stdout.flush())
+                            .is_err()
+                    {
+                        break 'main;
+                    }
+                    continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(line) => Some(line),
+                Err(_) => break, // stdin closed: frontend is gone
             }
         };
+
+        let Some(line) = line else { continue };
         if line.trim().is_empty() {
             continue;
         }
@@ -54,16 +95,6 @@ fn main() {
                 .is_err()
         {
             // stdout closed: frontend is gone
-            break;
-        }
-        // Post-response work: the deep typo search runs after the synchronous
-        // reply so the frontend gets quick candidates immediately, then the
-        // search findings arrive as an update_candidates notification.
-        if let Some(note) = server.poll_deep_search()
-            && writeln!(stdout, "{note}")
-                .and_then(|_| stdout.flush())
-                .is_err()
-        {
             break;
         }
     }

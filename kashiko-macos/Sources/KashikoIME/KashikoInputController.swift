@@ -152,15 +152,29 @@ class KashikoInputController: IMKInputController {
             }
         }
 
+        // Set by deleteSurrounding: the range of just-committed text the next
+        // setMarkedText should replace (undo commit / reconversion).
+        var pendingReplacement: NSRange?
+
         for action in actions {
             switch action {
             case .commit(let text):
                 client.insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
 
+            case .deleteSurrounding(let text):
+                let sel = client.selectedRange()
+                let len = text.utf16.count
+                if sel.location != NSNotFound && sel.location >= len {
+                    pendingReplacement = NSRange(location: sel.location - len, length: len)
+                }
+
             case .updatePreedit(let text, let caret, let attributes):
                 isConversionMode = attributes.contains { $0.style == "highlight" }
                 hasPreedit = !text.isEmpty
-                setMarkedText(text: text, caret: caret, attributes: attributes, client: client)
+                setMarkedText(
+                    text: text, caret: caret, attributes: attributes, client: client,
+                    replacementRange: pendingReplacement)
+                pendingReplacement = nil
 
             case .showCandidates(let candidates, let cursor, let page, let totalPages):
                 // Always re-query the cursor rect (cheap client IPC), rather than
@@ -234,13 +248,18 @@ class KashikoInputController: IMKInputController {
     }
 
     private func setMarkedText(
-        text: String, caret: Int, attributes: [PreeditAttr], client: any IMKTextInput
+        text: String, caret: Int, attributes: [PreeditAttr], client: any IMKTextInput,
+        replacementRange: NSRange? = nil
     ) {
+        // Default: insert at the caret. A concrete range (from
+        // deleteSurrounding) replaces just-committed document text with the
+        // marked text instead — the undo-commit / reconversion path.
+        let replacement = replacementRange ?? NSRange(location: NSNotFound, length: 0)
         guard !text.isEmpty else {
             client.setMarkedText(
                 NSAttributedString(string: ""),
                 selectionRange: NSRange(location: 0, length: 0),
-                replacementRange: NSRange(location: NSNotFound, length: 0)
+                replacementRange: replacement
             )
             return
         }
@@ -268,7 +287,7 @@ class KashikoInputController: IMKInputController {
         client.setMarkedText(
             attributed,
             selectionRange: NSRange(location: caretUTF16, length: 0),
-            replacementRange: NSRange(location: NSNotFound, length: 0)
+            replacementRange: replacement
         )
     }
 

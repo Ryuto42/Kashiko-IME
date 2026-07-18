@@ -176,6 +176,13 @@ pub enum Action {
     Commit {
         text: String,
     },
+    /// Undo commit (reconversion): the frontend replaces `text` — the
+    /// just-committed string sitting immediately before the caret — with
+    /// the marked text from the following `update_preedit` in the same
+    /// batch.
+    DeleteSurrounding {
+        text: String,
+    },
     UpdateAux {
         text: String,
     },

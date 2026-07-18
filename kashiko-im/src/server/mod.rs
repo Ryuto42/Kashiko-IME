@@ -163,15 +163,19 @@ impl ImServer {
         .map_err(internal_error)
     }
 
-    /// Run pending post-response work (the deep typo search scheduled by the
-    /// last key) and return a JSON-RPC `update_candidates` notification line
-    /// to push to the frontend, or `None` when there is nothing to do.
-    ///
-    /// Called by the main loop right after the synchronous response has been
-    /// written, so the frontend shows the quick candidates first and receives
-    /// the deep-search findings as a follow-up.
-    pub fn poll_deep_search(&mut self) -> Option<String> {
-        let result = self.engine.run_deep_typo_search()?;
+    /// Whether deep-search work is scheduled or in flight. The main loop
+    /// uses this to decide between blocking on stdin and stepping the
+    /// search, so key events are served between model calls.
+    pub fn deep_search_pending(&self) -> bool {
+        self.engine.deep_search_pending()
+    }
+
+    /// Advance the pending deep search by one increment (at most a couple
+    /// of model calls). Returns the JSON-RPC `update_candidates`
+    /// notification line when the search just finished with actions to push
+    /// to the frontend; `None` while still working or when it was canceled.
+    pub fn step_deep_search(&mut self) -> Option<String> {
+        let result = self.engine.step_deep_search()?;
         let actions: Vec<Action> = result.actions.into_iter().map(to_action).collect();
         let note = json!({
             "jsonrpc": "2.0",
@@ -239,6 +243,7 @@ fn to_action(action: EngineAction) -> Action {
         },
         EngineAction::HideCandidates => Action::HideCandidates,
         EngineAction::Commit(text) => Action::Commit { text },
+        EngineAction::DeleteSurrounding(text) => Action::DeleteSurrounding { text },
         EngineAction::UpdateAuxText(text) => {
             if text.is_empty() {
                 Action::HideAux

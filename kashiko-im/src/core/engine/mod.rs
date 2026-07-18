@@ -157,12 +157,48 @@ pub struct InputMethodEngine {
     learning: Option<LearningCache>,
     /// Whether the last key processed was backspace (used for aux hint display)
     last_key_was_backspace: bool,
-    /// Reading flagged for the post-response deep typo search. Set by
-    /// `start_conversion` when a typo-recovery path fired; consumed by the
-    /// server (via `run_deep_typo_search`) right after the synchronous
-    /// key response is written, so better corrections can be pushed to the
-    /// frontend asynchronously as an `update_candidates` notification.
-    deep_search_reading: Option<String>,
+    /// Request flagged for the post-response deep search. Set by
+    /// `start_conversion`; turned into a `DeepSearchJob` and stepped
+    /// incrementally by the server (via `step_deep_search`) between key
+    /// events, so extra candidates can be pushed to the frontend
+    /// asynchronously as an `update_candidates` notification without ever
+    /// blocking typing or candidate selection.
+    deep_search: Option<DeepSearchRequest>,
+    /// The in-flight deep search, if one is running.
+    deep_job: Option<conversion::DeepSearchJob>,
+    /// The last committed conversion `(reading, surface)`, kept for exactly
+    /// one following key so Ctrl+Backspace can take it back into conversion
+    /// mode (undo commit / reconversion). Cleared by any other key.
+    last_commit: Option<(String, String)>,
+}
+
+/// What the post-response deep search should look for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DeepSearchKind {
+    /// A typo is suspected (stray romaji / garbled conversion): search
+    /// keyboard-plausible edits of the reading for what the user meant.
+    TypoCorrection,
+    /// The quick pass produced few real candidates: widen the beam and
+    /// generate tail-segment alternatives (e.g. `…詳細に下記` → `…詳細に書き`)
+    /// so ambiguous endings get their other interpretations listed.
+    MoreAlternatives,
+}
+
+/// A scheduled deep search, scoped to the conversion it was started for —
+/// including manual Left/Right resizes, where only a prefix of the buffer is
+/// being converted.
+#[derive(Debug, Clone)]
+struct DeepSearchRequest {
+    /// The reading actually under conversion (the highlighted scope), raw —
+    /// stray ASCII included, since it is evidence for the keyboard edits.
+    reading: String,
+    /// Full input buffer at schedule time; the job cancels itself when the
+    /// buffer changes (commit, further typing).
+    buffer: String,
+    /// Conversion scope (`split_index`) at schedule time; the job cancels
+    /// itself when the user resizes the segment again.
+    scope: usize,
+    kind: DeepSearchKind,
 }
 
 impl InputMethodEngine {
@@ -188,7 +224,9 @@ impl InputMethodEngine {
             dicts: Dictionaries::default(),
             last_key_was_backspace: false,
             learning: None,
-            deep_search_reading: None,
+            deep_search: None,
+            deep_job: None,
+            last_commit: None,
         }
     }
 

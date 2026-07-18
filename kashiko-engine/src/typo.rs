@@ -152,6 +152,43 @@ fn romaji_to_kana(romaji: &str) -> Option<String> {
         .then_some(out)
 }
 
+/// "Complete the keystroke" variants for a reading with stray ASCII in it:
+/// instead of *removing* the leftover romaji (the strip pattern), treat it as
+/// an interrupted kana whose vowel was never pressed and finish it with each
+/// vowel — `wたし` → わたし/うぃたし/うたし/うぇたし/をたし, `けっk` →
+/// けっか/けっき/…. Only the first ASCII run is completed (typos are almost
+/// always a single slip); variants that don't round-trip to pure kana are
+/// dropped. Returns full readings, never equal to the input.
+pub fn romaji_completion_variants(reading: &str) -> Vec<String> {
+    let chars: Vec<char> = reading.chars().collect();
+    let Some(run_start) = chars.iter().position(|c| c.is_ascii_alphabetic()) else {
+        return vec![];
+    };
+    let run_end = chars[run_start..]
+        .iter()
+        .position(|c| !c.is_ascii_alphabetic())
+        .map_or(chars.len(), |n| run_start + n);
+    let prefix: String = chars[..run_start].iter().collect();
+    let run: String = chars[run_start..run_end]
+        .iter()
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let suffix: String = chars[run_end..].iter().collect();
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for v in ['a', 'i', 'u', 'e', 'o'] {
+        let Some(kana) = romaji_to_kana(&format!("{run}{v}")) else {
+            continue;
+        };
+        let variant = format!("{prefix}{kana}{suffix}");
+        if variant != reading && seen.insert(variant.clone()) {
+            out.push(variant);
+        }
+    }
+    out
+}
+
 /// Keyboard-plausible corrections of a suspicious kana region.
 ///
 /// Edits are applied in romaji space, ordered by how common each mistake is
@@ -233,6 +270,34 @@ mod tests {
         assert!(
             variants.iter().any(|v| v == "ため"),
             "expected ため among variants, got {variants:?}"
+        );
+    }
+
+    #[test]
+    fn completion_variants_finish_the_keystroke() {
+        let variants = romaji_completion_variants("wたし");
+        assert!(
+            variants.iter().any(|v| v == "わたし"),
+            "expected わたし among completions, got {variants:?}"
+        );
+        // Trailing interrupted kana completes too.
+        let variants = romaji_completion_variants("けっk");
+        assert!(
+            variants.iter().any(|v| v == "けっか"),
+            "expected けっか among completions, got {variants:?}"
+        );
+        // No ASCII → nothing to complete.
+        assert!(romaji_completion_variants("わたし").is_empty());
+    }
+
+    #[test]
+    fn missed_vowel_recovers_watashi() {
+        // `wたし` case: the vowel after `w` was never pressed — keystrokes
+        // `wtasi`, one vowel insertion from `watasi` (わたし).
+        let variants = keyboard_typo_variants("wたし", 14);
+        assert!(
+            variants.iter().any(|v| v == "わたし"),
+            "expected わたし among variants, got {variants:?}"
         );
     }
 

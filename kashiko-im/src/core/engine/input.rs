@@ -172,6 +172,20 @@ impl InputMethodEngine {
 
     /// Process key in empty state
     pub(super) fn process_key_empty(&mut self, key: &KeyEvent, shift_active: bool) -> EngineResult {
+        // Ctrl+Backspace right after a conversion commit: undo the commit
+        // and return to conversion mode (reconversion). Any other key
+        // invalidates the undo window, since the caret may move away from
+        // the committed text.
+        if key.is_press {
+            if key.keysym == Keysym::BACKSPACE && key.modifiers.control_key {
+                if let Some((reading, surface)) = self.last_commit.take() {
+                    return self.reconvert_last_commit(reading, surface);
+                }
+                return EngineResult::not_consumed();
+            }
+            self.last_commit = None;
+        }
+
         // Ctrl+Space: start input with full-width space
         if key.modifiers.control_key && key.keysym == Keysym::SPACE {
             self.converters.romaji.reset();
@@ -511,6 +525,10 @@ impl InputMethodEngine {
         // so storing it would corrupt the kana-keyed learning cache.
         if self.input_mode != InputMode::Emoji {
             self.record_learning(&reading, &text);
+            // Remember the commit for one key so Ctrl+Backspace can take it
+            // back into conversion mode — live-conversion Enter commits are
+            // the most common commit path on macOS.
+            self.last_commit = Some((reading.clone(), text.clone()));
         }
 
         self.converters.romaji.reset();

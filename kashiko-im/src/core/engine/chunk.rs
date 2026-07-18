@@ -335,7 +335,7 @@ impl InputMethodEngine {
     /// truncated to the API context budget. Defined once so the context the
     /// model is given at conversion time (`convert_new_chunk`) stays identical
     /// to the one displayed in the aux text (`chunk_lctx`).
-    fn lctx_for(&self, base: &str, preceding_converted: &str) -> String {
+    pub(super) fn lctx_for(&self, base: &str, preceding_converted: &str) -> String {
         self.truncate_context(&format!("{base}{preceding_converted}"))
     }
 
