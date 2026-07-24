@@ -39,6 +39,11 @@ impl LearningCache {
     /// shown. Long sentences committed once should not be memorized wholesale.
     pub const MAX_LEARN_SURFACE_CHARS: usize = 12;
 
+    /// Length cap for all-latin surfaces (`InputMethodKit`). Higher than the
+    /// Japanese cap: the limit exists to reject memorized sentences, and a
+    /// long English identifier is still a single word.
+    pub const MAX_LEARN_LATIN_CHARS: usize = 24;
+
     /// Create an empty cache with the given entry limit.
     pub fn new(max_entries: usize) -> Self {
         Self {
@@ -76,19 +81,51 @@ impl LearningCache {
     /// Whether a `(reading, surface)` pair is worth learning.
     ///
     /// Rejects: overly long surfaces, unconverted surfaces (equal to the
-    /// reading or all-kana), surfaces with leftover ASCII romaji, and surfaces
-    /// containing a run of 3+ identical characters (mistyped repeats).
+    /// reading or all-kana), surfaces with leftover ASCII romaji mixed into
+    /// Japanese, and surfaces containing a run of 3+ identical characters
+    /// (mistyped repeats). A *pure* latin word (`WordPress`) is accepted —
+    /// see below.
     pub fn is_learnable(reading: &str, surface: &str) -> bool {
         if surface.is_empty() {
             return false;
         }
-        // Feature 1: length cap.
-        if surface.chars().count() >= Self::MAX_LEARN_SURFACE_CHARS {
+        // A surface that is entirely latin letters/digits is a real word the
+        // user typed (`WordPress`, `iPhone`), not a conversion failure: the
+        // romaji converter mangles those keystrokes into kana, so learning
+        // them is the only way to offer the spelling back later. Recognized
+        // here because the leftover-romaji and no-kanji rules below exist for
+        // *Japanese* surfaces and would both reject it.
+        let pure_latin = surface.chars().all(|c| c.is_ascii_alphanumeric())
+            && surface.chars().any(|c| c.is_ascii_alphabetic());
+        // Feature 1: length cap. Latin words get a longer allowance — the cap
+        // targets runaway *sentences*, and `InputMethodKit` is one word.
+        let max_chars = if pure_latin {
+            Self::MAX_LEARN_LATIN_CHARS
+        } else {
+            Self::MAX_LEARN_SURFACE_CHARS
+        };
+        if surface.chars().count() >= max_chars {
             return false;
         }
-        // Feature 3-2: leftover romaji (ASCII letters) means it was never converted.
-        if surface.chars().any(|c| c.is_ascii_alphabetic()) {
-            return false;
+        // Feature 3-2: ASCII mixed into Japanese is usually leftover romaji the
+        // model never converted (`できないt消す`). But mixed script is also
+        // legitimate — `私はLinuxが` is a documented conversion result — so
+        // reject only when *every* latin run looks like a stray fragment: one
+        // or two lowercase letters. A run with a capital or ≥3 letters is a
+        // word, not a slip.
+        if !pure_latin {
+            let mut runs = surface.split(|c: char| !c.is_ascii_alphanumeric());
+            let mut saw_run = false;
+            let all_fragments = runs.all(|run| {
+                if run.is_empty() {
+                    return true;
+                }
+                saw_run = true;
+                run.chars().count() <= 2 && run.chars().all(|c| c.is_ascii_lowercase())
+            });
+            if saw_run && all_fragments {
+                return false;
+            }
         }
         // Unrenderable characters (rare historical kana, stray model control
         // tokens) — see `has_unrenderable_char`.
@@ -101,7 +138,7 @@ impl LearningCache {
             return false;
         }
         let has_kanji = surface.chars().any(is_kanji);
-        if !has_kanji && surface.chars().count() >= 6 {
+        if !pure_latin && !has_kanji && surface.chars().count() >= 6 {
             return false;
         }
         // Feature 3-3: 3+ consecutive identical characters (garbage repeats).
@@ -133,6 +170,16 @@ impl LearningCache {
             .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         scored
+    }
+
+    /// Whether any learned entry has exactly this surface form, regardless of
+    /// reading. Used to recognize a latin word the user has committed before
+    /// (e.g. `WordPress`) so it can be offered again even though the romaji
+    /// converter turned the keystrokes into kana.
+    pub fn has_surface(&self, surface: &str) -> bool {
+        self.entries
+            .values()
+            .any(|entries| entries.iter().any(|e| e.surface == surface))
     }
 
     /// Highest-scoring `(surface, frequency)` for an exact reading match, if any.
@@ -377,6 +424,33 @@ mod tests {
         // "今日" should have higher score (frequency 2 vs 1)
         assert_eq!(results[0].0, "今日");
         assert_eq!(results[1].0, "京");
+    }
+
+    #[test]
+    fn pure_latin_surface_is_learnable() {
+        // A latin word the romaji converter mangled into kana must be
+        // learnable — it's the only way to offer the spelling back later.
+        assert!(LearningCache::is_learnable("wおrdpレッ", "WordPress"));
+        assert!(LearningCache::is_learnable("いphおね", "iPhone"));
+        // A long latin identifier is one word, so it clears the Japanese cap.
+        assert!(LearningCache::is_learnable("いんぷっと", "InputMethodKit"));
+        // Stray lowercase fragments in Japanese are leftover romaji → rejected.
+        assert!(!LearningCache::is_learnable("できないt", "できないt消す"));
+        // Legitimate mixed script (a documented conversion result) is kept.
+        assert!(LearningCache::is_learnable("わたしはlinuxが", "私はLinuxが"));
+        // And a pure-latin surface still obeys its own (longer) cap.
+        assert!(!LearningCache::is_learnable(
+            "x",
+            "Supercalifragilisticexpialidocious"
+        ));
+    }
+
+    #[test]
+    fn latin_surface_round_trips_through_has_surface() {
+        let mut cache = LearningCache::new(100);
+        cache.record("wおrdpレッ", "WordPress");
+        assert!(cache.has_surface("WordPress"));
+        assert!(!cache.has_surface("Wordpress"));
     }
 
     #[test]

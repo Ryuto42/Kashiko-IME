@@ -12,6 +12,8 @@ macOS Swift フロントエンドから使われる日本語IMEエンジン。�
 - 日本語・英数字の混合入力（Shift切り替え）
 - Surrounding Textによる文脈を考慮した変換
 - システム辞書・ユーザー辞書による候補補完
+- タイプミスの補正候補（キーボード配置を考慮した打鍵誤りの推定。変換応答後もバックグラウンドで探索を継続）
+- ローマ字変換で崩れた英単語の復元（確度に応じて候補順位を決定）
 
 > [!NOTE]
 > モデル推論だけでは語彙が限られるため、システム辞書の併用を強く推奨します。システム辞書はIMEに同梱されていないため、別途インストールが必要です。詳しくは [Dictionary](#dictionary) を参照してください。
@@ -39,10 +41,13 @@ macOS Swift フロントエンドから使われる日本語IMEエンジン。�
 |------|------|
 | Space / Tab / ↓ | 次の候補 |
 | ↑ | 前の候補 |
+| ← → | 変換範囲を単語区切りで伸縮（残りは未変換のまま） |
 | 1-9 | 候補を番号で選択・確定 |
 | Enter | 選択中の候補を確定 |
 | Escape | 変換をキャンセル（ひらがなに戻る） |
 | 文字キー | 選択中の候補を確定して新しい入力を開始 |
+
+確定した直後に `Ctrl+Backspace` を押すと、確定を取り消して変換モードに戻せます（標準のCocoaテキスト部品で動作。一部のElectron系アプリでは効かない場合があります）。
 
 ### モード切り替え
 
@@ -61,7 +66,7 @@ macOS Swift フロントエンドから使われる日本語IMEエンジン。�
 
 ## Configuration
 
-設定ファイル: `~/.config/kashiko-im/config.toml`（macOS: `~/Library/Application Support/com.kashiko.kashiko-im/config.toml`）
+設定ファイル: `~/Library/Application Support/com.kashiko.kashiko-im/config.toml`
 
 ```toml
 [conversion]
@@ -122,20 +127,13 @@ CPU高負荷時（Rustビルド中など）にかな漢字変換が遅くなる�
 
 double-array trieベースのシステム辞書で、モデル推論に加えて辞書からの変換候補を提供します。
 
-- デフォルトパス: `~/.local/share/kashiko-im/dict.bin`（macOS: `~/Library/Application Support/com.kashiko.kashiko-im/dict.bin`）
+- デフォルトパス: `~/Library/Application Support/com.kashiko.kashiko-im/dict.bin`
 - `dict_path` で任意のパスを指定可能
 - ファイルが存在しない場合は辞書なしで動作
 
-ビルド済みの辞書を以下からダウンロードして配置できます:
+`make install` が自動でダウンロードしますが、手動で配置する場合は以下のとおりです:
 
 ```bash
-# Linux
-wget https://github.com/togatoga/kashiko/releases/download/v0.1.0/dict.tgz
-tar xzf dict.tgz
-mkdir -p ~/.local/share/kashiko-im
-cp dict.bin ~/.local/share/kashiko-im/
-
-# macOS
 curl -LO https://github.com/togatoga/kashiko/releases/download/v0.1.0/dict.tgz
 tar xzf dict.tgz
 mkdir -p ~/Library/"Application Support"/com.kashiko.kashiko-im
@@ -148,7 +146,7 @@ cp dict.bin ~/Library/"Application Support"/com.kashiko.kashiko-im/
 
 ユーザー辞書ディレクトリにファイルを配置すると、ユーザー辞書として読み込まれます。
 
-- デフォルトパス: `~/.local/share/kashiko-im/user_dicts/`（macOS: `~/Library/Application Support/com.kashiko.kashiko-im/user_dicts/`）
+- デフォルトパス: `~/Library/Application Support/com.kashiko.kashiko-im/user_dicts/`
 - ディレクトリ内のファイルはすべて自動で読み込み（KRKNバイナリ・Mozc TSV を自動判定）
 - ディレクトリが存在しない場合はユーザー辞書なしで動作
 
@@ -158,18 +156,20 @@ cp dict.bin ~/Library/"Application Support"/com.kashiko.kashiko-im/
 2. 👤 ユーザー辞書
 3. 🤖 モデル推論
 4. 📚 システム辞書（スコア順）
-5. ひらがな / カタカナ
-6. 🔄 Rewriter（半角カタカナ・英字全角半角・記号バリアント）
+5. 🔄 Rewriter（英字全角半角・記号バリアント）
+6. ひらがな / カタカナ（常に最下部）
+
+半角カタカナは候補に表示しません（全角形と並ぶとノイズになるため）。
 
 ### Learning Cache
 
 ユーザーが選択した変換結果を記憶し、次回以降の変換で優先表示します。
 
-- 保存先: `~/.local/share/kashiko-im/learning.tsv`（macOS: `~/Library/Application Support/com.kashiko.kashiko-im/learning.tsv`）
+- 保存先: `~/Library/Application Support/com.kashiko.kashiko-im/learning.tsv`
 - 完全一致と前方一致（予測変換）の両方に対応
   - 例: 「早稲田大学」を一度変換すると、次回「わせだ」と入力した時点で候補に表示
-- 学習候補は変換時・入力中（auto-suggest）の両方で最大3件表示
+- 学習候補は変換時（Space押下後）に最大3件表示。入力中は候補ウィンドウを出さず、ライブ変換のプリエディットのみを表示します
 - スコアはrecency（最終使用日時）重視 + 頻度補正
 - IME切り替え・ウィンドウ切り替え時に自動保存（commit のたびには保存しない）
 - `[learning] enabled = false` で無効化可能
-- 学習履歴を削除するには: `rm ~/.local/share/kashiko-im/learning.tsv`
+- 学習履歴を削除するには: `rm ~/Library/"Application Support"/com.kashiko.kashiko-im/learning.tsv`

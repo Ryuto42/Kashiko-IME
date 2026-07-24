@@ -97,6 +97,7 @@ impl InputMethodEngine {
 
     /// Surrounding-text context line (editor left/right). Used by conversion-mode
     /// aux text, where there is no live chunking.
+    #[allow(dead_code)]
     pub(super) fn display_context(&self) -> String {
         let ctx = self.surrounding_context.as_ref();
         self.context_line(
@@ -148,6 +149,7 @@ impl InputMethodEngine {
     }
 
     /// Get token count for a reading (returns None if converter not initialized)
+    #[allow(dead_code)]
     pub(super) fn get_token_count(&self, reading: &str) -> Option<usize> {
         self.converters
             .kanji
@@ -157,6 +159,7 @@ impl InputMethodEngine {
 
     /// Get the display name of the model used for the last conversion
     /// Falls back to the static model name if no conversion has happened yet
+    #[allow(dead_code)]
     fn last_used_model(&self) -> String {
         if self.metrics.model_name.is_empty() {
             self.model_name()
@@ -166,14 +169,17 @@ impl InputMethodEngine {
     }
 
     /// Format aux text for conversion mode
+    /// Currently empty: the aux line in conversion mode is reserved for the
+    /// deep-search progress indicator, which `start_conversion` sets directly.
+    /// Kept as a hook (and to keep the action shape uniform) — it must stay
+    /// cheap, since it runs on every conversion and every candidate move. It
+    /// used to call `display_context`/`last_used_model`/`get_token_count` and
+    /// throw the results away, which put a tokenizer pass on that hot path.
     pub(super) fn format_aux_conversion_with_page(
         &self,
         _reading: &str,
         _candidates: Option<&CandidateList>,
     ) -> String {
-        let _ctx = self.display_context();
-        let _model = self.last_used_model();
-        let _tokens = self.get_token_count(_reading);
         String::new()
     }
 

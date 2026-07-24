@@ -11,6 +11,7 @@ mod conversion;
 mod cursor;
 mod emoji;
 mod katakana;
+mod latin_word;
 mod learning;
 mod live_conversion;
 mod mode_toggle;

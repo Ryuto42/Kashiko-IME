@@ -1,5 +1,6 @@
 pub mod dict;
 pub mod kana;
+pub mod latin;
 pub mod kanji;
 pub mod learning;
 pub mod rewriter;

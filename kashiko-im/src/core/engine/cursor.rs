@@ -22,6 +22,11 @@ impl InputMethodEngine {
     /// Handle backspace in composing mode
     pub(super) fn backspace_composing(&mut self) -> EngineResult {
         self.last_key_was_backspace = true;
+        // Keep the keystroke history in step with the buffer. Kana and
+        // keystrokes aren't 1:1 (`ka` → `か`), so this is approximate; the
+        // latin-word candidate it feeds only matters while the two still
+        // line up, and an over-trimmed history simply stops offering it.
+        self.input_buf.raw_keys.pop();
         // If romaji buffer is not empty, backspace from buffer (not from composed text)
         if !self.converters.romaji.buffer().is_empty() {
             let old_output_len = self.converters.romaji.output().chars().count();

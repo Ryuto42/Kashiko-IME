@@ -1,5 +1,5 @@
 # Kashiko IME デフォルト設定
-# このファイルは ~/.config/kashiko-im/config.toml にコピーして使用してください
+# このファイルは ~/Library/Application Support/com.kashiko.kashiko-im/config.toml にコピーして使用してください
 
 [conversion]
 # 変換ストラテジー: adaptive（動的切替）, light（軽量モデルのみ）, main（メインモデルのみ）
@@ -29,7 +29,7 @@ light_model = "jinen-v1-xsmall-q5"
 n_threads = 4
 # 起動時にライブ変換を有効にする（Ctrl+Shift+L で実行中も切替可能）
 live_conversion = true
-# ユーザー辞書: ~/.local/share/kashiko-im/user_dicts/ に辞書ファイルを配置（Mozc TSV or KRKN binary）
+# ユーザー辞書: ~/Library/Application Support/com.kashiko.kashiko-im/user_dicts/ に辞書ファイルを配置（Mozc TSV or KRKN binary）
 
 [learning]
 # 変換学習を有効にする

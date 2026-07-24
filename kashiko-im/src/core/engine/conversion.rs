@@ -55,6 +55,19 @@ pub(super) struct DeepSearchJob {
 /// unconverted (e.g. `できないようらな` = 8) does.
 const UNCONVERTED_RUN_MIN: usize = 7;
 
+/// Score added to a latin-word candidate the user has committed before, or
+/// that a dictionary lists verbatim. Large enough to outrank any purely
+/// heuristic score, since a previous commit is proof rather than a guess.
+pub(super) const KNOWN_LATIN_BONUS: u32 = 16;
+
+/// Minimum latin-word score worth showing at all.
+const MIN_LATIN_SCORE: u32 = 6;
+
+/// At or above this score the composition is treated as a deliberate latin
+/// word, so the typo-recovery machinery (which reads the same "ASCII mixed
+/// with kana" signal as a mistyped key) stands down.
+const STRONG_LATIN_SCORE: u32 = 10;
+
 /// Mozc-style width/script annotation for a pure-kana candidate, or `None`
 /// if the text mixes scripts or contains kanji/punctuation. Used to label
 /// `あ` / `ア` / `ｱ` candidates in the conversion list.
@@ -301,7 +314,17 @@ impl InputMethodEngine {
         // consumes the whole buffer, stray chars included. Only when neither
         // produces a real conversion do we keep the old split behavior
         // (prefix converted, tail left raw).
-        let has_stray_ascii = full_reading.chars().any(|c| c.is_ascii_alphabetic())
+        //
+        // A composition we're confident is a deliberate latin word reads the
+        // same way ("ASCII mixed with kana") but must NOT go down this path:
+        // stripping or vowel-completing `WordPress` produces nonsense, and
+        // rewriting `reading` to the stripped kana would build the candidate
+        // list for `おレッ`. Step 10c offers the spelling instead.
+        let deliberate_latin = self
+            .latin_word_candidate()
+            .is_some_and(|(_, score)| score >= STRONG_LATIN_SCORE);
+        let has_stray_ascii = !deliberate_latin
+            && full_reading.chars().any(|c| c.is_ascii_alphabetic())
             && kashiko_engine::contains_kana(&full_reading);
         let mut candidates: Option<Vec<AnnotatedCandidate>> = None;
         if split_index.is_none() && has_stray_ascii {
@@ -353,6 +376,8 @@ impl InputMethodEngine {
                     self.config.num_candidates,
                     skip_learning,
                     None,
+                    // Whole-buffer scope: the latin word belongs here.
+                    true,
                 );
                 has_real_conversion |= cleaned_candidates
                     .iter()
@@ -385,6 +410,8 @@ impl InputMethodEngine {
                 self.config.num_candidates,
                 skip_learning,
                 cached_model,
+                // Latin candidate only when converting the whole buffer.
+                split_idx == total_chars,
             ),
         };
 
@@ -434,6 +461,8 @@ impl InputMethodEngine {
                         self.config.num_candidates,
                         skip_learning,
                         None,
+                        // Prefix scope: the whole-buffer keystrokes don't apply.
+                        false,
                     );
                     let prefix_is_clean = prefix_candidates.first().is_some_and(|c| {
                         c.text != prefix_reading
@@ -547,10 +576,18 @@ impl InputMethodEngine {
         // segment whose conversion failed (only fallback candidates) also
         // gets the recovery search.
         let scoped_raw: String = full_reading.chars().take(split_idx).collect();
-        let scope_has_ascii = scoped_raw.chars().any(|c| c.is_ascii_alphabetic());
+        let scope_has_ascii =
+            !deliberate_latin && scoped_raw.chars().any(|c| c.is_ascii_alphabetic());
+        // Alternatives are only worth a background pass on input long enough
+        // to have competing readings; short input would otherwise schedule a
+        // model run on nearly every Space press, since a thin candidate list
+        // is normal there.
+        const MIN_ALTERNATIVES_READING_CHARS: usize = 6;
         let kind = if typo_suspected || scope_has_ascii || top_garbled {
             Some(DeepSearchKind::TypoCorrection)
-        } else if real_candidate_count < MIN_QUICK_REAL_CANDIDATES {
+        } else if real_candidate_count < MIN_QUICK_REAL_CANDIDATES
+            && reading.chars().count() >= MIN_ALTERNATIVES_READING_CHARS
+        {
             Some(DeepSearchKind::MoreAlternatives)
         } else {
             None
@@ -649,6 +686,51 @@ impl InputMethodEngine {
         }
 
         candidates
+    }
+
+    /// The raw keystrokes as a latin-word candidate, with a confidence score,
+    /// when the composition looks like a latin word the romaji converter
+    /// mangled into kana.
+    ///
+    /// Typing `WordPress` yields the buffer `WおrdPレッ`: the keystrokes are
+    /// the only place the intended spelling still exists, so they are offered
+    /// back as a candidate. See [`kashiko_engine::latin::latin_word_confidence`]
+    /// for the gates that keep ordinary Japanese input (whose keystrokes are
+    /// also pure romaji) out. Having committed the word before, or finding it
+    /// verbatim in a dictionary, adds a large bonus — that is proof, not a
+    /// guess — and pushes the candidate to the top of the list.
+    ///
+    /// The score is what ranks the candidate *among* the real conversions
+    /// rather than pinning it to either end (see `latin_insert_index`).
+    pub(super) fn latin_word_candidate(&self) -> Option<(String, u32)> {
+        let raw = self.input_buf.raw_keys.trim();
+        let mut score = kashiko_engine::latin::latin_word_confidence(raw, &self.input_buf.text)?;
+        let known = self.learning.as_ref().is_some_and(|c| c.has_surface(raw))
+            || [self.dicts.user.as_ref(), self.dicts.system.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|d| d.exact_match_search(raw).is_some());
+        if known {
+            score += KNOWN_LATIN_BONUS;
+        }
+        (score >= MIN_LATIN_SCORE).then(|| (raw.to_string(), score))
+    }
+
+    /// Where a latin-word candidate scoring `score` belongs in the candidate
+    /// list: proven words lead, strong guesses sit just under the top
+    /// conversion, weaker ones a little further down — but always *within* the
+    /// normal candidates, never appended after the fallbacks.
+    fn latin_insert_index(score: u32, len: usize) -> usize {
+        let rank = if score >= KNOWN_LATIN_BONUS {
+            0
+        } else if score >= 12 {
+            1
+        } else if score >= 9 {
+            2
+        } else {
+            3
+        };
+        rank.min(len)
     }
 
     /// Longest dictionary-word reading that is a *proper* prefix of `reading`
@@ -1175,12 +1257,16 @@ impl InputMethodEngine {
     /// `skip_learning` suppresses the learning-cache step (1). Used by the Tab
     /// key path so users can escape a noisy learning history without losing
     /// access to dictionary/model candidates.
+    /// `allow_latin` enables the raw-keystroke latin-word candidate (step 10c).
+    /// Only the whole-buffer calls pass `true`; a prefix-scoped retry must not
+    /// offer a candidate covering text outside its scope.
     pub(super) fn build_conversion_candidates(
         &mut self,
         reading: &str,
         num_candidates: usize,
         skip_learning: bool,
         cached_model: Option<Vec<String>>,
+        allow_latin: bool,
     ) -> Vec<AnnotatedCandidate> {
         // Try to initialize the kanji converter, but don't bail out if it
         // fails — symbol-only inputs (e.g. `。。。`) don't need the model and
@@ -1375,6 +1461,26 @@ impl InputMethodEngine {
                 && !(!c.text.is_empty()
                     && c.text.chars().all(|ch| ('\u{FF61}'..='\u{FF9F}').contains(&ch)))
         });
+
+        // 10c. The raw keystrokes as a latin word (`WordPress` out of the
+        //      buffer `WおrdPレッ`) — no other source can reconstruct it from
+        //      the kana. Inserted *among* the real candidates at a position
+        //      set by its confidence score, so a proven word leads while a
+        //      weaker guess sits a couple of rows down. Only for whole-buffer
+        //      conversions: the keystrokes cover the entire composition, so
+        //      injecting them into a prefix-scoped list would commit text
+        //      outside that scope.
+        if allow_latin
+            && let Some((latin, score)) = self.latin_word_candidate()
+            && !builder.candidates.iter().any(|c| c.text == latin)
+        {
+            let at = Self::latin_insert_index(score, builder.candidates.len());
+            builder.seen.insert(latin.clone());
+            builder.candidates.insert(
+                at,
+                AnnotatedCandidate::new(latin, CandidateSource::UserDictionary),
+            );
+        }
 
         // 11. Drop low-quality model guesses: when the user mistypes mid-phrase
         //     (e.g. `できないようらな…`), the model often emits a candidate that
@@ -1609,8 +1715,7 @@ impl InputMethodEngine {
         if let Some(remaining) = remaining {
             // Partial commit: commit selected segment, keep remainder for further conversion
             self.state = InputState::Empty;
-            self.input_buf.text = remaining;
-            self.input_buf.cursor_pos = self.input_buf.text.chars().count();
+            self.input_buf.set_text(remaining);
             self.live.text.clear();
             self.chunks.clear();
 

@@ -9,6 +9,12 @@ pub(super) struct InputBuffer {
     pub text: String,
     /// Cursor position (in characters, not bytes)
     pub cursor_pos: usize,
+    /// Raw printable keystrokes of this composition, before romaji→kana
+    /// conversion. Typing `WordPress` leaves `text` as `Wおrdpレッ`, which no
+    /// kana-keyed lookup can recover; keeping the keystrokes lets the engine
+    /// offer the latin spelling back as a candidate. Lives here so it is
+    /// cleared together with the text it belongs to.
+    pub raw_keys: String,
 }
 
 impl InputBuffer {
@@ -17,13 +23,28 @@ impl InputBuffer {
         Self {
             text: String::new(),
             cursor_pos: 0,
+            raw_keys: String::new(),
         }
     }
 
-    /// Clear the buffer (text, cursor).
+    /// Clear the buffer (text, cursor, raw keystrokes).
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor_pos = 0;
+        self.raw_keys.clear();
+    }
+
+    /// Replace the whole buffer with `text`, dropping the keystroke history.
+    ///
+    /// Use this instead of assigning `text` directly whenever the buffer stops
+    /// corresponding to what the user typed — a partial commit leaving only
+    /// the remainder, a katakana bake, and so on. A stale `raw_keys` would
+    /// otherwise make the engine offer the *original* keystrokes as a latin
+    /// word for text they no longer cover.
+    pub fn set_text(&mut self, text: String) {
+        self.text = text;
+        self.cursor_pos = self.text.chars().count();
+        self.raw_keys.clear();
     }
 
     /// Insert text at the current cursor position.

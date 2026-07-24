@@ -16,6 +16,7 @@ Kashiko IME は、macOS環境向けに最適化された次世代の日本語入
 - **高度なフォーマッター**: 半角カタカナ、全角英数、各種記号、16進数など、多様な表記バリエーションを自動生成します。
 - **長文入力の最適化**: ライブ変換で使ったチャンク単位の変換結果を再利用することで、スペースキー押下時の再変換コストを削減。入力途中でスペルミスがあっても、変換に失敗した箇所の手前まではきれいに変換し、以降は未変換のまま残して再入力しやすくします。
 - **タイプミスのAI補正**: キーボードの物理配置を考慮した打鍵誤りの推定（転置・隣接キー・母音抜け等）により、「本来打ちたかった文」を候補として提示。変換応答を返した後もバックグラウンドで探索を続け、見つかった候補を順次追加します（入力操作はブロックしません）。
+- **英単語の復元**: ローマ字変換で崩れてしまった英単語を、打鍵内容から復元して候補に提示します。英単語らしさをスコア化し、確度が高いものほど候補上位に並びます。一度確定した単語は次回からライブ変換にも反映されます。
 - **確定取り消し（再変換）**: 確定直後に `Ctrl+Backspace` で、確定したテキストを変換モードに戻せます。
 - **単語単位の変換範囲調整**: 変換中の `←`/`→` キーで、辞書の単語区切りに沿って変換範囲を伸縮できます。
 
@@ -69,7 +70,7 @@ Kashiko IMEは、Rustで書かれた高速なバックエンドエンジンと�
 
 Kashiko IME はローカル完結で動作し、入力内容や学習データを外部に送信することはありません。
 
-- **辞書・学習データ**: ユーザー辞書は `~/.local/share/kashiko-im/user_dicts/`、変換学習キャッシュは `~/.local/share/kashiko-im/learning.tsv` にのみ保存され、すべて端末内で完結します。
+- **辞書・学習データ**: ユーザー辞書は `~/Library/Application Support/com.kashiko.kashiko-im/user_dicts/`、変換学習キャッシュは同ディレクトリの `learning.tsv` にのみ保存され、すべて端末内で完結します。
 - **AIモデルによる変換**: かな漢字変換は `llama.cpp` によるローカル推論で行われ、入力テキストが外部サーバーに送信されることはありません。
 - **ネットワーク通信が発生するタイミング**: 初回ビルド時のみ、Hugging Face から GGUF モデルおよびシステム辞書をダウンロードします（`kashiko-engine/src/kanji/hf_download.rs`）。それ以外の通常利用時に外部通信は行いません。
 
@@ -80,8 +81,12 @@ Kashiko IME は MIT OR Apache-2.0 のデュアルライセンスで提供され�
 - [MIT License](LICENSE-MIT)
 - [Apache License 2.0](LICENSE-APACHE)
 
-一部のデータ(`kashiko-engine/data/`)は、GoogleのMozcプロジェクトから派生した辞書データを含んでおり、BSD 3-Clause License のもとで配布されています。詳細は [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES) を参照してください。
+本プロジェクトは [togatoga/kashiko](https://github.com/togatoga/kashiko)（MIT OR Apache-2.0）を元に、macOS向けに改変した派生物です。MITライセンスの要求に従い、原著作権表示は [LICENSE-MIT](LICENSE-MIT) に本フォークの表示と併記して保持しています。
 
-### クレジット
+第三者素材の帰属とライセンスは [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES) に一覧しています。主なものは以下のとおりです。
 
-かな漢字変換に使用しているニューラルモデル（jinen-v1シリーズ）およびシステム辞書は [togatoga](https://github.com/togatoga) 氏のOSSを利用しています。
+- **記号・絵文字データ** (`kashiko-engine/data/`): GoogleのMozcプロジェクト由来（BSD 3-Clause License）
+- **システム辞書** (`dict.bin`、初回ビルド時にダウンロード): SudachiDict 由来（Apache License 2.0）。通知は [kashiko-macos/docs/](kashiko-macos/docs/) にあります
+- **ニューラルモデル** (jinen-v1シリーズ、初回ビルド時にHugging Faceからダウンロード): togatoga氏が公開しているモデルを利用しています
+
+モデルとシステム辞書は本リポジトリには含まれず、ビルド時に取得されます。それぞれの配布元の条件が適用されます。

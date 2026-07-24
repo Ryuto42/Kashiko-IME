@@ -28,33 +28,23 @@ fn append_candidates_dedup(target: &mut Vec<Candidate>, source: Vec<Candidate>) 
     }
 }
 
+/// Whether `text` is disproportionately longer than `reading` — the shape of a
+/// model hallucination (a 1–2 char reading converting into a whole phrase).
+/// Shared by the candidate filter and the live-conversion guard so both reject
+/// the same thing.
+fn is_overlong_for_reading(text: &str, reading: &str) -> bool {
+    let reading_len = reading.chars().count();
+    let text_len = text.chars().count();
+    text_len > reading_len * 2 + 4
+        || (text_len >= 12 && reading_len < 8)
+        || (reading_len < LONG_INPUT_THRESHOLD && text_len > SHORT_INPUT_MAX_CANDIDATE_LEN)
+}
+
 /// Remove candidates that are disproportionately long relative to the reading.
 /// When the reading is short (< `LONG_INPUT_THRESHOLD` chars), candidates
 /// longer than `SHORT_INPUT_MAX_CANDIDATE_LEN` chars are dropped.
 fn filter_long_candidates_for_short_input(candidates: &mut Vec<Candidate>, reading: &str) {
-    let reading_len = reading.chars().count();
-    candidates.retain(|c| {
-        let text_len = c.text.chars().count();
-
-        // Never show candidates that are more than 2x longer than the reading.
-        // This prevents previously-learned long sentences from appearing
-        // as suggestions while the user is still composing a shorter phrase.
-        if text_len > reading_len * 2 + 4 {
-            return false;
-        }
-
-        // Block long model outputs (12+ chars) when reading is short
-        if text_len >= 12 && reading_len < 8 {
-            return false;
-        }
-
-        // Standard short input filter
-        if reading_len < LONG_INPUT_THRESHOLD {
-            text_len <= SHORT_INPUT_MAX_CANDIDATE_LEN
-        } else {
-            true
-        }
-    });
+    candidates.retain(|c| !is_overlong_for_reading(&c.text, reading));
 }
 
 impl InputMethodEngine {
@@ -150,7 +140,23 @@ impl InputMethodEngine {
         // Live conversion mode: show converted text in preedit. No candidate
         // popup here either — Space still brings up the full candidate list.
         if self.live.enabled && self.input_mode != InputMode::Katakana {
-            self.live.text = candidates[0].clone();
+            // A latin word we're confident about (`WordPress`) beats the kana
+            // the romaji converter produced from those keystrokes. Only proven
+            // words drive live conversion — an unproven guess still appears in
+            // the Space candidate list, but must not hijack the preedit.
+            let latin = self
+                .latin_word_candidate()
+                .filter(|(_, score)| *score >= super::conversion::KNOWN_LATIN_BONUS)
+                .map(|(text, _)| text);
+            let suggestion = latin.unwrap_or_else(|| candidates[0].clone());
+            // Guard against the model hallucinating a long continuation for a
+            // short reading — a 1–2 char input must not live-convert into a
+            // whole phrase.
+            self.live.text = if is_overlong_for_reading(&suggestion, &self.input_buf.text) {
+                self.input_buf.text.clone()
+            } else {
+                suggestion
+            };
             let preedit = self.set_composing_state();
             let aux = self.format_aux_suggest(&self.input_buf.text.clone());
             return EngineResult::consumed()
@@ -279,6 +285,7 @@ impl InputMethodEngine {
         self.last_key_was_backspace = false;
         self.converters.romaji.reset();
         self.input_buf.clear();
+        self.input_buf.raw_keys.push(ch);
 
         if self.input_mode == InputMode::Alphabet {
             self.input_buf.insert(&ch.to_string());
@@ -450,6 +457,7 @@ impl InputMethodEngine {
     /// In alphabet mode, inserts directly; otherwise goes through romaji conversion.
     pub(super) fn input_char(&mut self, ch: char) -> EngineResult {
         self.last_key_was_backspace = false;
+        self.input_buf.raw_keys.push(ch);
         if matches!(self.input_mode, InputMode::Alphabet | InputMode::Emoji) {
             self.input_buf.insert(&ch.to_string());
             return self.refresh_input_state();

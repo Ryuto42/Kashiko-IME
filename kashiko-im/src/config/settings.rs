@@ -138,14 +138,14 @@ impl Settings {
     /// Get the user dictionary directory path.
     ///
     /// All files in this directory are automatically loaded as user dictionaries.
-    /// Default: `~/.local/share/kashiko-im/user_dicts/`
+    /// Default (macOS): `~/Library/Application Support/com.kashiko.kashiko-im/user_dicts/`
     pub fn user_dict_dir() -> Option<PathBuf> {
         Self::data_dir().map(|dir| dir.join("user_dicts"))
     }
 
     /// Get the learning cache file path.
     ///
-    /// Default: `~/.local/share/kashiko-im/learning.tsv`
+    /// Default (macOS): `~/Library/Application Support/com.kashiko.kashiko-im/learning.tsv`
     pub fn learning_file() -> Option<PathBuf> {
         Self::data_dir().map(|dir| dir.join("learning.tsv"))
     }

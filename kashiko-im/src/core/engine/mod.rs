@@ -359,7 +359,8 @@ impl InputMethodEngine {
     /// Called when leaving Katakana mode so the preedit doesn't revert.
     fn bake_katakana(&mut self) {
         if !self.input_buf.text.is_empty() {
-            self.input_buf.text = kashiko_engine::hiragana_to_katakana(&self.input_buf.text);
+            self.input_buf
+                .set_text(kashiko_engine::hiragana_to_katakana(&self.input_buf.text));
         }
     }
 
