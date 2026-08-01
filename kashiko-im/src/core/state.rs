@@ -26,9 +26,15 @@ pub enum InputState {
         preedit: Preedit,
         /// List of conversion candidates
         candidates: CandidateList,
-        /// The character index where the current conversion segment ends.
+        /// The character index where the focused conversion segment ends.
         /// Unconverted text after this index is kept as hiragana.
         split_index: usize,
+        /// The character index where the focused segment *starts*. Text before
+        /// it has already been decided (see `InputMethodEngine::decided`) and
+        /// is displayed as settled preedit; `candidates` applies only to
+        /// `[segment_start, split_index)`. Left/Right slide this window
+        /// through the reading instead of growing it from position 0.
+        segment_start: usize,
     },
 }
 

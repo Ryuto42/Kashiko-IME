@@ -263,6 +263,12 @@ impl InputMethodEngine {
     ) -> EngineResult {
         // Flush any remaining romaji into composed_hiragana
         self.flush_romaji_to_composed();
+        // A fresh conversion of the buffer starts with the focus at the
+        // beginning, so any segments settled by a previous focus slide are
+        // discarded rather than double-counted.
+        self.decided.clear();
+        self.tail_text = None;
+        self.segment_bounds.clear();
 
         let full_reading = self.input_buf.text.clone();
         let total_chars = full_reading.chars().count();
@@ -613,24 +619,54 @@ impl InputMethodEngine {
     /// Sets up the preedit (highlighted selected text), updates the state, and
     /// returns an EngineResult with preedit, candidates, and aux text actions.
     fn enter_conversion_state(&mut self, full_reading: &str, candidates: CandidateList, split_index: usize) -> EngineResult {
-        let reading: String = full_reading.chars().take(split_index).collect();
-        let selected_text = candidates.selected_text().unwrap_or(&reading).to_string();
+        self.enter_conversion_state_at(full_reading, candidates, 0, split_index)
+    }
 
-        let mut segments = vec![PreeditSegment::highlighted(&selected_text)];
+    /// As [`Self::enter_conversion_state`], but for a focused segment that may
+    /// start past the beginning: `[segment_start, split_index)` is highlighted,
+    /// `self.decided` renders ahead of it, and the reading after it stays raw.
+    fn enter_conversion_state_at(
+        &mut self,
+        full_reading: &str,
+        candidates: CandidateList,
+        segment_start: usize,
+        split_index: usize,
+    ) -> EngineResult {
+        use crate::core::preedit::AttributeType::Underline;
+
+        let reading: String = full_reading
+            .chars()
+            .skip(segment_start)
+            .take(split_index.saturating_sub(segment_start))
+            .collect();
+        let selected_text = candidates.selected_text().unwrap_or(&reading).to_string();
+        let decided_text: String = self.decided.iter().map(|(_, t)| t.as_str()).collect();
+
+        let mut segments = Vec::new();
+        if !decided_text.is_empty() {
+            segments.push(PreeditSegment::new(&decided_text, Underline));
+        }
+        segments.push(PreeditSegment::highlighted(&selected_text));
         if split_index < full_reading.chars().count() {
-            let remaining_reading: String = full_reading.chars().skip(split_index).collect();
-            segments.push(PreeditSegment::new(&remaining_reading, crate::core::preedit::AttributeType::Underline));
+            // The tail keeps its conversion while the focus is being moved
+            // around (`tail_text`); it falls back to the raw reading only for
+            // the typo split, where leaving it unconverted is the point.
+            let tail = self.tail_text.clone().unwrap_or_else(|| {
+                full_reading.chars().skip(split_index).collect()
+            });
+            segments.push(PreeditSegment::new(&tail, Underline));
         }
 
         let preedit = Preedit::from_segments(
             segments,
-            selected_text.chars().count(),
+            decided_text.chars().count() + selected_text.chars().count(),
         );
 
         self.state = InputState::Conversion {
             preedit: preedit.clone(),
             candidates: candidates.clone(),
             split_index,
+            segment_start,
         };
 
         EngineResult::consumed()
@@ -1462,6 +1498,40 @@ impl InputMethodEngine {
                     && c.text.chars().all(|ch| ('\u{FF61}'..='\u{FF9F}').contains(&ch)))
         });
 
+        // 10a2. Drop candidates the user deleted with the row's ✕.
+        if let Some(cache) = self.learning.as_ref() {
+            builder
+                .candidates
+                .retain(|c| !cache.is_suppressed(reading, &c.text));
+        }
+
+        // 10b2. Drop candidates that invent ASCII the reading never contained.
+        //       A kana-only reading converting to `な2回慰安ありますか` is the
+        //       model hallucinating a digit: nothing in `なにかいいあんありますか`
+        //       could produce a `2`. Latin/digit output is only legitimate when
+        //       the user actually typed those characters, which the reading
+        //       then carries — so comparing against the reading is enough.
+        //       Runs *before* the latin-word step below, whose candidate comes
+        //       from the keystrokes rather than the reading and is exempt.
+        {
+            let reading_lower = reading.to_ascii_lowercase();
+            let invents_ascii = |text: &str| {
+                text.chars().any(|c| {
+                    c.is_ascii_alphanumeric()
+                        && !reading_lower.contains(c.to_ascii_lowercase())
+                })
+            };
+            // Fallback and Rewriter output is derived from the reading by rule
+            // (width/case variants such as `abc` → `ABC`/`ａｂｃ`), so only
+            // free-form model/dictionary output is checked.
+            builder.candidates.retain(|cand| {
+                matches!(
+                    cand.source,
+                    CandidateSource::Fallback | CandidateSource::Rewriter
+                ) || !invents_ascii(&cand.text)
+            });
+        }
+
         // 10c. The raw keystrokes as a latin word (`WordPress` out of the
         //      buffer `WおrdPレッ`) — no other source can reconstruct it from
         //      the kana. Inserted *among* the real candidates at a position
@@ -1569,6 +1639,7 @@ impl InputMethodEngine {
     /// Look up dictionary candidates for a reading (1 page, for live conversion display)
     ///
     /// Searches user dictionary first, then system dictionary.
+    #[allow(dead_code)]
     pub(super) fn lookup_dict_candidates(&self, reading: &str) -> Vec<Candidate> {
         self.search_dictionaries(reading, CandidateList::DEFAULT_PAGE_SIZE)
             .into_iter()
@@ -1624,8 +1695,12 @@ impl InputMethodEngine {
             Keysym::UP => self.prev_candidate(),
             Keysym::PAGE_DOWN => self.next_candidate_page(),
             Keysym::PAGE_UP => self.prev_candidate_page(),
-            Keysym::LEFT => self.resize_conversion(-1),
-            Keysym::RIGHT => self.resize_conversion(1),
+            // Plain Left/Right slide the focused segment through the reading;
+            // Shift+Left/Right resize it (fixing a wrong word split).
+            Keysym::LEFT if key.modifiers.shift_key => self.resize_conversion(-1),
+            Keysym::RIGHT if key.modifiers.shift_key => self.resize_conversion(1),
+            Keysym::LEFT => self.move_segment_focus(-1),
+            Keysym::RIGHT => self.move_segment_focus(1),
             Keysym::BACKSPACE => self.backspace_conversion(),
             _ => {
                 // Ctrl+N / Ctrl+P: emacs-style candidate navigation
@@ -1684,10 +1759,14 @@ impl InputMethodEngine {
             return EngineResult::consumed();
         }
 
-        // Check if there is remaining unconverted text after the split
+        // Text after the focused segment. When the focus was moved with the
+        // arrow keys the tail is already converted (`tail_text`) and commits
+        // with everything else; otherwise (the typo split) it stays raw and
+        // goes back into composing for the user to fix.
+        let converted_tail = self.tail_text.take();
         let remaining = if let InputState::Conversion { split_index, .. } = self.state {
             let full_len = self.input_buf.text.chars().count();
-            if split_index < full_len {
+            if split_index < full_len && converted_tail.is_none() {
                 Some(self.input_buf.text.chars().skip(split_index).collect::<String>())
             } else {
                 None
@@ -1703,13 +1782,29 @@ impl InputMethodEngine {
             }
         }
 
+        // Segments settled by sliding the focus right (Left/Right) commit
+        // together with the focused one, ahead of it.
+        let decided_text = self.take_decided_text();
+        let text = format!(
+            "{decided_text}{text}{}",
+            converted_tail.as_deref().unwrap_or("")
+        );
+
         // Remember full commits for one key so Ctrl+Backspace can take the
         // text back into conversion mode (undo commit). Partial commits are
-        // excluded — their remainder is already back in composition.
-        if remaining.is_none()
-            && let Some(reading) = &reading
-        {
-            self.last_commit = Some((reading.clone(), text.clone()));
+        // excluded — their remainder is already back in composition. The
+        // reading has to cover everything committed, decided segments
+        // included, or the undo would restore only the last segment.
+        if remaining.is_none() {
+            let covered: String = match self.state {
+                InputState::Conversion { split_index, .. } => {
+                    self.input_buf.text.chars().take(split_index).collect()
+                }
+                _ => reading.clone().unwrap_or_default(),
+            };
+            if !covered.is_empty() {
+                self.last_commit = Some((covered, text.clone()));
+            }
         }
 
         if let Some(remaining) = remaining {
@@ -1771,6 +1866,9 @@ impl InputMethodEngine {
         {
             self.record_learning(reading, &text);
         }
+
+        // Settled segments (from sliding the focus) commit ahead of this text.
+        let text = format!("{}{}", self.take_decided_text(), text);
 
         self.state = InputState::Empty;
         self.input_buf.text.clear();
@@ -1896,10 +1994,221 @@ impl InputMethodEngine {
         boundaries
     }
 
-    /// Resize the conversion segment using Left/Right arrow keys, jumping
+    /// Forget the learned candidate at `page_index` on the current page and
+    /// drop it from the live list, so clicking its ✕ makes it stop coming back.
+    ///
+    /// Only learned entries can be deleted — dictionary and model candidates
+    /// aren't user data. Returns `not_consumed` when the index isn't a learned
+    /// candidate, leaving the list untouched.
+    pub fn forget_candidate_on_page(&mut self, page_index: usize) -> EngineResult {
+        let InputState::Conversion { candidates, .. } = &self.state else {
+            return EngineResult::not_consumed();
+        };
+        let Some(cand) = candidates.page_candidates().get(page_index) else {
+            return EngineResult::not_consumed();
+        };
+        let (text, reading) = (cand.text.clone(), cand.reading.clone());
+        let reading = reading.unwrap_or_else(|| self.input_buf.text.clone());
+        let Some(cache) = self.learning.as_mut() else {
+            return EngineResult::not_consumed();
+        };
+        // Drop any learned entry, and record a suppression so the candidate
+        // stays gone even when it came from the model or a dictionary — the
+        // point of the ✕ is "stop showing me this", whatever produced it.
+        cache.forget(&reading, &text);
+        cache.suppress(&reading, &text);
+
+        let InputState::Conversion { candidates, .. } = &mut self.state else {
+            return EngineResult::not_consumed();
+        };
+        let selected = candidates.selected_text().map(str::to_string);
+        let kept: Vec<Candidate> = candidates
+            .candidates()
+            .iter()
+            .filter(|c| c.text != text)
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            return EngineResult::not_consumed();
+        }
+        let mut list = CandidateList::new(kept);
+        if let Some(sel) = selected
+            && let Some(idx) = list.candidates().iter().position(|c| c.text == sel)
+        {
+            list.select(idx);
+        }
+        *candidates = list.clone();
+        EngineResult::consumed().with_action(EngineAction::ShowCandidates(list))
+    }
+
+    /// Take the settled segments' text (left of the focus), learning each
+    /// against its own reading on the way out, and clear them.
+    fn take_decided_text(&mut self) -> String {
+        let decided = std::mem::take(&mut self.decided);
+        if decided.is_empty() {
+            return String::new();
+        }
+        let mut at = 0usize;
+        let mut out = String::new();
+        for (seg_len, seg_text) in &decided {
+            if self.input_mode != InputMode::Emoji {
+                let seg_reading: String =
+                    self.input_buf.text.chars().skip(at).take(*seg_len).collect();
+                self.record_learning(&seg_reading, seg_text);
+            }
+            out.push_str(seg_text);
+            at += seg_len;
+        }
+        out
+    }
+
+    /// Slide the focused conversion segment one word left or right.
+    ///
+    /// Left/Right move the highlighted window *through* the reading — the
+    /// natural reading of "move the selection" — rather than growing it from
+    /// the start. Moving right settles the current segment's choice into
+    /// `self.decided` and focuses the next word; moving left pops the previous
+    /// choice back into focus. Shift+Left/Right still resize the segment for
+    /// when the word split itself is wrong.
+    fn move_segment_focus(&mut self, delta: isize) -> EngineResult {
+        let InputState::Conversion {
+            split_index,
+            segment_start,
+            ref candidates,
+            ..
+        } = self.state
+        else {
+            return EngineResult::consumed();
+        };
+        let selected = candidates.selected_text().unwrap_or_default().to_string();
+        let full_reading = self.input_buf.text.clone();
+        let total = full_reading.chars().count();
+
+        // Phrase boundaries: prefer aligning the whole-sentence conversion
+        // against the reading, which is the only source that knows where the
+        // words actually are. Dictionary longest-match read
+        // `きょうのてんきははれです` as `…てんき|はは|れです` (母!), because it
+        // can't see that the two `は` belong to different words — the
+        // conversion `今日の天気は晴れです` makes that obvious. Computed once,
+        // on the first arrow press, and reused for the rest of the navigation.
+        if self.segment_bounds.is_empty() {
+            self.segment_bounds =
+                kashiko_engine::segment::boundaries_from_conversion(&full_reading, &selected)
+                    .unwrap_or_else(|| self.word_boundaries(&full_reading));
+        }
+        let boundaries = self.segment_bounds.clone();
+
+        // Right after Space the whole reading is one focused span (so the user
+        // can pick a whole-sentence candidate). The first arrow press splits it
+        // into words; from then on the focus slides, wrapping back to the whole
+        // span at either end so both keys always do something.
+        let whole_focused = segment_start == 0 && split_index >= total;
+
+        if delta > 0 {
+            if whole_focused {
+                let first_end = boundaries.first().copied().unwrap_or(total);
+                if first_end >= total {
+                    // Single word: nothing to move through.
+                    return EngineResult::consumed();
+                }
+                return self.convert_focused_segment(&full_reading, 0, first_end);
+            }
+            if split_index >= total {
+                // Past the last word: back to the whole span.
+                self.decided.clear();
+                return self.convert_focused_segment(&full_reading, 0, total);
+            }
+            // Settle this segment and focus the next word.
+            self.decided
+                .push((split_index - segment_start, selected));
+            let new_start = split_index;
+            let new_end = boundaries
+                .iter()
+                .find(|&&b| b > new_start)
+                .copied()
+                .unwrap_or(total);
+            self.convert_focused_segment(&full_reading, new_start, new_end)
+        } else {
+            if whole_focused {
+                // Already covering everything — the leftmost position.
+                return EngineResult::consumed();
+            }
+            let Some((prev_len, _)) = self.decided.pop() else {
+                // At the first word: widen back out to the whole span.
+                return self.convert_focused_segment(&full_reading, 0, total);
+            };
+            let new_end = segment_start;
+            let new_start = new_end.saturating_sub(prev_len);
+            self.convert_focused_segment(&full_reading, new_start, new_end)
+        }
+    }
+
+    /// Convert `full_reading[start..end]` and focus it, leaving already-decided
+    /// segments and the raw tail around it untouched.
+    fn convert_focused_segment(
+        &mut self,
+        full_reading: &str,
+        start: usize,
+        end: usize,
+    ) -> EngineResult {
+        let reading: String = full_reading
+            .chars()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .collect();
+        if reading.is_empty() {
+            return EngineResult::consumed();
+        }
+        // The latin-word candidate covers the whole composition, so it is only
+        // valid when the focus spans everything (the wrap-around case).
+        let allow_latin = start == 0 && end >= full_reading.chars().count();
+        let candidates = self.build_conversion_candidates(
+            &reading,
+            self.config.num_candidates,
+            false,
+            None,
+            allow_latin,
+        );
+        let list = CandidateList::new(
+            candidates
+                .into_iter()
+                .map(|ac| {
+                    let cand_reading = ac.reading.unwrap_or_else(|| reading.clone());
+                    let label = ac.source.label();
+                    Candidate {
+                        text: ac.text,
+                        reading: Some(cand_reading),
+                        source_label: (!label.is_empty()).then(|| label.to_string()),
+                        description: ac.description,
+                    }
+                })
+                .collect(),
+        );
+        if list.is_empty() {
+            return EngineResult::consumed();
+        }
+        // Keep the tail converted rather than reverting it to hiragana: moving
+        // the focus is navigation within an already-converted sentence, so only
+        // the focused segment should look unsettled.
+        let tail_reading: String = full_reading.chars().skip(end).collect();
+        self.tail_text = if tail_reading.is_empty() {
+            None
+        } else {
+            let ctx = self.truncate_context_for_api();
+            self.run_kana_kanji_conversion(&tail_reading, &ctx, 1)
+                .into_iter()
+                .next()
+                .filter(|t| t != &tail_reading)
+        };
+        // Focus moves are user-driven navigation, not a fresh conversion, so
+        // no deep search is scheduled for them.
+        self.deep_search = None;
+        self.enter_conversion_state_at(full_reading, list, start, end)
+    }
+
+    /// Resize the focused conversion segment (Shift+Left/Right), jumping
     /// between dictionary word boundaries (`すべての|あぷりで|…`) instead of
-    /// one character at a time. Wraps around at either end, mirroring the
-    /// old per-character behavior.
+    /// one character at a time. Wraps around at either end.
     fn resize_conversion(&mut self, delta: isize) -> EngineResult {
         if let InputState::Conversion { split_index, .. } = self.state {
             let full_reading = self.input_buf.text.clone();
@@ -1964,6 +2273,9 @@ impl InputMethodEngine {
         if let Some(reading) = &reading {
             self.record_learning(reading, &selected_text);
         }
+
+        // Settled segments (from sliding the focus) commit ahead of this text.
+        let selected_text = format!("{}{}", self.take_decided_text(), selected_text);
 
         // Remember the commit for one key (Ctrl+Backspace undo).
         if let Some(reading) = &reading {

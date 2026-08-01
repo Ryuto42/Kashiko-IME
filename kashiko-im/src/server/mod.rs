@@ -104,6 +104,17 @@ impl ImServer {
                 let result = self.engine.select_candidate_on_page(params.page_index);
                 self.key_result(result)
             }
+            "forget_candidate" => {
+                let params: SelectCandidateParams = parse_params(params)?;
+                if params.page_index >= CandidateList::DEFAULT_PAGE_SIZE {
+                    return Err(RpcError::new(
+                        RpcError::INVALID_PARAMS,
+                        format!("page_index out of range: {}", params.page_index),
+                    ));
+                }
+                let result = self.engine.forget_candidate_on_page(params.page_index);
+                self.key_result(result)
+            }
             "commit" => {
                 let result = self.engine.commit_result();
                 self.key_result(result)
@@ -233,6 +244,10 @@ fn to_action(action: EngineAction) -> Action {
                 .page_candidates()
                 .iter()
                 .map(|c| CandidateItem {
+                    // The source label is how the engine tags a learning-cache
+                    // candidate; the frontend only needs the yes/no.
+                    is_learned: c.source_label.as_deref()
+                        == Some(crate::core::engine::LEARNING_SOURCE_LABEL),
                     text: c.text.clone(),
                     description: c.description.clone().filter(|s| !s.is_empty()),
                 })

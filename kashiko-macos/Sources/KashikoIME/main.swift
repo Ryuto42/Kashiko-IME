@@ -78,6 +78,13 @@ engineClient.onUpdateCandidates = { actions in
     }
 }
 
+// Clicking a row's ✕ asks the engine to forget that learned candidate; the
+// refreshed list comes back in the response.
+KashikoInputController.candidateWindow.onDeleteCandidate = { pageIndex in
+    guard let result = engineClient.forgetCandidateSync(pageIndex: pageIndex) else { return }
+    KashikoInputController.applyAsyncCandidateUpdate(result.actions)
+}
+
 engineProcess.start()
 engineClient.startReaderLoop()
 // Model loading takes seconds (and downloads from HuggingFace on the very

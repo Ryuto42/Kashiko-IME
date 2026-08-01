@@ -1,5 +1,72 @@
 import Cocoa
 
+/// A candidate row that reveals a delete button while the pointer is over it.
+///
+/// The button stays hidden until hover so the list looks clean, and is drawn
+/// small and dim so it reads as an affordance rather than part of the
+/// candidate. Clicking it asks the engine to stop offering that candidate.
+final class CandidateRowView: NSView {
+    /// Row index within the visible page, as the engine numbers them.
+    let pageIndex: Int
+    private let deleteButton: NSButton
+    private var onDelete: ((Int) -> Void)?
+    private var trackingAreaAdded = false
+
+    init(pageIndex: Int, onDelete: ((Int) -> Void)?) {
+        self.pageIndex = pageIndex
+        self.onDelete = onDelete
+        deleteButton = NSButton(frame: .zero)
+        super.init(frame: .zero)
+
+        wantsLayer = true
+        deleteButton.title = "✕"
+        deleteButton.font = NSFont.systemFont(ofSize: 9)
+        deleteButton.isBordered = false
+        deleteButton.contentTintColor = NSColor.tertiaryLabelColor
+        deleteButton.alphaValue = 0.55
+        deleteButton.isHidden = true
+        deleteButton.target = self
+        deleteButton.action = #selector(deleteClicked)
+        deleteButton.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(deleteButton)
+        NSLayoutConstraint.activate([
+            deleteButton.trailingAnchor.constraint(equalTo: trailingAnchor),
+            deleteButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            deleteButton.widthAnchor.constraint(equalToConstant: 14),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not supported") }
+
+    /// Whether this row shows a ✕ on hover.
+    var isDeletable: Bool = false
+
+    @objc private func deleteClicked() {
+        onDelete?(pageIndex)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(
+            NSTrackingArea(
+                rect: bounds,
+                options: [.mouseEnteredAndExited, .activeAlways],
+                owner: self,
+                userInfo: nil
+            ))
+        trackingAreaAdded = true
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        if isDeletable { deleteButton.isHidden = false }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        deleteButton.isHidden = true
+    }
+}
+
 /// Custom candidate window (borderless non-activating NSPanel).
 ///
 /// The engine pre-paginates: `show` receives only the visible page plus
@@ -29,6 +96,9 @@ class CandidateWindowController {
     }
     private var pageState: PageState?
     var liveMode: Bool = false
+    /// Called with a page row index when its ✕ is clicked, to stop the engine
+    /// offering the candidate on that row.
+    var onDeleteCandidate: ((Int) -> Void)?
 
     init() {
         panel = NSPanel(
@@ -41,7 +111,10 @@ class CandidateWindowController {
         panel.hidesOnDeactivate = false
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.ignoresMouseEvents = true
+        // Mouse events are accepted so a row can reveal its delete button on
+        // hover. The panel is non-activating, so this never steals focus from
+        // the app being typed into.
+        panel.ignoresMouseEvents = false
         panel.contentView?.wantsLayer = true
         panel.contentView?.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
         panel.contentView?.layer?.cornerRadius = 16
@@ -49,7 +122,11 @@ class CandidateWindowController {
 
         stackView = NSStackView()
         stackView.orientation = .vertical
-        stackView.alignment = .leading
+        // `.width` makes every row as wide as the widest one, so a row's
+        // hover area covers the full panel width instead of just its text —
+        // without it the ✕ could only be reached by pointing exactly at the
+        // characters.
+        stackView.alignment = .width
         stackView.spacing = 2
         stackView.edgeInsets = NSEdgeInsets(top: 6, left: 12, bottom: 6, right: 12)
         stackView.translatesAutoresizingMaskIntoConstraints = false
@@ -184,7 +261,11 @@ class CandidateWindowController {
         // exactly where the unselected text does — NSTextField's own
         // drawsBackground fill has asymmetric internal cell padding that
         // makes the text look shifted within the highlight.
-        let container = NSView()
+        let container = CandidateRowView(pageIndex: rowViews.count, onDelete: onDeleteCandidate)
+        // Any candidate can be dismissed: the engine forgets a learned entry
+        // and records a suppression for anything else, so the ✕ always means
+        // "stop showing me this".
+        container.isDeletable = true
         container.translatesAutoresizingMaskIntoConstraints = false
         container.wantsLayer = true
         container.layer?.backgroundColor =
@@ -200,7 +281,9 @@ class CandidateWindowController {
             label.topAnchor.constraint(equalTo: container.topAnchor, constant: 4),
             label.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: 0),
             label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 4),
-            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -4),
+            // Room on the right for the hover ✕ so it never overlaps the text.
+            label.trailingAnchor.constraint(
+                lessThanOrEqualTo: container.trailingAnchor, constant: -18),
         ])
 
         stackView.addArrangedSubview(container)

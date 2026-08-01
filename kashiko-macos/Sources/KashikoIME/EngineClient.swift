@@ -74,6 +74,12 @@ class EngineClient {
         keyResultSync(method: "commit", params: [:], timeout: 1.0)
     }
 
+    /// Forget the learned candidate at `pageIndex` (the ✕ button on a row).
+    func forgetCandidateSync(pageIndex: Int) -> KeyResult? {
+        keyResultSync(
+            method: "forget_candidate", params: ["page_index": pageIndex], timeout: 1.0)
+    }
+
     func saveLearningAsync() {
         sendRequest(method: "save_learning", params: [:]) { _ in }
     }

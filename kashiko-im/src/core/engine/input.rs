@@ -19,15 +19,6 @@ pub(super) const SHORT_INPUT_MAX_CANDIDATE_LEN: usize = 6;
 /// while keeping other rewriter output (symbol substitutions, emoji) intact.
 const SCRIPT_VARIANT_DESCRIPTIONS: [&str; 3] = ["[全]ひらがな", "[全]カタカナ", "[半]カタカナ"];
 
-/// Append candidates to `target`, skipping duplicates by text.
-fn append_candidates_dedup(target: &mut Vec<Candidate>, source: Vec<Candidate>) {
-    for c in source {
-        if !target.iter().any(|existing| existing.text == c.text) {
-            target.push(c);
-        }
-    }
-}
-
 /// Whether `text` is disproportionately longer than `reading` — the shape of a
 /// model hallucination (a 1–2 char reading converting into a whole phrase).
 /// Shared by the candidate filter and the live-conversion guard so both reject
@@ -104,19 +95,31 @@ impl InputMethodEngine {
         }
 
         let Some((candidates, _reading)) = candidates else {
-            // No kanji-conversion suggestion. Still surface learning/dict/
-            // rewriter output — this is the only path that drives the Emoji
-            // shortcode picker (`:pien`) and live symbol substitution
-            // (`。。。` → `…`), both of which have to appear before Space by
-            // design. Plain script-variant noise (katakana/hiragana width
-            // annotations of the reading itself) is filtered out; those are
-            // always available again after Space if wanted.
+            // No kanji-conversion suggestion. Only rule-based rewriter output
+            // is surfaced here — the Emoji shortcode picker (`:pien` → 🥺) and
+            // live symbol substitution (`。。。` → `…`), both of which have to
+            // appear before Space by design.
+            //
+            // Learning and dictionary lookups are deliberately NOT consulted:
+            // their predictive (prefix) matches produced unsolicited
+            // whole-sentence suggestions mid-typing — typing `なにかいいあ`
+            // popped up a learned `なにかいい案ありますか`. Those belong to the
+            // Space candidate list, where the user asked for them.
             self.live.text.clear();
             let preedit = self.set_composing_state();
             let reading = self.input_buf.text.clone();
-            let mut all_candidates = self.lookup_learning_candidates(&reading);
-            append_candidates_dedup(&mut all_candidates, self.lookup_dict_candidates(&reading));
-            append_candidates_dedup(&mut all_candidates, self.lookup_rewriter_variants(&reading));
+            // Barely-typed input gets no popup at all: one or two characters
+            // matched rare-kana rewriter variants (`い` → `ゐ`/`ヰ`/捨て仮名…),
+            // which flashed a menu the user never asked for. Emoji mode is
+            // exempt — its shortcode picker has to react from `:a` onwards.
+            const MIN_POPUP_READING_CHARS: usize = 3;
+            let mut all_candidates = if self.input_mode == InputMode::Emoji
+                || reading.chars().count() >= MIN_POPUP_READING_CHARS
+            {
+                self.lookup_rewriter_variants(&reading)
+            } else {
+                Vec::new()
+            };
             all_candidates.retain(|c| {
                 !c.description
                     .as_deref()
@@ -561,6 +564,11 @@ impl InputMethodEngine {
     /// In live conversion mode: first Escape clears live conversion and shows hiragana,
     /// second Escape cancels input entirely.
     pub(super) fn cancel_composing(&mut self) -> EngineResult {
+        // Escape abandons the conversion, so any segments settled by sliding
+        // the focus are dropped with it.
+        self.decided.clear();
+        self.tail_text = None;
+        self.segment_bounds.clear();
         // If live conversion is active, first Escape returns to hiragana display
         if !self.live.text.is_empty() {
             self.live.text.clear();

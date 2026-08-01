@@ -272,9 +272,14 @@ impl InputMethodEngine {
 
     /// Minimum selection count for a learned entry to be treated as
     /// authoritative enough to override live conversion's per-chunk model
-    /// call. A single selection could be a stray/unusual choice; repeated
-    /// selection of the same reading→surface pair is a much stronger signal.
-    const LIVE_LEARNING_MIN_FREQUENCY: u32 = 2;
+    /// call.
+    ///
+    /// One is enough: if the user picked a conversion for this exact reading
+    /// even once, showing it again immediately is what makes learning feel
+    /// responsive — waiting for a second confirmation just meant the same
+    /// correction had to be made twice. The learning cache already refuses
+    /// low-quality surfaces, so a single entry is a trustworthy signal.
+    const LIVE_LEARNING_MIN_FREQUENCY: u32 = 1;
 
     /// Exact-match learned conversion for `reading`, if the user has
     /// confirmed it often enough (see `LIVE_LEARNING_MIN_FREQUENCY`) to trust

@@ -20,6 +20,17 @@ struct PreeditAttr: Decodable {
 struct CandidateItem: Decodable {
     let text: String
     let description: String?
+    /// Came from the learning cache, so the user may delete it (hover ✕).
+    /// Absent in the payload for non-learned candidates.
+    private let isLearnedFlag: Bool?
+
+    var isLearned: Bool { isLearnedFlag ?? false }
+
+    private enum CodingKeys: String, CodingKey {
+        case text
+        case description
+        case isLearnedFlag = "is_learned"
+    }
 }
 
 struct InitResult: Decodable {

@@ -32,6 +32,11 @@ use super::preedit::{AttributeType, Preedit, PreeditAttribute, PreeditSegment};
 use super::state::InputState;
 use crate::config::settings::Settings;
 
+/// Source label for learning-cache candidates. Public because the server
+/// reports "this candidate is user data" (deletable via the row's ✕) by
+/// comparing against it.
+pub const LEARNING_SOURCE_LABEL: &str = "\u{1F4DD} \u{5B66}\u{7FD2}"; // 📝 学習
+
 /// Source of a conversion candidate
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CandidateSource {
@@ -54,7 +59,7 @@ impl CandidateSource {
     fn label(&self) -> &'static str {
         match self {
             CandidateSource::UserDictionary => "\u{1F464} \u{30E6}\u{30FC}\u{30B6}\u{30FC}", // 👤 ユーザー
-            CandidateSource::Learning => "\u{1F4DD} \u{5B66}\u{7FD2}", // 📝 学習
+            CandidateSource::Learning => LEARNING_SOURCE_LABEL, // 📝 学習
             CandidateSource::Model => "\u{1F916} AI",                  // 🤖 AI
             CandidateSource::Dictionary => "\u{1F4DA} \u{8F9E}\u{66F8}", // 📚 辞書
             CandidateSource::Rewriter => "\u{1F504} \u{5909}\u{63DB}", // 🔄 変換
@@ -170,6 +175,22 @@ pub struct InputMethodEngine {
     /// one following key so Ctrl+Backspace can take it back into conversion
     /// mode (undo commit / reconversion). Cleared by any other key.
     last_commit: Option<(String, String)>,
+    /// Converted text of the region *after* the focused segment, kept so the
+    /// unfocused tail stays converted while the focus slides through the
+    /// sentence. `None` means show the raw reading there instead — the
+    /// typo-split case, where the tail is deliberately left for re-editing.
+    tail_text: Option<String>,
+    /// Phrase boundaries used while sliding the focus, derived from the
+    /// whole-sentence conversion when the first arrow key is pressed (see
+    /// `kashiko_engine::segment::boundaries_from_conversion`). Held for the
+    /// duration of the navigation so every move uses the same segmentation
+    /// instead of re-guessing it from the reading. Empty when not navigating.
+    segment_bounds: Vec<usize>,
+    /// Segments left of the focused one, as `(reading chars, chosen text)`.
+    /// Filled as Right slides the focus rightwards and popped by Left, so the
+    /// preedit can show settled conversions ahead of the focused segment and
+    /// commit them together. Empty whenever the focus is at the start.
+    decided: Vec<(usize, String)>,
 }
 
 /// What the post-response deep search should look for.
@@ -227,6 +248,9 @@ impl InputMethodEngine {
             deep_search: None,
             deep_job: None,
             last_commit: None,
+            tail_text: None,
+            segment_bounds: Vec::new(),
+            decided: Vec::new(),
         }
     }
 
@@ -298,6 +322,9 @@ impl InputMethodEngine {
         self.input_buf.clear();
         self.live.text.clear();
         self.chunks.clear();
+        self.decided.clear();
+        self.tail_text = None;
+        self.segment_bounds.clear();
         self.metrics = ConversionMetrics::default();
     }
 

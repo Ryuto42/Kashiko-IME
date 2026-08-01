@@ -201,6 +201,10 @@ pub struct PreeditAttr {
 
 #[derive(Debug, Serialize)]
 pub struct CandidateItem {
+    /// Whether this candidate came from the learning cache, i.e. it is user
+    /// data the frontend may offer to delete (the ✕ on a hovered row).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_learned: bool,
     pub text: String,
     /// Mozc-style right-side comment (e.g. 三点リーダ). Unformatted; the
     /// frontend decides how to display it.

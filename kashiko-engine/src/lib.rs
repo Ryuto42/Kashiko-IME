@@ -5,6 +5,7 @@ pub mod kanji;
 pub mod learning;
 pub mod rewriter;
 pub mod romaji;
+pub mod segment;
 pub mod typo;
 
 pub use dict::{Candidate as DictCandidate, DictEntry, Dictionary, LookupResult};

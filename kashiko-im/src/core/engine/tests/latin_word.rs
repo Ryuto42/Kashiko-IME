@@ -130,3 +130,195 @@ fn partial_commit_drops_stale_keystrokes() {
     assert!(engine.input_buf.raw_keys.is_empty());
     assert!(engine.latin_word_candidate().is_none());
 }
+
+// --- segment focus movement (Left/Right slide, Shift+Left/Right resize) ---
+
+/// Shift + a non-printable key (used for the resize gesture).
+fn press_shift_key(keysym: Keysym) -> KeyEvent {
+    KeyEvent::new(keysym, KeyModifiers::new().with_shift(true), true)
+}
+
+/// Engine in Conversion state over `reading`, with a user dictionary so the
+/// word boundaries are real ones rather than one big span.
+fn engine_in_conversion(reading: &str, words: &[(&str, &str)]) -> InputMethodEngine {
+    use std::io::Write;
+    let mut engine = InputMethodEngine::new();
+    engine.converters.kanji = None;
+    let entries: Vec<String> = words
+        .iter()
+        .map(|(r, s)| {
+            format!(
+                r#"{{"reading":"{r}","candidates":[{{"surface":"{s}","score":1.0}}]}}"#
+            )
+        })
+        .collect();
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    tmp.write_all(format!("[{}]", entries.join(",")).as_bytes()).unwrap();
+    tmp.flush().unwrap();
+    engine.dicts.user = Some(kashiko_engine::dict::Dictionary::build_from_json(tmp.path()).unwrap());
+    engine.input_buf.insert(reading);
+    engine.start_conversion(false, None, 0);
+    engine
+}
+
+#[test]
+fn right_settles_the_segment_and_focuses_the_next_word() {
+    // `あい` + `うえ` are dictionary words, so they form two segments.
+    let mut engine = engine_in_conversion("あいうえ", &[("あい", "藍"), ("うえ", "上")]);
+
+    // Initial conversion covers the whole reading.
+    let InputState::Conversion {
+        split_index,
+        segment_start,
+        ..
+    } = engine.state
+    else {
+        panic!("expected Conversion state");
+    };
+    assert_eq!((segment_start, split_index), (0, 4));
+
+    // Shrink to the first word, then slide right: the focus window MOVES
+    // rather than growing from position 0.
+    engine.process_key(&press_shift_key(Keysym::LEFT));
+    let InputState::Conversion {
+        segment_start,
+        split_index,
+        ..
+    } = engine.state
+    else {
+        panic!("expected Conversion state");
+    };
+    assert_eq!(segment_start, 0, "resize keeps the window anchored at 0");
+    let first_end = split_index;
+    assert!(first_end < 4, "Shift+Left should shrink the segment");
+
+    engine.process_key(&press_key(Keysym::RIGHT));
+    let InputState::Conversion {
+        segment_start,
+        split_index,
+        ..
+    } = engine.state
+    else {
+        panic!("expected Conversion state");
+    };
+    assert_eq!(
+        segment_start, first_end,
+        "Right must move the window's start, not keep it at 0"
+    );
+    assert!(split_index > segment_start);
+    assert_eq!(engine.decided.len(), 1, "the passed segment is settled");
+}
+
+#[test]
+fn left_returns_focus_to_the_previous_segment() {
+    let mut engine = engine_in_conversion("あいうえ", &[("あい", "藍"), ("うえ", "上")]);
+    engine.process_key(&press_shift_key(Keysym::LEFT));
+    engine.process_key(&press_key(Keysym::RIGHT));
+    assert_eq!(engine.decided.len(), 1);
+
+    engine.process_key(&press_key(Keysym::LEFT));
+    let InputState::Conversion { segment_start, .. } = engine.state else {
+        panic!("expected Conversion state");
+    };
+    assert_eq!(segment_start, 0, "Left brings the focus back to the start");
+    assert!(engine.decided.is_empty(), "the settled choice is popped");
+}
+
+#[test]
+fn commit_includes_segments_settled_by_sliding() {
+    let mut engine = engine_in_conversion("あいうえ", &[("あい", "藍"), ("うえ", "上")]);
+    engine.process_key(&press_shift_key(Keysym::LEFT));
+    engine.process_key(&press_key(Keysym::RIGHT));
+
+    let result = engine.process_key(&press_key(Keysym::RETURN));
+    let committed: String = result
+        .actions
+        .iter()
+        .find_map(|a| match a {
+            EngineAction::Commit(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("Enter should commit");
+    // Whatever the candidates were, the settled segment must not be lost:
+    // the commit has to cover the whole reading, not just the focused part.
+    assert!(
+        committed.chars().count() >= 2,
+        "commit dropped the settled segment: {committed:?}"
+    );
+    assert!(engine.decided.is_empty());
+}
+
+#[test]
+fn arrows_work_straight_after_space() {
+    // The reported bug: right after Space the whole reading is focused
+    // (split_index == total), and both arrow handlers bailed out early, so
+    // neither key did anything. The first Right must split into words.
+    let mut engine = engine_in_conversion("あいうえ", &[("あい", "藍"), ("うえ", "上")]);
+    engine.process_key(&press_key(Keysym::RIGHT));
+    let InputState::Conversion {
+        segment_start,
+        split_index,
+        ..
+    } = engine.state
+    else {
+        panic!("expected Conversion state");
+    };
+    assert_eq!(segment_start, 0);
+    assert!(
+        split_index < 4,
+        "the first Right should focus the first word, got split_index={split_index}"
+    );
+
+    // Left from the first word widens back out to the whole reading.
+    engine.process_key(&press_key(Keysym::LEFT));
+    let InputState::Conversion {
+        segment_start,
+        split_index,
+        ..
+    } = engine.state
+    else {
+        panic!("expected Conversion state");
+    };
+    assert_eq!((segment_start, split_index), (0, 4));
+}
+
+#[test]
+fn focus_uses_conversion_derived_phrase_boundaries() {
+    // The reported bug: for `今日の天気は晴れです` the dictionary read the
+    // reading as `…てんき|はは|れです` (母 is a real word), so the first Right
+    // focused the nonsense span `はは`. Aligning against the conversion gives
+    // the real phrases: 今日の | 天気は | 晴れです.
+    let reading = "きょうのてんきははれです";
+    let mut engine = InputMethodEngine::new();
+    engine.converters.kanji = None;
+    engine.input_buf.insert(reading);
+    // Enter Conversion with the sentence conversion as the selected candidate,
+    // which is what the model produces on Space.
+    engine.state = InputState::Conversion {
+        preedit: Preedit::new(),
+        candidates: CandidateList::new(vec![Candidate {
+            text: "今日の天気は晴れです".to_string(),
+            reading: Some(reading.to_string()),
+            source_label: None,
+            description: None,
+        }]),
+        split_index: reading.chars().count(),
+        segment_start: 0,
+    };
+
+    engine.process_key(&press_key(Keysym::RIGHT));
+    let InputState::Conversion {
+        segment_start,
+        split_index,
+        ..
+    } = engine.state
+    else {
+        panic!("expected Conversion state");
+    };
+    assert_eq!(
+        (segment_start, split_index),
+        (0, 4),
+        "first phrase should be きょうの (今日の), not a dictionary mis-split"
+    );
+    assert_eq!(engine.segment_bounds, vec![4, 8, 12]);
+}

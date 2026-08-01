@@ -39,6 +39,12 @@ impl LearningCache {
     /// shown. Long sentences committed once should not be memorized wholesale.
     pub const MAX_LEARN_SURFACE_CHARS: usize = 12;
 
+    /// Frequency marking a *suppressed* entry — a candidate the user deleted
+    /// with the row's ✕. Stored in the same map so it persists with the rest,
+    /// but treated as a blocklist rather than a suggestion. 0 can never occur
+    /// naturally: `record` starts at 1.
+    pub const SUPPRESSED_FREQUENCY: u32 = 0;
+
     /// Length cap for all-latin surfaces (`InputMethodKit`). Higher than the
     /// Japanese cap: the limit exists to reject memorized sentences, and a
     /// long English identifier is still a single word.
@@ -166,10 +172,60 @@ impl LearningCache {
         };
         let mut scored: Vec<(String, f64)> = entries
             .iter()
+            .filter(|e| e.frequency != Self::SUPPRESSED_FREQUENCY)
             .map(|e| (e.surface.clone(), score(e, now)))
             .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         scored
+    }
+
+    /// Suppress `surface` for `reading` so it is never offered again, even when
+    /// it comes from the model or a dictionary rather than learning.
+    ///
+    /// Recorded as a learning entry with a sentinel frequency, so it rides
+    /// along with the existing persistence and needs no second file. Entries
+    /// like this are filtered out of lookups and used as a blocklist instead.
+    pub fn suppress(&mut self, reading: &str, surface: &str) {
+        let entries = self.entries.entry(reading.to_string()).or_default();
+        entries.retain(|e| e.surface != surface);
+        entries.push(LearningEntry {
+            surface: surface.to_string(),
+            frequency: Self::SUPPRESSED_FREQUENCY,
+            last_access: now_unix(),
+        });
+        self.dirty = true;
+    }
+
+    /// Whether `surface` has been suppressed for `reading` (or for a reading
+    /// that starts with it, matching how predictive lookup would surface it).
+    pub fn is_suppressed(&self, reading: &str, surface: &str) -> bool {
+        self.entries.iter().any(|(key, entries)| {
+            (key == reading || key.starts_with(reading))
+                && entries
+                    .iter()
+                    .any(|e| e.surface == surface && e.frequency == Self::SUPPRESSED_FREQUENCY)
+        })
+    }
+
+    /// Forget a learned entry, so the candidate stops being suggested.
+    ///
+    /// Removes `surface` from `reading`'s entries and, since a surface picked
+    /// up by predictive (prefix) lookup can be keyed under a longer reading
+    /// than what was typed, from every reading that starts with `reading` too —
+    /// otherwise deleting a suggestion would leave it reappearing from the
+    /// prefix match. Returns whether anything was removed.
+    pub fn forget(&mut self, reading: &str, surface: &str) -> bool {
+        let mut removed = false;
+        for (key, entries) in self.entries.iter_mut() {
+            if key == reading || key.starts_with(reading) {
+                let before = entries.len();
+                entries.retain(|e| e.surface != surface);
+                removed |= entries.len() != before;
+            }
+        }
+        self.entries.retain(|_, entries| !entries.is_empty());
+        self.dirty |= removed;
+        removed
     }
 
     /// Whether any learned entry has exactly this surface form, regardless of
@@ -202,7 +258,10 @@ impl LearningCache {
         let mut results: Vec<(String, String, f64)> = Vec::new();
         for (reading, entries) in &self.entries {
             if reading.starts_with(prefix) {
-                for entry in entries {
+                for entry in entries
+                    .iter()
+                    .filter(|e| e.frequency != Self::SUPPRESSED_FREQUENCY)
+                {
                     results.push((reading.clone(), entry.surface.clone(), score(entry, now)));
                 }
             }
