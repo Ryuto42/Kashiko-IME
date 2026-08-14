@@ -20,7 +20,7 @@ Rust側(`kashiko-im`)にあり、Swift側はInputMethodKitとの橋渡しに徹�
 
 - プロトコル定義: `kashiko-im/src/server/protocol.rs`(Rust側が正)と
   `Sources/KashikoIME/EngineProtocol.swift`(Swift側ミラー)
-- キーイベントはfcitx5版と同じXKB keysym表現に変換して送る
+- キーイベントはエンジンが解釈するXKB keysym表現に変換して送る
   (`Sources/KashikoIME/KeyCodeMap.swift`)
 - エンジンプロセスはクラッシュ時に指数バックオフで自動再起動、
   スリープ復帰時にも再起動(macOSがスリープ中にパイプを破棄するため)
@@ -97,13 +97,13 @@ killall KashikoIME  # 起動中の場合は再起動して反映
 
 ## キー操作
 
-fcitx5版と同じキーバインドに加えて:
+共通のキーバインド（[kashiko-im の README](../kashiko-im/README.md#key-bindings) 参照）に加えて、macOS 固有のキー:
 
 | キー | 動作 |
 |------|------|
 | かな (JIS) | 日本語モードへ切替 |
 | 英数 (JIS) | 変換中テキストを確定して直接入力モードへ切替 |
-| 右⌘ 単独タップ | 日本語入力(ひらがな)へ戻る。直接入力モード、Shift+英字で入った英字モードのどちらからでも有効。⌘C など他のキーと組み合わせた場合は発動しない(Linux版の右Superに相当) |
+| 右⌘ 単独タップ | 日本語入力(ひらがな)へ戻る。直接入力モード、Shift+英字で入った英字モードのどちらからでも有効。⌘C など他のキーと組み合わせた場合は発動しない |
 
 ## 設定・データファイル
 

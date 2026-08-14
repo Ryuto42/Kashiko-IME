@@ -179,3 +179,51 @@ fn test_truncate_context() {
     let jp = engine.truncate_context("今日はとても良い天気");
     assert_eq!(jp.chars().count(), 5); // Last 5 chars
 }
+
+#[test]
+fn pending_n_resolves_and_commits() {
+    // Regression: the second `n` of `かん` crashed the engine. The live
+    // conversion's beam-search rescue sliced the beam's tokens by the prompt
+    // length, but beam results contain only the generated tokens (unlike
+    // `generate`, which prefixes the prompt), so the slice panicked and took
+    // the engine process down mid-composition.
+    let mut engine = InputMethodEngine::new();
+    engine.converters.kanji = None;
+    for ch in ['k', 'a'] {
+        engine.process_key(&press(ch));
+    }
+    // A lone `n` stays pending: it could still become な/に/ん.
+    engine.process_key(&press('n'));
+    assert_eq!(engine.preedit().unwrap().text(), "かn");
+    assert_eq!(engine.converters.romaji.buffer(), "n");
+
+    // The second `n` resolves it to ん.
+    engine.process_key(&press('n'));
+    assert_eq!(engine.preedit().unwrap().text(), "かん");
+    assert_eq!(engine.input_buf.text, "かん");
+    assert!(engine.converters.romaji.buffer().is_empty());
+
+    let result = engine.process_key(&press_key(Keysym::RETURN));
+    let committed: Vec<&str> = result
+        .actions
+        .iter()
+        .filter_map(|a| match a {
+            EngineAction::Commit(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(committed, vec!["かん"]);
+}
+
+#[test]
+fn pending_n_is_flushed_by_space_conversion() {
+    // Space must flush the pending `n` into the reading before converting,
+    // so the conversion sees かん rather than か.
+    let mut engine = InputMethodEngine::new();
+    engine.converters.kanji = None;
+    for ch in ['k', 'a', 'n'] {
+        engine.process_key(&press(ch));
+    }
+    engine.process_key(&press_key(Keysym::SPACE));
+    assert_eq!(engine.input_buf.text, "かん");
+}

@@ -241,6 +241,27 @@ impl LlamaCppModel {
             eos_token_id,
             LlamaSampler::greedy(),
         )
+        .map(|(tokens, _score)| tokens)
+    }
+
+    /// Greedy generation that also reports how likely the model thought its own
+    /// output was: the summed log-probability of the generated tokens.
+    ///
+    /// Free to obtain (see `generate_with_sampler`), which is what makes it
+    /// usable on the per-keystroke live-conversion path: the caller can judge
+    /// the result's quality without spending a second inference pass on it.
+    pub fn generate_greedy_scored(
+        &self,
+        input_tokens: &[LlamaToken],
+        max_new_tokens: usize,
+        eos_token_id: Option<i32>,
+    ) -> Result<(Vec<LlamaToken>, f32)> {
+        self.generate_with_sampler(
+            input_tokens,
+            max_new_tokens,
+            eos_token_id,
+            LlamaSampler::greedy(),
+        )
     }
 
     /// Generate multiple candidates using true beam search algorithm
@@ -633,13 +654,16 @@ impl LlamaCppModel {
     }
 
     /// Generate tokens with a custom sampler
+    /// Returns the generated sequence together with the summed log-probability
+    /// of the tokens it produced. The score is free: the logits it reads are
+    /// the same ones the sampler is about to use at each step.
     fn generate_with_sampler(
         &self,
         input_tokens: &[LlamaToken],
         max_new_tokens: usize,
         eos_token_id: Option<i32>,
         mut sampler: LlamaSampler,
-    ) -> Result<Vec<LlamaToken>> {
+    ) -> Result<(Vec<LlamaToken>, f32)> {
         let backend = get_backend()?;
         let ctx_params = self.context_params();
 
@@ -666,7 +690,12 @@ impl LlamaCppModel {
         let model_eos = self.model.token_eos();
 
         // Generate new tokens
+        let mut total_log_prob = 0.0f32;
         for n_cur in (input_tokens.len()..).take(max_new_tokens) {
+            // Read the distribution before sampling: these logits are already
+            // computed, so accumulating the chosen token's log-probability adds
+            // no inference work.
+            let step_logits = ctx.get_logits().to_vec();
             let new_token = sampler.sample(&ctx, -1);
 
             // Check for EOS using the provided token ID
@@ -684,6 +713,7 @@ impl LlamaCppModel {
                 break;
             }
 
+            total_log_prob += log_prob_of(&step_logits, new_token.0 as usize, step_logits.len());
             generated.push(new_token);
 
             // Prepare next batch with just the new token
@@ -696,13 +726,29 @@ impl LlamaCppModel {
                 .map_err(|e| KanjiError::Inference(e.into()))?;
         }
 
-        Ok(generated)
+        Ok((generated, total_log_prob))
     }
 
     /// Get the EOS token ID from the model
     pub fn eos_token_id(&self) -> LlamaToken {
         self.model.token_eos()
     }
+}
+
+/// Log-softmax of `logits` at `index`, i.e. log P(token = index).
+fn log_prob_of(logits: &[f32], index: usize, vocab_size: usize) -> f32 {
+    let n = vocab_size.min(logits.len());
+    if index >= n {
+        return 0.0;
+    }
+    let max_logit = logits[..n].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let log_sum_exp: f32 = logits[..n]
+        .iter()
+        .map(|&x| (x - max_logit).exp())
+        .sum::<f32>()
+        .ln()
+        + max_logit;
+    logits[index] - log_sum_exp
 }
 
 /// Reusable NLL scorer that keeps a single llama.cpp context alive.
@@ -742,12 +788,20 @@ impl<'a> NllScorer<'a> {
     /// Compute per-character NLL for a single (reading, surface) pair.
     ///
     /// Reuses the internal context by clearing the KV cache between calls.
-    pub fn compute_nll(&mut self, reading_katakana: &str, surface: &str) -> Result<f32> {
+    /// `context` is the surrounding text left of the cursor, in the same slot
+    /// the conversion prompt uses — scoring a candidate against the sentence it
+    /// will land in is the whole point of reranking, so it must not be blank.
+    pub fn compute_nll(
+        &mut self,
+        reading_katakana: &str,
+        surface: &str,
+        context: &str,
+    ) -> Result<f32> {
         use super::{CONTEXT_TOKEN, INPUT_START_TOKEN, OUTPUT_START_TOKEN};
 
         let prompt = format!(
             "{}{}{}{}{}",
-            CONTEXT_TOKEN, "", INPUT_START_TOKEN, reading_katakana, OUTPUT_START_TOKEN
+            CONTEXT_TOKEN, context, INPUT_START_TOKEN, reading_katakana, OUTPUT_START_TOKEN
         );
         let full_text = format!("{}{}", prompt, surface);
 

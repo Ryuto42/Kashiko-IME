@@ -166,31 +166,132 @@ impl KanaKanjiConverter {
         Ok(candidates)
     }
 
+    /// Convert for live display, retrying with a small beam only when greedy
+    /// decoding produced something the model itself rates as unlikely.
+    ///
+    /// Greedy is myopic: it commits to the best token at each step and can walk
+    /// into a bad sentence that beam search would avoid. Running a beam on every
+    /// keystroke is far too slow, but the greedy pass already reports its own
+    /// log-probability for free (see `generate_greedy_scored`), so its quality
+    /// can be checked at no cost and the beam spent only on the rare bad case.
+    ///
+    /// Returns the conversion, or the reading itself when nothing usable came
+    /// out (matching `convert`'s fallback).
+    pub fn convert_live(&self, reading: &str, context: &str) -> Result<String> {
+        let katakana = hiragana_to_katakana(reading);
+        let prompt = build_jinen_prompt(&katakana, context);
+        let tokens = self.model.tokenize(&prompt)?;
+        let eos = Some(self.model.eos_token_id().0);
+
+        let (out_tokens, log_prob) =
+            self.model
+                .generate_greedy_scored(&tokens, self.config.max_new_tokens, eos)?;
+        let generated = &out_tokens[tokens.len()..];
+        let greedy = clean_model_output(&self.model.decode(generated, true)?);
+
+        // Normalize per output character so the threshold means the same thing
+        // for a two-character word and a whole clause.
+        let n_chars = greedy.chars().count();
+        let greedy_nll = if n_chars == 0 {
+            f32::INFINITY
+        } else {
+            -log_prob / n_chars as f32
+        };
+        if greedy_nll <= Self::LIVE_RESCUE_NLL_THRESHOLD {
+            return Ok(if greedy.is_empty() {
+                reading.to_string()
+            } else {
+                greedy
+            });
+        }
+
+        // Greedy looks unnatural — spend a narrow beam and keep its best.
+        // Beam scores are cumulative log-probabilities, highest first.
+        let beams = self.model.generate_beam_search(
+            &tokens,
+            self.config.max_new_tokens,
+            eos,
+            Self::LIVE_RESCUE_BEAM_WIDTH,
+        )?;
+        // Beam results hold only the generated tokens — unlike `generate`, which
+        // returns the prompt followed by them — so they are decoded whole.
+        let rescued = beams
+            .iter()
+            .filter_map(|(toks, score)| {
+                let text = clean_model_output(&self.model.decode(toks, true).ok()?);
+                (!text.is_empty()).then(|| (text, *score))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(text, _)| text);
+
+        Ok(match rescued {
+            Some(text) => text,
+            None if greedy.is_empty() => reading.to_string(),
+            None => greedy,
+        })
+    }
+
+    /// Per-character NLL above which the live greedy conversion is considered
+    /// bad enough to be worth a beam-search retry.
+    pub const LIVE_RESCUE_NLL_THRESHOLD: f32 = 1.5;
+
+    /// Beam width for that retry — narrow, since it runs on the typing path.
+    pub const LIVE_RESCUE_BEAM_WIDTH: usize = 3;
+
+    /// NLL threshold above which a conversion reads as unnatural Japanese.
+    /// Per-character, so it is comparable across candidate lengths.
+    pub const TYPO_NLL_THRESHOLD: f32 = 1.5;
+
     /// Check if a (reading, surface) pair is likely a typo based on LLM NLL score
-    pub fn is_typo(&self, reading: &str, surface: &str) -> Result<bool> {
+    pub fn is_typo(&self, reading: &str, surface: &str, context: &str) -> Result<bool> {
         let mut scorer = super::llamacpp::NllScorer::new(&self.model, 512)?;
         let katakana = hiragana_to_katakana(reading);
-        let nll = scorer.compute_nll(&katakana, surface)?;
-        // Threshold of 1.5 is a reasonable default for detecting unnatural Japanese/typos
-        Ok(nll > 1.5)
+        let nll = scorer.compute_nll(&katakana, surface, context)?;
+        Ok(nll > Self::TYPO_NLL_THRESHOLD)
+    }
+
+    /// Score each candidate as per-character negative log-likelihood given
+    /// `reading` and the surrounding `context` — lower is more natural.
+    ///
+    /// One scorer for the whole list, so the shared prompt stays in the KV
+    /// cache across candidates instead of being re-evaluated per candidate.
+    /// Returns one score per input candidate, in the same order;
+    /// `None` marks a candidate the model could not score (its position is
+    /// preserved so callers can zip the two lists).
+    pub fn score_candidates(
+        &self,
+        reading: &str,
+        context: &str,
+        candidates: &[String],
+    ) -> Result<Vec<Option<f32>>> {
+        let mut scorer = super::llamacpp::NllScorer::new(&self.model, 512)?;
+        let katakana = hiragana_to_katakana(reading);
+        Ok(candidates
+            .iter()
+            .map(|cand| scorer.compute_nll(&katakana, cand, context).ok())
+            .collect())
     }
 
     /// Filter out candidates that are likely typos or exceed maximum length.
-    pub fn filter_candidates(&self, reading: &str, candidates: Vec<String>) -> Result<Vec<String>> {
+    pub fn filter_candidates(
+        &self,
+        reading: &str,
+        context: &str,
+        candidates: Vec<String>,
+    ) -> Result<Vec<String>> {
         let mut scorer = super::llamacpp::NllScorer::new(&self.model, 512)?;
         let katakana = hiragana_to_katakana(reading);
-        
+
         let mut filtered = Vec::new();
         for cand in candidates {
             if cand.chars().count() >= 12 {
                 continue;
             }
-            if let Ok(nll) = scorer.compute_nll(&katakana, &cand) {
-                if nll <= 1.5 {
-                    filtered.push(cand);
-                }
-            } else {
-                filtered.push(cand);
+            match scorer.compute_nll(&katakana, &cand, context) {
+                Ok(nll) if nll > Self::TYPO_NLL_THRESHOLD => {}
+                // Unscoreable candidates are kept: a scoring failure is not
+                // evidence against the candidate.
+                _ => filtered.push(cand),
             }
         }
         Ok(filtered)

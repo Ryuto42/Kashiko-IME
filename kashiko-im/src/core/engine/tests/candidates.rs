@@ -97,3 +97,107 @@ fn test_empty_live_text_not_added_to_candidates() {
         );
     }
 }
+
+// --- likelihood reranking + quality gate ---
+
+/// Build a candidate list from `(text, source)` pairs.
+fn annotated(items: &[(&str, CandidateSource)]) -> Vec<AnnotatedCandidate> {
+    items
+        .iter()
+        .map(|(t, s)| AnnotatedCandidate::new(*t, s.clone()))
+        .collect()
+}
+
+fn texts(cands: &[AnnotatedCandidate]) -> Vec<&str> {
+    cands.iter().map(|c| c.text.as_str()).collect()
+}
+
+#[test]
+fn junk_candidates_are_dropped_not_just_ranked_lower() {
+    // The reported problem: near homophones (`約割`, `役割り`, `パット`) padded
+    // the list below the correct reading. They must be removed, so the number
+    // of candidates shown follows quality instead of a fixed count.
+    let mut cands = annotated(&[
+        ("役割と構造要素", CandidateSource::Model),
+        ("約割と構造要素", CandidateSource::Model),
+        ("役割りと構造要素", CandidateSource::Model),
+        ("やくわり", CandidateSource::Fallback),
+    ]);
+    let scored = vec![(0, Some(0.4)), (1, Some(1.9)), (2, Some(2.4))];
+    cands = super::super::conversion::gate_and_reorder(&cands, &scored);
+    // MIN_KEPT_SCORED keeps the runner-up, but the worst one is gone.
+    assert_eq!(texts(&cands), vec!["役割と構造要素", "約割と構造要素", "やくわり"]);
+}
+
+#[test]
+fn a_uniformly_good_list_is_kept_in_full() {
+    // The other half of the rule: good candidates are not truncated to a cap.
+    let mut cands = annotated(&[
+        ("天気", CandidateSource::Model),
+        ("転機", CandidateSource::Model),
+        ("典器", CandidateSource::Model),
+        ("てんき", CandidateSource::Fallback),
+    ]);
+    let scored = vec![(0, Some(0.30)), (1, Some(0.40)), (2, Some(0.55))];
+    cands = super::super::conversion::gate_and_reorder(&cands, &scored);
+    assert_eq!(texts(&cands), vec!["天気", "転機", "典器", "てんき"]);
+}
+
+#[test]
+fn gate_keeps_surrounding_groups_in_place() {
+    // Learning stays on top and the fallbacks stay at the bottom; only the
+    // model block is reordered and filtered.
+    let mut cands = annotated(&[
+        ("学習", CandidateSource::Learning),
+        ("転機", CandidateSource::Model),
+        ("天気", CandidateSource::Model),
+        ("てんき", CandidateSource::Fallback),
+    ]);
+    let scored = vec![(1, Some(2.0)), (2, Some(0.5))];
+    cands = super::super::conversion::gate_and_reorder(&cands, &scored);
+    assert_eq!(texts(&cands), vec!["学習", "天気", "転機", "てんき"]);
+}
+
+#[test]
+fn unscoreable_candidates_are_kept_after_scored_ones() {
+    let mut cands = annotated(&[
+        ("あ", CandidateSource::Model),
+        ("い", CandidateSource::Model),
+        ("う", CandidateSource::Model),
+    ]);
+    // `あ` can't be scored: keep it (no evidence against it), but after the
+    // scored ones.
+    let scored = vec![(0, None), (1, Some(0.5)), (2, Some(0.4))];
+    cands = super::super::conversion::gate_and_reorder(&cands, &scored);
+    assert_eq!(texts(&cands), vec!["う", "い", "あ"]);
+}
+
+#[test]
+fn all_bad_scores_still_leave_something_to_pick() {
+    // Even when the model is lost, the list must not be emptied.
+    let mut cands = annotated(&[
+        ("甲", CandidateSource::Model),
+        ("乙", CandidateSource::Model),
+        ("丙", CandidateSource::Model),
+    ]);
+    let scored = vec![(0, Some(3.0)), (1, Some(3.5)), (2, Some(4.0))];
+    cands = super::super::conversion::gate_and_reorder(&cands, &scored);
+    assert_eq!(cands.len(), super::super::conversion::MIN_KEPT_SCORED);
+    assert_eq!(texts(&cands), vec!["甲", "乙"]);
+}
+
+#[test]
+fn reranking_without_a_model_is_a_noop() {
+    // Tests run with no kanji converter loaded; reranking must leave the list
+    // untouched rather than dropping candidates.
+    let mut engine = InputMethodEngine::new();
+    engine.converters.kanji = None;
+    let mut cands = annotated(&[
+        ("転機", CandidateSource::Model),
+        ("天気", CandidateSource::Model),
+    ]);
+    let before: Vec<String> = cands.iter().map(|c| c.text.clone()).collect();
+    engine.rerank_by_likelihood("きょうのてんき", &mut cands);
+    let after: Vec<String> = cands.iter().map(|c| c.text.clone()).collect();
+    assert_eq!(before, after);
+}

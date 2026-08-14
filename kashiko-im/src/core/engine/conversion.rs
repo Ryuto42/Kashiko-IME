@@ -45,6 +45,80 @@ pub(super) struct DeepSearchJob {
     max_results: usize,
 }
 
+/// How much worse than the best candidate a candidate may score and still be
+/// shown, in per-character NLL. Relative rather than absolute so it adapts to
+/// how hard the sentence is: what matters is whether a candidate is close to
+/// the best reading, not its raw likelihood.
+const QUALITY_MARGIN_NLL: f32 = 0.55;
+
+/// Absolute per-character NLL ceiling. Catches the case where even the best
+/// candidate is poor, so "within the margin of the best" would still let
+/// nonsense through.
+const QUALITY_CEILING_NLL: f32 = 1.6;
+
+/// Candidates always kept, however badly they score. The list must never be
+/// gutted — the user needs something to pick even when the model is lost.
+pub(super) const MIN_KEPT_SCORED: usize = 2;
+
+/// Sort the scored candidates best-first and drop the ones that read as junk,
+/// leaving every other candidate exactly where it was.
+///
+/// This is the "show fewer, not more" rule: the number of candidates shown
+/// follows their quality instead of being padded to a fixed count. Near
+/// homophones the model rates far below the best reading (`パケットの約割と…`
+/// next to `パケットの役割と…`) are removed rather than ranked lower, while a
+/// list where everything scores well is kept in full.
+///
+/// Split out from the model call so the policy is testable without inference.
+/// `scored` pairs an index into `candidates` with its per-character NLL
+/// (lower = better); `None` means unscoreable, which is not evidence against a
+/// candidate, so those are kept — after the scored ones.
+pub(super) fn gate_and_reorder(
+    candidates: &[AnnotatedCandidate],
+    scored: &[(usize, Option<f32>)],
+) -> Vec<AnnotatedCandidate> {
+    let mut order = scored.to_vec();
+    // Stable sort: equal or unscoreable candidates keep their original order.
+    order.sort_by(|a, b| match (a.1, b.1) {
+        (Some(x), Some(y)) => x.total_cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+
+    let best = order.iter().filter_map(|(_, s)| *s).fold(f32::INFINITY, f32::min);
+    let survivors: Vec<usize> = order
+        .iter()
+        .enumerate()
+        .filter(|(rank, (_, score))| match score {
+            // Unscoreable: keep.
+            None => true,
+            Some(s) => {
+                *rank < MIN_KEPT_SCORED
+                    || (*s <= best + QUALITY_MARGIN_NLL && *s <= QUALITY_CEILING_NLL)
+            }
+        })
+        .map(|(_, (idx, _))| *idx)
+        .collect();
+
+    // Rebuild the list: unscored candidates stay put (keeping learning on top
+    // and the fallbacks at the bottom), and the scored block is replaced by its
+    // survivors in ranked order, compacting away the dropped ones.
+    let scored_slots: HashSet<usize> = scored.iter().map(|(i, _)| *i).collect();
+    let mut survivors = survivors.into_iter();
+    let mut out = Vec::with_capacity(candidates.len());
+    for (i, cand) in candidates.iter().enumerate() {
+        if scored_slots.contains(&i) {
+            if let Some(src) = survivors.next() {
+                out.push(candidates[src].clone());
+            }
+        } else {
+            out.push(cand.clone());
+        }
+    }
+    out
+}
+
 /// Minimum length of a passed-through hiragana run (present verbatim in the
 /// reading) for a model candidate to count as a low-quality "typo passthrough"
 /// and for a full-sentence conversion to be deemed a failure worth splitting.
@@ -198,10 +272,23 @@ impl InputMethodEngine {
                 } else {
                     num_candidates
                 };
-                light_converter
-                    .convert(&katakana, api_context, n)
-                    .unwrap_or_default()
+                if n == 1 {
+                    // Single-candidate = the live/auto-suggest path: use the
+                    // self-checking conversion (see `convert_live`).
+                    light_converter
+                        .convert_live(reading, api_context)
+                        .map(|t| vec![t])
+                        .unwrap_or_default()
+                } else {
+                    light_converter
+                        .convert(&katakana, api_context, n)
+                        .unwrap_or_default()
+                }
             }
+            ConversionStrategy::MainModelOnly if num_candidates == 1 => converter
+                .convert_live(reading, api_context)
+                .map(|t| vec![t])
+                .unwrap_or_default(),
             ConversionStrategy::MainModelOnly => converter
                 .convert(&katakana, api_context, num_candidates)
                 .unwrap_or_default(),
@@ -490,6 +577,11 @@ impl InputMethodEngine {
                 }
             }
         }
+
+        // Rank the model/dictionary candidates by how natural they read in
+        // context before anything is pinned on top, so the ordering reflects
+        // the language model rather than the decoder's beam order.
+        self.rerank_by_likelihood(&reading, &mut candidates);
 
         // If the previous auto-suggest result is not in the new candidates, insert it at the top
         // so it doesn't disappear when the conversion strategy changes.
@@ -2039,6 +2131,71 @@ impl InputMethodEngine {
         }
         *candidates = list.clone();
         EngineResult::consumed().with_action(EngineAction::ShowCandidates(list))
+    }
+
+    /// Reorder the model/dictionary candidates by how natural the language
+    /// model finds them in context (per-character NLL, lower is better).
+    ///
+    /// This is what puts `今日の天気は晴れです` above `今日の転機は晴れです`:
+    /// both are valid readings of the kana, and only a language model can say
+    /// which one is the sentence. Beam order alone can't — it ranks by the
+    /// decoder's own path probability, which is why near-homophone junk kept
+    /// surfacing high.
+    ///
+    /// Deliberately narrow:
+    /// - Learning and user-dictionary candidates keep the top; they are the
+    ///   user's own choices and outrank any model opinion.
+    /// - Rewriter variants and the hiragana/katakana fallbacks keep the bottom.
+    /// - Only the Model/Dictionary block in between is reordered.
+    ///
+    /// Scoring costs one forward pass per candidate (sharing the prompt's KV
+    /// cache), so it is capped and skipped for short readings, where the
+    /// candidate list is short and already good.
+    pub(super) fn rerank_by_likelihood(&mut self, reading: &str, candidates: &mut Vec<AnnotatedCandidate>) {
+        /// Readings shorter than this are left alone: few candidates, and the
+        /// per-candidate forward pass isn't worth the Space-key latency.
+        const MIN_RERANK_READING_CHARS: usize = 5;
+        /// Upper bound on forward passes per conversion. Set above the usual
+        /// candidate count so the whole list gets judged — a candidate left
+        /// unscored can't be gated, which is how junk used to survive at the
+        /// bottom of the list.
+        const MAX_RERANK_CANDIDATES: usize = 12;
+
+        if reading.chars().count() < MIN_RERANK_READING_CHARS || self.converters.kanji.is_none() {
+            return;
+        }
+        let rerankable = |c: &AnnotatedCandidate| {
+            matches!(
+                c.source,
+                CandidateSource::Model | CandidateSource::Dictionary
+            )
+        };
+        let positions: Vec<usize> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| rerankable(c))
+            .map(|(i, _)| i)
+            .take(MAX_RERANK_CANDIDATES)
+            .collect();
+        if positions.len() < 2 {
+            return;
+        }
+
+        let texts: Vec<String> = positions
+            .iter()
+            .map(|&i| candidates[i].text.clone())
+            .collect();
+        let ctx = self.truncate_context_for_api();
+        let Some(converter) = self.converters.kanji.as_ref() else {
+            return;
+        };
+        let Ok(scores) = converter.score_candidates(reading, &ctx, &texts) else {
+            return;
+        };
+
+        let scored: Vec<(usize, Option<f32>)> =
+            positions.iter().copied().zip(scores).collect();
+        *candidates = gate_and_reorder(candidates, &scored);
     }
 
     /// Take the settled segments' text (left of the focus), learning each

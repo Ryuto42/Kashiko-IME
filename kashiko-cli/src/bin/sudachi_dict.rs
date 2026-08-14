@@ -208,8 +208,10 @@ fn score_with_model(
             let chunk_scores: Vec<f32> = chunk
                 .iter()
                 .map(|fp| {
+                    // Dictionary entries are scored standalone, so there is no
+                    // surrounding sentence to condition on.
                     let score = scorer
-                        .compute_nll(&fp.reading_katakana, &fp.surface)
+                        .compute_nll(&fp.reading_katakana, &fp.surface, "")
                         .unwrap_or(fp.cost as f32 / 1000.0);
                     pb.inc(1);
                     score
