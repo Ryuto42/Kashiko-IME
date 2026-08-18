@@ -191,6 +191,7 @@ impl InputMethodEngine {
             self.learning = Some(LearningCache::new(max_entries));
             return;
         };
+        self.learning_path = Some(path.clone());
 
         if path.exists() {
             match LearningCache::load(&path, max_entries) {

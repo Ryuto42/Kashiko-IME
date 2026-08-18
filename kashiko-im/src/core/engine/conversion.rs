@@ -45,6 +45,52 @@ pub(super) struct DeepSearchJob {
     max_results: usize,
 }
 
+/// Dictionary-form ending implied by a 連用形 ending.
+///
+/// A godan verb's 連用形 sits in the い-段 of its row, and its dictionary form
+/// in the う-段 of the same row: `のり`→`のる`, `かき`→`かく`, `のみ`→`のむ`.
+/// Anything else (ichidan `たべます`, and non-verbs) takes `る`, which is the
+/// ichidan dictionary form and simply finds nothing when the guess is wrong.
+fn dictionary_form_ending(renyoukei: char) -> Option<char> {
+    Some(match renyoukei {
+        'い' => 'う',
+        'き' => 'く',
+        'ぎ' => 'ぐ',
+        'し' => 'す',
+        'ち' => 'つ',
+        'に' => 'ぬ',
+        'び' => 'ぶ',
+        'み' => 'む',
+        'り' => 'る',
+        // `ます` straight after the stem is ichidan (`たべ|ます`).
+        'ま' => 'る',
+        _ => return None,
+    })
+}
+
+/// A candidate submitted to the quality gate: where it sits in the list, how
+/// natural it reads (per-character NLL, lower is better; `None` = unscoreable),
+/// and whether it is protected from removal.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Scored {
+    pub index: usize,
+    pub score: Option<f32>,
+    /// Largest single-character NLL in the candidate. `None` = unscoreable.
+    pub worst: Option<f32>,
+    /// Never dropped, only reordered. Set for the user's own learned choices:
+    /// re-ranking them is fair, discarding them is not.
+    pub never_drop: bool,
+}
+
+/// NLL discount applied to a learned candidate before ranking.
+///
+/// A past choice is strong evidence, but it is recorded against the reading
+/// alone and so carries no context — `のります` learned as `乗ります` from
+/// `車に乗ります` would otherwise keep winning under `雑誌に`. The discount lets
+/// the past choice take ties and near-ties while a clear contextual preference
+/// still overrules it.
+pub(super) const LEARNED_SCORE_BONUS: f32 = 0.15;
+
 /// How much worse than the best candidate a candidate may score and still be
 /// shown, in per-character NLL. Relative rather than absolute so it adapts to
 /// how hard the sentence is: what matters is whether a candidate is close to
@@ -56,9 +102,77 @@ const QUALITY_MARGIN_NLL: f32 = 0.55;
 /// nonsense through.
 const QUALITY_CEILING_NLL: f32 = 1.6;
 
+/// Ceiling on the single worst character of a candidate.
+///
+/// The per-character average cannot judge a long sentence: one wrong character
+/// in twenty-six barely moves it, so `…形で対欧できます` (average 0.62) sat
+/// within the margin of `…形で対応できます` (0.03) and reached the window. Its
+/// worst character scores 13.8 — the damage is local, and only a local measure
+/// sees it.
+///
+/// Measured across the cases this gate exists for, legitimate candidates top
+/// out around 5 (`皆さんおはよう御座います` 5.0, `きょうの天気は晴れです` 4.4)
+/// while nonsense starts at 6 and climbs steeply (`官寺` 6.9, `かけている分廠`
+/// 9.2, `皆さんお様ございます` 11.6, `伸ります` 15.6). Set above the highest
+/// real candidate seen rather than as tight as the numbers allow, so a rare but
+/// wanted reading is not cut for being unusual.
+const QUALITY_WORST_TOKEN_NLL: f32 = 6.0;
+
 /// Candidates always kept, however badly they score. The list must never be
 /// gutted — the user needs something to pick even when the model is lost.
 pub(super) const MIN_KEPT_SCORED: usize = 2;
+
+/// Whether `text` contains ASCII letters or digits the reading never had.
+///
+/// The model hallucinating a `2` into `な2回慰安ありますか` cannot be right:
+/// nothing in `なにかいいあんありますか` could have produced it. Latin output is
+/// only legitimate when the user actually typed those characters, which the
+/// reading then carries.
+fn invents_ascii(reading: &str, text: &str) -> bool {
+    let reading_lower = reading.to_ascii_lowercase();
+    text.chars()
+        .any(|c| c.is_ascii_alphanumeric() && !reading_lower.contains(c.to_ascii_lowercase()))
+}
+
+/// The phrases where two conversions of the same reading disagree, as
+/// `(reading, a's text, b's text)` triples.
+///
+/// Both are aligned to the reading, and only spans the two alignments agree on
+/// the boundaries of are compared — a phrase either lines up or is skipped,
+/// which keeps a mis-alignment from producing a nonsense pair. Returns nothing
+/// when either conversion cannot be aligned.
+pub(super) fn differing_spans(reading: &str, a: &str, b: &str) -> Vec<(String, String, String)> {
+    let (Some(sa), Some(sb)) = (
+        kashiko_engine::segment::align(reading, a),
+        kashiko_engine::segment::align(reading, b),
+    ) else {
+        return Vec::new();
+    };
+    let r: Vec<char> = reading.chars().collect();
+    let ca: Vec<char> = a.chars().collect();
+    let cb: Vec<char> = b.chars().collect();
+    let slice = |v: &[char], from: usize, to: usize| -> String {
+        v.get(from..to).map(|s| s.iter().collect()).unwrap_or_default()
+    };
+    let mut out = Vec::new();
+    for pa in &sa {
+        let Some(pb) = sb
+            .iter()
+            .find(|pb| pb.reading_start == pa.reading_start && pb.reading_end == pa.reading_end)
+        else {
+            continue;
+        };
+        let (ta, tb) = (
+            slice(&ca, pa.converted_start, pa.converted_end),
+            slice(&cb, pb.converted_start, pb.converted_end),
+        );
+        if ta == tb || ta.is_empty() || tb.is_empty() {
+            continue;
+        }
+        out.push((slice(&r, pa.reading_start, pa.reading_end), ta, tb));
+    }
+    out
+}
 
 /// Sort the scored candidates best-first and drop the ones that read as junk,
 /// leaving every other candidate exactly where it was.
@@ -75,36 +189,42 @@ pub(super) const MIN_KEPT_SCORED: usize = 2;
 /// candidate, so those are kept — after the scored ones.
 pub(super) fn gate_and_reorder(
     candidates: &[AnnotatedCandidate],
-    scored: &[(usize, Option<f32>)],
+    scored: &[Scored],
 ) -> Vec<AnnotatedCandidate> {
-    let mut order = scored.to_vec();
+    let mut order: Vec<Scored> = scored.to_vec();
     // Stable sort: equal or unscoreable candidates keep their original order.
-    order.sort_by(|a, b| match (a.1, b.1) {
+    order.sort_by(|a, b| match (a.score, b.score) {
         (Some(x), Some(y)) => x.total_cmp(&y),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => std::cmp::Ordering::Equal,
     });
 
-    let best = order.iter().filter_map(|(_, s)| *s).fold(f32::INFINITY, f32::min);
+    let best = order
+        .iter()
+        .filter_map(|e| e.score)
+        .fold(f32::INFINITY, f32::min);
     let survivors: Vec<usize> = order
         .iter()
         .enumerate()
-        .filter(|(rank, (_, score))| match score {
+        .filter(|(rank, e)| match e.score {
             // Unscoreable: keep.
             None => true,
             Some(s) => {
-                *rank < MIN_KEPT_SCORED
-                    || (*s <= best + QUALITY_MARGIN_NLL && *s <= QUALITY_CEILING_NLL)
+                e.never_drop
+                    || *rank < MIN_KEPT_SCORED
+                    || (s <= best + QUALITY_MARGIN_NLL
+                        && s <= QUALITY_CEILING_NLL
+                        && e.worst.is_none_or(|w| w <= QUALITY_WORST_TOKEN_NLL))
             }
         })
-        .map(|(_, (idx, _))| *idx)
+        .map(|(_, e)| e.index)
         .collect();
 
     // Rebuild the list: unscored candidates stay put (keeping learning on top
     // and the fallbacks at the bottom), and the scored block is replaced by its
     // survivors in ranked order, compacting away the dropped ones.
-    let scored_slots: HashSet<usize> = scored.iter().map(|(i, _)| *i).collect();
+    let scored_slots: HashSet<usize> = scored.iter().map(|e| e.index).collect();
     let mut survivors = survivors.into_iter();
     let mut out = Vec::with_capacity(candidates.len());
     for (i, cand) in candidates.iter().enumerate() {
@@ -578,22 +698,82 @@ impl InputMethodEngine {
             }
         }
 
+        // Offer the dictionary's other readings of each word before ranking, so
+        // a word the beam never produced can still win (see
+        // `dictionary_substitution_variants`). Added as Dictionary candidates,
+        // which puts them in the block the reranker scores and gates.
+        if let Some(top) = candidates.first().map(|c| c.text.clone()) {
+            let existing: HashSet<String> =
+                candidates.iter().map(|c| c.text.clone()).collect();
+            // Inserted above the hiragana/katakana fallbacks, which must stay
+            // at the very bottom of the list (they are what Up from the top
+            // wraps around to).
+            let at = candidates
+                .iter()
+                .position(|c| c.source == CandidateSource::Fallback)
+                .unwrap_or(candidates.len());
+            let new: Vec<AnnotatedCandidate> = self
+                .dictionary_substitution_variants(&reading, &top)
+                .into_iter()
+                .filter(|v| !existing.contains(v))
+                // These are spliced in here rather than inside
+                // `build_conversion_candidates`, so the rules applied there
+                // have to be repeated. The dictionary holds latin aliases
+                // under kana readings (`きぼう` → `KIBOU`), which spliced into
+                // a sentence produce `ごKIBOUなら試飲補完を…`.
+                .filter(|v| !invents_ascii(&reading, v))
+                .filter(|v| {
+                    self.learning
+                        .as_ref()
+                        .is_none_or(|cache| !cache.is_suppressed(&reading, v))
+                })
+                .map(|v| AnnotatedCandidate::new(v, CandidateSource::Dictionary))
+                .collect();
+            candidates.splice(at..at, new);
+        }
+
         // Rank the model/dictionary candidates by how natural they read in
         // context before anything is pinned on top, so the ordering reflects
         // the language model rather than the decoder's beam order.
         self.rerank_by_likelihood(&reading, &mut candidates);
 
-        // If the previous auto-suggest result is not in the new candidates, insert it at the top
-        // so it doesn't disappear when the conversion strategy changes.
-        let seen: HashSet<&str> = candidates.iter().map(|c| c.text.as_str()).collect();
-        if !prev_suggest_text.is_empty()
-            && prev_suggest_text != reading
-            && !seen.contains(prev_suggest_text.as_str())
-        {
+        // The live-conversion text leads the list unconditionally: it is what
+        // the user was already looking at, so Space must never appear to throw
+        // it away. Pulled to the front when the candidate sources produced it
+        // too, inserted when they didn't.
+        //
+        // Testing `!seen.contains(...)` here instead was the bug behind "the
+        // live conversion one is gone": when the sources *did* produce it, it
+        // was left wherever reranking had put it, which for a long sentence
+        // meant several rows down and out of sight. Placed after reranking and
+        // the quality gate, so neither can bury or drop it.
+        // A ✕-ed sentence must not sneak back in as the pin: the pin is
+        // inserted after the suppression filter, and live conversion works on
+        // chunks whose readings don't match a whole-sentence suppression, so
+        // nothing upstream catches it.
+        let pin_suppressed = self
+            .learning
+            .as_ref()
+            .is_some_and(|cache| cache.is_suppressed(&reading, &prev_suggest_text));
+        if !prev_suggest_text.is_empty() && prev_suggest_text != reading && !pin_suppressed {
+            let known = candidates.iter().any(|c| c.text == prev_suggest_text);
+            candidates.retain(|c| c.text != prev_suggest_text);
             candidates.insert(
                 0,
                 AnnotatedCandidate::new(prev_suggest_text.clone(), CandidateSource::Model),
             );
+            // Being pinned means reranking never scored it, so it contributed
+            // nothing to the bar the deep search has to clear — and the pinned
+            // text is usually the best reading there is. One extra forward pass
+            // buys the correct bar: without it, `皆さんおはようございます`
+            // (0.05) was pinned while the recorded best stayed 0.46, doubling
+            // the tolerance and letting `皆さんおは様ございます` through.
+            if !known
+                && let Some(score) = self.score_one(&reading, &prev_suggest_text)
+            {
+                self.last_quality_best =
+                    Some(self.last_quality_best.map_or(score, |b| b.min(score)));
+            }
         }
 
         if candidates.is_empty() {
@@ -649,11 +829,15 @@ impl InputMethodEngine {
         );
 
         if initial_selection == 1 {
-            let top_is_live_duplicate = candidate_list
+            // Space/Down land on the *second* candidate when the first is the
+            // live-conversion text: the user has already seen that reading, so
+            // asking to convert means "show me something else". The first row
+            // stays available by pressing Up.
+            let top_is_live_text = candidate_list
                 .candidates()
                 .first()
                 .is_some_and(|c| !prev_suggest_text.is_empty() && c.text == prev_suggest_text);
-            if top_is_live_duplicate {
+            if top_is_live_text {
                 candidate_list.move_next();
             }
         } else if initial_selection == -1 {
@@ -681,7 +865,23 @@ impl InputMethodEngine {
         // model run on nearly every Space press, since a thin candidate list
         // is normal there.
         const MIN_ALTERNATIVES_READING_CHARS: usize = 6;
-        let kind = if typo_suspected || scope_has_ascii || top_garbled {
+        // A conversion the model is confident about is not a typo, whatever the
+        // heuristics suspected. Both suspicions are heuristic and both misfire
+        // on correct input: `みなさんおはようございます` converts to
+        // `皆さんおはようございます` at 0.05 NLL, yet `おはようございます` is a
+        // nine-character kana run shared with the reading, so `top_garbled`
+        // read it as a failed conversion and ran the keyboard-edit search
+        // anyway. Its variants come back as faithful conversions of nonsense
+        // (`ほあさま` → `ホア様`), which no amount of scoring the correction
+        // itself can reject — the only fix is not to ask. Raw keystrokes left
+        // in the reading stay an unconditional trigger: that is not a
+        // heuristic, the input is provably unfinished.
+        const TYPO_SEARCH_MAX_BEST_NLL: f32 = 0.5;
+        let converted_confidently = self
+            .last_quality_best
+            .is_some_and(|best| best <= TYPO_SEARCH_MAX_BEST_NLL);
+        let kind = if scope_has_ascii || ((typo_suspected || top_garbled) && !converted_confidently)
+        {
             Some(DeepSearchKind::TypoCorrection)
         } else if real_candidate_count < MIN_QUICK_REAL_CANDIDATES
             && reading.chars().count() >= MIN_ALTERNATIVES_READING_CHARS
@@ -1078,7 +1278,10 @@ impl InputMethodEngine {
         }
         self.ensure_kanji_converter();
 
-        const MAX_TOTAL_RESULTS: usize = 6;
+        // Pre-gate cap. Higher than what reaches the window, because
+        // `gate_deep_findings` removes the ones that read as nonsense — the
+        // search needs room to find the good ones before that selection.
+        const MAX_TOTAL_RESULTS: usize = 10;
         let mut queue: VecDeque<DeepTask> = VecDeque::new();
         let mut uniq: HashSet<String> = HashSet::new();
         let mut push_convert = |queue: &mut VecDeque<DeepTask>, variant: String, beam: usize, cap: usize| {
@@ -1258,18 +1461,142 @@ impl InputMethodEngine {
         }
     }
 
+    /// Per-character NLL of one candidate, or `None` when unscoreable.
+    fn score_one(&mut self, reading: &str, text: &str) -> Option<f32> {
+        let ctx = self.truncate_context_for_api();
+        let converter = self.converters.kanji.as_ref()?;
+        converter
+            .score_candidates(reading, &ctx, std::slice::from_ref(&text.to_string()))
+            .ok()?
+            .into_iter()
+            .next()
+            .flatten()
+    }
+
+    /// Score-gate the deep search's findings before they join the list.
+    ///
+    /// Findings come from beams over *edited* readings, so a wide beam or an
+    /// unlucky keyboard edit yields text that parses as Japanese but means
+    /// nothing. The quick pass gates its own candidates this way already;
+    /// skipping it here was why one Space press could offer nine candidates of
+    /// which only three were ever picked.
+    ///
+    /// Everything is scored against the reading the user actually typed. That
+    /// is deliberately *not* the reading each finding assumes: a keyboard-edit
+    /// variant converts faithfully into its own hypothesis, so
+    /// `ほあさま → ホア様` scores beautifully against `ほあさま` and the gate
+    /// learns nothing. Scored against the typed reading the findings become
+    /// comparable to each other, which is the only comparison that separates
+    /// them.
+    ///
+    /// What the margin is measured from depends on why the search ran:
+    ///
+    /// - `MoreAlternatives` searched because the list was thin, so a finding
+    ///   has to hold up against the list already on screen — the quick pass's
+    ///   best (`last_quality_best`) joins the reference, and the absolute
+    ///   ceiling applies.
+    /// - `TypoCorrection` searched because the input is broken, so every
+    ///   finding departs from the typed reading by design and scores poorly
+    ///   against it in absolute terms (measured on
+    ///   `さいびるどまえだったtまえ…`: real corrections 1.9–2.3, junk 2.7–2.9).
+    ///   Findings are ranked against each other only, with no ceiling.
+    ///
+    /// Survivors come back best-first, and nothing caps the count: a search
+    /// that turns up eight good sentences shows eight, one that turns up only
+    /// junk shows none.
+    fn gate_deep_findings(
+        &mut self,
+        typed_reading: &str,
+        kind: DeepSearchKind,
+        found: Vec<Candidate>,
+    ) -> Vec<Candidate> {
+        if self.converters.kanji.is_none() {
+            return found;
+        }
+        let ctx = self.truncate_context_for_api();
+        let texts: Vec<String> = found.iter().map(|c| c.text.clone()).collect();
+        let Some(converter) = self.converters.kanji.as_ref() else {
+            return found;
+        };
+        let Ok(scores) = converter.score_candidates_detailed(typed_reading, &ctx, &texts) else {
+            return found;
+        };
+        let worst: Vec<Option<f32>> = scores.iter().map(|d| d.map(|d| d.worst)).collect();
+        let scores: Vec<Option<f32>> = scores.iter().map(|d| d.map(|d| d.mean)).collect();
+
+        let compare_with_shown = kind == DeepSearchKind::MoreAlternatives;
+        let best = scores
+            .iter()
+            .copied()
+            .flatten()
+            .chain(compare_with_shown.then_some(self.last_quality_best).flatten())
+            .fold(f32::INFINITY, f32::min);
+        if !best.is_finite() {
+            return found;
+        }
+        let ceiling = if compare_with_shown {
+            QUALITY_CEILING_NLL
+        } else {
+            f32::INFINITY
+        };
+
+        let mut kept: Vec<(f32, Candidate)> = found
+            .into_iter()
+            .zip(scores)
+            .zip(worst)
+            .filter_map(|((cand, score), worst)| match score {
+                // Unscoreable is not evidence against a candidate; rank it as
+                // if it tied the best so it keeps its place.
+                None => Some((best, cand)),
+                Some(s) => (s <= best + QUALITY_MARGIN_NLL
+                    && s <= ceiling
+                    // Applies whatever the search's reason: a single character
+                    // the model flatly disbelieves is junk either way.
+                    && worst.is_none_or(|w| w <= QUALITY_WORST_TOKEN_NLL))
+                    .then_some((s, cand)),
+            })
+            .collect();
+        kept.sort_by(|a, b| a.0.total_cmp(&b.0));
+        kept.into_iter().map(|(_, c)| c).collect()
+    }
+
     /// Merge the finished job's findings into the live candidate list and
     /// build the notification result (always at least `HideAuxText`, to
     /// clear the loading indicator).
     fn finish_deep_job(&mut self, job: DeepSearchJob) -> EngineResult {
         let found = job.found;
-        let InputState::Conversion { candidates, .. } = &mut self.state else {
-            return EngineResult::consumed().with_action(EngineAction::HideAuxText);
-        };
+        let done = || EngineResult::consumed().with_action(EngineAction::HideAuxText);
         if found.is_empty() {
             // Nothing new — just clear the loading indicator.
-            return EngineResult::consumed().with_action(EngineAction::HideAuxText);
+            return done();
         }
+        if !matches!(self.state, InputState::Conversion { .. }) {
+            return done();
+        }
+        // Deleted candidates must not come back through the side door: the
+        // quick pass filters suppressed text but the deep search merged its
+        // findings straight into the list, so a ✕-ed candidate reappeared a
+        // second later when the background search rediscovered it.
+        // ...and neither may the model invent ASCII here, the same rule the
+        // quick pass applies: `ごKIBOUなら試飲補完を…` is a beam over an edited
+        // reading spelling out keystrokes that were never typed.
+        let mut found: Vec<Candidate> = found
+            .into_iter()
+            .filter(|c| !invents_ascii(&job.reading, &c.text))
+            .collect();
+        if let Some(cache) = self.learning.as_ref() {
+            found.retain(|c| !cache.is_suppressed(&job.reading, &c.text));
+        }
+        if found.is_empty() {
+            return done();
+        }
+        let found = self.gate_deep_findings(&job.reading, job.request.kind, found);
+        if found.is_empty() {
+            return done();
+        }
+        let InputState::Conversion { candidates, .. } = &mut self.state else {
+            return done();
+        };
         // Insert findings right after the currently selected candidate so
         // they are visible on the *current page* — inserting at the bottom
         // (above the fallbacks) buried them on page 2 whenever the quick
@@ -1606,13 +1933,7 @@ impl InputMethodEngine {
         //       Runs *before* the latin-word step below, whose candidate comes
         //       from the keystrokes rather than the reading and is exempt.
         {
-            let reading_lower = reading.to_ascii_lowercase();
-            let invents_ascii = |text: &str| {
-                text.chars().any(|c| {
-                    c.is_ascii_alphanumeric()
-                        && !reading_lower.contains(c.to_ascii_lowercase())
-                })
-            };
+            let invents_ascii = |text: &str| invents_ascii(reading, text);
             // Fallback and Rewriter output is derived from the reading by rule
             // (width/case variants such as `abc` → `ABC`/`ａｂｃ`), so only
             // free-form model/dictionary output is checked.
@@ -2101,6 +2422,14 @@ impl InputMethodEngine {
         };
         let (text, reading) = (cand.text.clone(), cand.reading.clone());
         let reading = reading.unwrap_or_else(|| self.input_buf.text.clone());
+        // The best remaining conversion: what the user is presumably reaching
+        // for by deleting this one. Kana fallbacks (the ones carrying a width
+        // annotation) are not a choice, so they teach nothing.
+        let survivor = candidates
+            .candidates()
+            .iter()
+            .find(|c| c.text != text && c.description.is_none())
+            .map(|c| c.text.clone());
         let Some(cache) = self.learning.as_mut() else {
             return EngineResult::not_consumed();
         };
@@ -2109,6 +2438,21 @@ impl InputMethodEngine {
         // point of the ✕ is "stop showing me this", whatever produced it.
         cache.forget(&reading, &text);
         cache.suppress(&reading, &text);
+        // Learn from the deletion phrase by phrase, which is what makes the ✕
+        // carry over to *other* sentences. Suppressing the whole surface only
+        // helps if the identical sentence is typed again, and a long one is
+        // never learned at all (`MAX_LEARN_SURFACE_CHARS`) — so deleting
+        // `ご希望なら試飲保管を…` on its own would teach nothing. Aligning it
+        // against the survivor isolates the phrase actually being rejected
+        // (`しいんほかん`: `試飲保管` out, `子音補完` in), which is short enough
+        // to learn and applies wherever that reading turns up next, live
+        // conversion included.
+        if let Some(survivor) = survivor {
+            for (span_reading, rejected, wanted) in differing_spans(&reading, &text, &survivor) {
+                cache.suppress(&span_reading, &rejected);
+                cache.record(&span_reading, &wanted);
+            }
+        }
 
         let InputState::Conversion { candidates, .. } = &mut self.state else {
             return EngineResult::not_consumed();
@@ -2130,7 +2474,142 @@ impl InputMethodEngine {
             list.select(idx);
         }
         *candidates = list.clone();
+        // Written through immediately: a deletion is a deliberate instruction
+        // that must survive a crash or a force-quit, unlike ordinary learning
+        // which can wait for the next focus change.
+        self.save_learning();
         EngineResult::consumed().with_action(EngineAction::ShowCandidates(list))
+    }
+
+    /// Whole-sentence variants built by swapping one word of `converted` for a
+    /// dictionary homophone, so the reranker actually has the right answer to
+    /// choose from.
+    ///
+    /// Reranking can only reorder what exists, and the candidate sources can't
+    /// produce these: the dictionary is consulted by exact match on the *whole*
+    /// reading (`ざっしにのります` matches nothing), so the only sentence-level
+    /// candidates come from the model's beam. When the beam misses the intended
+    /// word — `雑誌に乗ります` where `載ります` was meant — nothing downstream
+    /// can recover it. This fills that recall gap the way a lattice would:
+    /// align the conversion to the reading, then for each phrase offer the
+    /// dictionary's other readings of the same kana, spliced back into the
+    /// sentence. Scoring in context then picks between them (`雑誌に` selects
+    /// `載ります`, `車に` selects `乗ります`).
+    ///
+    /// Each phrase is split at the kana it shares with its reading, so only the
+    /// stem is substituted and inflection survives: `のります`/`乗ります` share
+    /// the suffix `ります`, leaving the stem `の`/`乗` to swap.
+    pub(super) fn dictionary_substitution_variants(&self, reading: &str, converted: &str) -> Vec<String> {
+        /// Cap on generated variants: each one costs a scoring pass later.
+        const MAX_VARIANTS: usize = 6;
+
+        let Some(spans) = kashiko_engine::segment::align(reading, converted) else {
+            return Vec::new();
+        };
+        let r: Vec<char> = reading.chars().collect();
+        let c: Vec<char> = converted.chars().collect();
+        let take = |src: &[char], a: usize, b: usize| -> String {
+            src[a.min(src.len())..b.min(src.len())].iter().collect()
+        };
+
+        let mut out = Vec::new();
+        for span in &spans {
+            if out.len() >= MAX_VARIANTS {
+                break;
+            }
+            let seg_reading = take(&r, span.reading_start, span.reading_end);
+            let seg_converted = take(&c, span.converted_start, span.converted_end);
+
+            // Trim the shared tail (okurigana / auxiliary verb) so only the
+            // stem is looked up and replaced.
+            let shared: usize = seg_reading
+                .chars()
+                .rev()
+                .zip(seg_converted.chars().rev())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let stem_reading: String = seg_reading
+                .chars()
+                .take(seg_reading.chars().count().saturating_sub(shared))
+                .collect();
+            let stem_converted: String = seg_converted
+                .chars()
+                .take(seg_converted.chars().count().saturating_sub(shared))
+                .collect();
+            // Nothing was converted here (pure kana), so there is no homophone
+            // choice to offer.
+            if stem_reading.is_empty() || stem_converted == stem_reading {
+                continue;
+            }
+
+            // Nouns are in the dictionary under the stem itself; verbs are
+            // only under their dictionary form, so an inflected verb needs
+            // that form rebuilt before it can be looked up. `のります` leaves
+            // the stem `の`, which the dictionary knows only as 野/乃/之 — the
+            // homophone we want lives under `のる` (乗る, 載る).
+            //
+            // The 連用形 ending that begins the shared suffix says which row
+            // the verb belongs to, and therefore how its dictionary form ends:
+            // `り` is the い-段 of ら行, so the form is stem + `る`.
+            let inflected: Option<(String, char)> = seg_reading
+                .chars()
+                .nth(seg_reading.chars().count().saturating_sub(shared))
+                .and_then(dictionary_form_ending)
+                .map(|end| (format!("{stem_reading}{end}"), end));
+
+            // In a verb slot the plain stem resolves to unrelated nouns
+            // (`の` → 野/乃/ゝ), so the dictionary form wins when it matches
+            // anything; the plain stem is the fallback for nouns, where no
+            // dictionary form exists (`ざっしす` finds nothing).
+            let mut lookups: Vec<(String, Option<char>)> = Vec::new();
+            if let Some((form, end)) = inflected
+                && !self.search_dictionaries(&form, 1).is_empty()
+            {
+                lookups.push((form, Some(end)));
+            }
+            if lookups.is_empty() {
+                lookups.push((stem_reading.clone(), None));
+            }
+
+            for (lookup_reading, strip) in lookups {
+                if out.len() >= MAX_VARIANTS {
+                    break;
+                }
+                for cand in self.search_dictionaries(&lookup_reading, usize::MAX) {
+                    if out.len() >= MAX_VARIANTS {
+                        break;
+                    }
+                    // Drop the dictionary-form ending so the sentence's own
+                    // inflection is what gets attached (`載る` → `載` + `ります`).
+                    let surface = match strip {
+                        Some(end) => match cand.text.strip_suffix(end) {
+                            Some(stem) if !stem.is_empty() => stem.to_string(),
+                            _ => continue,
+                        },
+                        None => cand.text.clone(),
+                    };
+                    if surface == stem_converted {
+                        continue;
+                    }
+                    let cand = AnnotatedCandidate { text: surface, ..cand };
+                    let variant = format!(
+                        "{}{}{}{}",
+                        take(&c, 0, span.converted_start),
+                        cand.text,
+                        take(
+                            &c,
+                            span.converted_end - shared.min(span.converted_end),
+                            span.converted_end
+                        ),
+                        take(&c, span.converted_end, c.len()),
+                    );
+                    if variant != converted && !out.contains(&variant) {
+                        out.push(variant);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Reorder the model/dictionary candidates by how natural the language
@@ -2152,33 +2631,73 @@ impl InputMethodEngine {
     /// cache), so it is capped and skipped for short readings, where the
     /// candidate list is short and already good.
     pub(super) fn rerank_by_likelihood(&mut self, reading: &str, candidates: &mut Vec<AnnotatedCandidate>) {
-        /// Readings shorter than this are left alone: few candidates, and the
-        /// per-candidate forward pass isn't worth the Space-key latency.
-        const MIN_RERANK_READING_CHARS: usize = 5;
-        /// Upper bound on forward passes per conversion. Set above the usual
-        /// candidate count so the whole list gets judged — a candidate left
-        /// unscored can't be gated, which is how junk used to survive at the
-        /// bottom of the list.
+        /// Readings shorter than this are left alone: a one- or two-character
+        /// reading has few candidates and little context to judge them by, so
+        /// the per-candidate forward pass buys nothing. Kept low because short
+        /// inflected verbs (`のります`, 4 chars) are exactly where homophones
+        /// need separating — a higher bound skipped that case entirely.
+        const MIN_RERANK_READING_CHARS: usize = 3;
+        /// Upper bound on forward passes per conversion. One pass is ~12ms, so
+        /// this is what the user waits for after Space; the tail beyond it is
+        /// dropped rather than shown unjudged (see below).
         const MAX_RERANK_CANDIDATES: usize = 12;
 
+        // Cleared first: every early return below leaves no score for this
+        // conversion, and a stale one from the previous conversion would set
+        // the deep search's bar from unrelated text.
+        self.last_quality_best = None;
         if reading.chars().count() < MIN_RERANK_READING_CHARS || self.converters.kanji.is_none() {
             return;
         }
+        // Learned candidates take part in ranking so context can overrule a
+        // past choice made in a different sentence, but they are never dropped
+        // (see `Scored::never_drop`) and get a head start
+        // (`LEARNED_SCORE_BONUS`). User-dictionary entries stay out of this
+        // entirely: those are explicit configuration, not an inference.
         let rerankable = |c: &AnnotatedCandidate| {
             matches!(
                 c.source,
-                CandidateSource::Model | CandidateSource::Dictionary
+                CandidateSource::Model | CandidateSource::Dictionary | CandidateSource::Learning
             )
         };
-        let positions: Vec<usize> = candidates
+        let mut positions: Vec<usize> = candidates
             .iter()
             .enumerate()
             .filter(|(_, c)| rerankable(c))
             .map(|(i, _)| i)
-            .take(MAX_RERANK_CANDIDATES)
             .collect();
         if positions.len() < 2 {
             return;
+        }
+        // Anything past the scoring budget is removed, not shown unjudged.
+        // Passing it through was the larger half of "why are there so many
+        // candidates": for `かけているぶんしょう` the budget was spent on the
+        // first twelve, of which the gate kept four — and then
+        // `かけている分廠`, `分省`, `分章` (2.5, 2.1, 2.7 NLL against 0.10 for
+        // the best) walked straight into the window because nothing had looked
+        // at them. Candidate sources emit roughly best-first, so the tail is
+        // where the rare readings live; the deep search adds more later if the
+        // remaining list turns out thin, and those *are* gated.
+        let overflow: HashSet<usize> = positions
+            .split_off(positions.len().min(MAX_RERANK_CANDIDATES))
+            .into_iter()
+            // The user's own past choices are never silently discarded.
+            .filter(|&i| candidates[i].source != CandidateSource::Learning)
+            .collect();
+        if !overflow.is_empty() {
+            let mut kept = 0usize;
+            candidates.retain(|_| {
+                let keep = !overflow.contains(&kept);
+                kept += 1;
+                keep
+            });
+            positions = candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| rerankable(c))
+                .map(|(i, _)| i)
+                .take(MAX_RERANK_CANDIDATES)
+                .collect();
         }
 
         let texts: Vec<String> = positions
@@ -2189,12 +2708,37 @@ impl InputMethodEngine {
         let Some(converter) = self.converters.kanji.as_ref() else {
             return;
         };
-        let Ok(scores) = converter.score_candidates(reading, &ctx, &texts) else {
+        let Ok(scores) = converter.score_candidates_detailed(reading, &ctx, &texts) else {
             return;
         };
 
-        let scored: Vec<(usize, Option<f32>)> =
-            positions.iter().copied().zip(scores).collect();
+        let scored: Vec<Scored> = positions
+            .iter()
+            .copied()
+            .zip(scores)
+            .map(|(index, detail)| {
+                let learned = candidates[index].source == CandidateSource::Learning;
+                Scored {
+                    index,
+                    score: detail
+                        .map(|d| if learned { d.mean - LEARNED_SCORE_BONUS } else { d.mean }),
+                    worst: detail.map(|d| d.worst),
+                    never_drop: learned,
+                }
+            })
+            .collect();
+        // Candidates still carrying raw keystrokes are excluded from the
+        // recorded best: they score well precisely *because* they copy the
+        // input, and letting that stand in for "the conversion went fine" is
+        // how a genuinely garbled sentence looked confident —
+        // `サイビルド前だったt前だと思われます` scored 0.18 while every real
+        // correction of it sat above 1.9. Kana passthroughs need no such rule;
+        // the model rates those badly on their own.
+        self.last_quality_best = scored
+            .iter()
+            .filter(|e| !candidates[e.index].text.chars().any(|c| c.is_ascii_alphabetic()))
+            .filter_map(|e| e.score)
+            .reduce(f32::min);
         *candidates = gate_and_reorder(candidates, &scored);
     }
 

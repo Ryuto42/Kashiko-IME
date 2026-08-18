@@ -258,16 +258,68 @@ impl InputMethodEngine {
         combined: &str,
     ) -> ComposingChunk {
         let converted = if reading.chars().next().is_some_and(is_japanese) {
-            if let Some(learned) = self.important_learned_conversion(&reading) {
-                learned
-            } else {
-                let lctx = self.lctx_for(base_ctx, combined);
-                self.convert_chunk(&reading, &lctx)
+            let lctx = self.lctx_for(base_ctx, combined);
+            let model = self.convert_chunk(&reading, &lctx);
+            // A learned form used to short-circuit the model entirely, which
+            // meant live conversion ignored context: `のります` learned as
+            // `乗ります` from `車に乗ります` kept winning under `雑誌に`, even
+            // though the model reads that context correctly. Learning still
+            // takes precedence, but only as a weighted preference — the same
+            // policy the candidate list uses.
+            // A ✕-ed conversion is out of the running here too, otherwise live
+            // conversion kept proposing the phrase the user had just deleted.
+            let rejected = self
+                .learning
+                .as_ref()
+                .is_some_and(|cache| cache.is_suppressed(&reading, &model));
+            match self.important_learned_conversion(&reading) {
+                // Nothing to weigh when the model's answer was rejected
+                // outright — the learned form is the only one left.
+                Some(learned) if rejected => learned,
+                Some(learned) if learned != model => {
+                    self.prefer_in_context(&reading, &lctx, learned, model)
+                }
+                Some(learned) => learned,
+                None => model,
             }
         } else {
             reading.clone()
         };
         ComposingChunk { reading, converted }
+    }
+
+    /// Choose between a learned form and the model's own reading of the same
+    /// kana, by how each reads in `lctx`.
+    ///
+    /// `learned` gets the same head start the candidate list gives it, so a
+    /// past choice wins ties and near-ties while a clear contextual preference
+    /// overrules it. Only reached when the two disagree, so the common case
+    /// (learning and model agree) costs nothing extra.
+    fn prefer_in_context(
+        &mut self,
+        reading: &str,
+        lctx: &str,
+        learned: String,
+        model: String,
+    ) -> String {
+        let Some(converter) = self.converters.kanji.as_ref() else {
+            return learned;
+        };
+        let pair = [learned.clone(), model.clone()];
+        let Ok(scores) = converter.score_candidates(reading, lctx, &pair) else {
+            return learned;
+        };
+        match (scores[0], scores[1]) {
+            (Some(l), Some(m)) => {
+                if l - super::conversion::LEARNED_SCORE_BONUS <= m {
+                    learned
+                } else {
+                    model
+                }
+            }
+            // Unscoreable: fall back to the learned form, as before.
+            _ => learned,
+        }
     }
 
     /// Minimum selection count for a learned entry to be treated as

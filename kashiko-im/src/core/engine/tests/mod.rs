@@ -16,6 +16,7 @@ mod learning;
 mod live_conversion;
 mod mode_toggle;
 mod passthrough;
+mod real_model;
 mod rewriter;
 mod strategy;
 mod surrounding;

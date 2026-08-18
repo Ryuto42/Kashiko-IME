@@ -287,3 +287,69 @@ fn test_display_context_truncation() {
     assert!(ctx.contains("rctx: "));
     assert!(ctx.ends_with("..."));
 }
+
+// --- fallback context from our own commits ---
+
+#[test]
+fn committed_text_becomes_context_when_the_app_reports_none() {
+    // Many apps (Electron editors, terminals) don't implement `string(from:)`,
+    // so surrounding text arrives empty and context-aware conversion would
+    // otherwise run with no context at all.
+    let mut engine = InputMethodEngine::new();
+    engine.converters.kanji = None;
+    assert!(engine.truncate_context_for_api().is_empty());
+
+    engine.record_committed_context("雑誌に");
+    assert_eq!(engine.truncate_context_for_api(), "雑誌に");
+}
+
+#[test]
+fn document_context_wins_over_the_fallback() {
+    // When the app does report its document, that is authoritative — the user
+    // may have moved the caret somewhere our commit history knows nothing about.
+    let mut engine = InputMethodEngine::new();
+    engine.converters.kanji = None;
+    engine.record_committed_context("雑誌に");
+    engine.set_surrounding_context("車に", "");
+    assert_eq!(engine.truncate_context_for_api(), "車に");
+}
+
+#[test]
+fn empty_document_context_falls_back_rather_than_blanking() {
+    // The frontend explicitly sends "" when it cannot read the document; that
+    // must not wipe out the context we do have.
+    let mut engine = InputMethodEngine::new();
+    engine.converters.kanji = None;
+    engine.record_committed_context("雑誌に");
+    engine.set_surrounding_context("", "");
+    assert_eq!(engine.truncate_context_for_api(), "雑誌に");
+}
+
+#[test]
+fn fallback_context_keeps_the_most_recent_text_within_the_limit() {
+    let mut engine = InputMethodEngine::new();
+    engine.converters.kanji = None;
+    let limit = engine.config.max_api_context_len;
+    for _ in 0..limit {
+        engine.record_committed_context("あ");
+    }
+    engine.record_committed_context("私は歯医者です。");
+    let ctx = engine.truncate_context_for_api();
+    assert_eq!(ctx.chars().count(), limit);
+    assert!(
+        ctx.ends_with("私は歯医者です。"),
+        "the newest commits must survive truncation, got {ctx:?}"
+    );
+}
+
+#[test]
+fn context_window_fits_a_preceding_sentence() {
+    // The window has to hold the sentence the homophone depends on; the old
+    // 10-character limit cut `私はアナウンサーです。司会を` down to a fragment.
+    let engine = InputMethodEngine::new();
+    assert!(
+        engine.config.max_api_context_len >= "私はアナウンサーです。司会を".chars().count(),
+        "context window too small for a preceding sentence: {}",
+        engine.config.max_api_context_len
+    );
+}

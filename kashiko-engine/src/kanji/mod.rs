@@ -14,7 +14,7 @@ pub use hf_download::{
     download_gguf, get_path_by_id, get_tokenizer_path, get_tokenizer_path_by_id, get_variant_path,
 };
 pub use llama_cpp_2::token::LlamaToken;
-pub use llamacpp::{LlamaCppModel, NllScorer};
+pub use llamacpp::{LlamaCppModel, NllDetail, NllScorer};
 pub use model_config::{ModelFamily, ModelRegistry, VariantConfig, registry};
 
 /// Special tokens for jinen format

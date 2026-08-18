@@ -225,7 +225,11 @@ class KashikoInputController: IMKInputController {
             return
         }
 
-        let maxContextUTF16 = 40  // engine truncates further per its config
+        // Must exceed the engine's own `max_context_length` (32 chars) so the
+        // engine has enough to truncate from; disambiguating homophones depends
+        // on the preceding sentence, so a window shorter than one sentence
+        // silently defeats context-aware conversion.
+        let maxContextUTF16 = 80
         let start = max(0, selected.location - maxContextUTF16)
         let range = NSRange(location: start, length: selected.location - start)
         // string(from:actualRange:) rather than attributedSubstring(from:):

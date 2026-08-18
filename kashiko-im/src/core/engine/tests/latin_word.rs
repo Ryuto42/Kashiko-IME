@@ -322,3 +322,60 @@ fn focus_uses_conversion_derived_phrase_boundaries() {
     );
     assert_eq!(engine.segment_bounds, vec![4, 8, 12]);
 }
+
+// --- dictionary substitution: filling the recall gap ---
+
+#[test]
+fn homophone_of_an_inflected_verb_is_offered_as_a_whole_sentence() {
+    // The reported case: `雑誌にのります` converts to `雑誌に乗ります` and
+    // `載ります` never appears, so no amount of reranking can pick it. The
+    // dictionary is only consulted by exact match on the whole reading, which
+    // matches nothing here — this fills that gap.
+    //
+    // `のります`/`乗ります` share the suffix `ります`, so only the stem `の` is
+    // looked up and swapped, keeping the inflection intact.
+    let engine = engine_in_conversion_dict(&[("の", "載"), ("ざっし", "雑誌")]);
+    let variants = engine.dictionary_substitution_variants("ざっしにのります", "雑誌に乗ります");
+    assert!(
+        variants.contains(&"雑誌に載ります".to_string()),
+        "expected 雑誌に載ります among variants, got {variants:?}"
+    );
+}
+
+#[test]
+fn substitution_leaves_pure_kana_phrases_alone() {
+    // A phrase that was never converted has no homophone to offer.
+    let engine = engine_in_conversion_dict(&[("の", "載")]);
+    let variants = engine.dictionary_substitution_variants("あいうえ", "あいうえ");
+    assert!(variants.is_empty(), "got {variants:?}");
+}
+
+#[test]
+fn substitution_never_repeats_the_original() {
+    let engine = engine_in_conversion_dict(&[("ざっし", "雑誌")]);
+    let variants = engine.dictionary_substitution_variants("ざっしに", "雑誌に");
+    assert!(
+        !variants.contains(&"雑誌に".to_string()),
+        "the input conversion must not be offered back: {variants:?}"
+    );
+}
+
+/// Engine with a user dictionary of `(reading, surface)` entries, no model.
+fn engine_in_conversion_dict(words: &[(&str, &str)]) -> InputMethodEngine {
+    use std::io::Write;
+    let mut engine = InputMethodEngine::new();
+    engine.converters.kanji = None;
+    let entries: Vec<String> = words
+        .iter()
+        .map(|(r, s)| {
+            format!(r#"{{"reading":"{r}","candidates":[{{"surface":"{s}","score":1.0}}]}}"#)
+        })
+        .collect();
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    tmp.write_all(format!("[{}]", entries.join(",")).as_bytes())
+        .unwrap();
+    tmp.flush().unwrap();
+    engine.dicts.user =
+        Some(kashiko_engine::dict::Dictionary::build_from_json(tmp.path()).unwrap());
+    engine
+}

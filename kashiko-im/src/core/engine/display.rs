@@ -192,13 +192,38 @@ impl InputMethodEngine {
 
     /// Truncate context to safe size for API calls
     pub(super) fn truncate_context_for_api(&self) -> String {
-        match self
+        let from_document = self
             .surrounding_context
             .as_ref()
             .and_then(|ctx| ctx.left.as_deref())
-        {
+            .filter(|left| !left.is_empty());
+        match from_document {
+            // The application told us what precedes the cursor: authoritative.
             Some(left) => self.truncate_context(left),
+            // It didn't (or can't — many Electron apps and terminals don't
+            // implement `string(from:)`). Fall back to what we committed
+            // ourselves, which is the same text sitting left of the cursor.
+            None if self.config.max_api_context_len > 0 => {
+                self.truncate_context(&self.committed_tail)
+            }
             None => String::new(),
+        }
+    }
+
+    /// Append committed text to the fallback context tail, keeping only as much
+    /// as conversion can actually use.
+    pub(super) fn record_committed_context(&mut self, text: &str) {
+        if text.is_empty() || self.config.max_api_context_len == 0 {
+            return;
+        }
+        self.committed_tail.push_str(text);
+        let extra = self
+            .committed_tail
+            .chars()
+            .count()
+            .saturating_sub(self.config.max_api_context_len);
+        if extra > 0 {
+            self.committed_tail = self.committed_tail.chars().skip(extra).collect();
         }
     }
 

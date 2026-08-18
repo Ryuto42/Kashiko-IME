@@ -171,10 +171,32 @@ pub struct InputMethodEngine {
     deep_search: Option<DeepSearchRequest>,
     /// The in-flight deep search, if one is running.
     deep_job: Option<conversion::DeepSearchJob>,
+    /// Best per-character NLL seen by the quick pass's quality gate for the
+    /// conversion currently on screen. Reused as the bar the deep search's
+    /// findings must clear, so they are judged against the true best reading
+    /// rather than against whatever happens to sit at the top of the list —
+    /// which is itself only guaranteed to be *within the margin* of the best,
+    /// and so doubled the tolerance when used as the reference.
+    pub(super) last_quality_best: Option<f32>,
+    /// Where the learning cache is written. Taken from `Settings` at init; held
+    /// on the engine rather than looked up at save time so a test can point it
+    /// somewhere harmless — deleting a candidate now writes through immediately,
+    /// and a test doing that must not touch the user's own cache.
+    pub(super) learning_path: Option<std::path::PathBuf>,
     /// The last committed conversion `(reading, surface)`, kept for exactly
     /// one following key so Ctrl+Backspace can take it back into conversion
     /// mode (undo commit / reconversion). Cleared by any other key.
     last_commit: Option<(String, String)>,
+    /// Rolling tail of text this engine has committed, used as conversion
+    /// context when the application can't report its own.
+    ///
+    /// `string(from:)` is the only way to read the document, and a large share
+    /// of apps (Electron-based editors, terminals) don't implement it — there
+    /// the surrounding text arrives empty and context-aware conversion silently
+    /// degrades to no context at all. What *we* just committed is the same text
+    /// that sits left of the cursor, so it stands in. Authoritative document
+    /// context always wins when available; this is only a fallback.
+    committed_tail: String,
     /// Converted text of the region *after* the focused segment, kept so the
     /// unfocused tail stays converted while the focus slides through the
     /// sentence. `None` means show the raw reading there instead — the
@@ -247,7 +269,10 @@ impl InputMethodEngine {
             learning: None,
             deep_search: None,
             deep_job: None,
+            last_quality_best: None,
+            learning_path: None,
             last_commit: None,
+            committed_tail: String::new(),
             tail_text: None,
             segment_bounds: Vec::new(),
             decided: Vec::new(),
@@ -325,6 +350,9 @@ impl InputMethodEngine {
         self.decided.clear();
         self.tail_text = None;
         self.segment_bounds.clear();
+        // A reset means focus moved: our committed tail no longer describes
+        // what precedes the cursor.
+        self.committed_tail.clear();
         self.metrics = ConversionMetrics::default();
     }
 
@@ -566,7 +594,25 @@ impl InputMethodEngine {
 
         self.metrics.process_key_ms = start.elapsed().as_millis() as u64;
 
+        self.record_context_from(&result);
         result
+    }
+
+    /// Feed any text this result commits into the fallback conversion context.
+    ///
+    /// Done here, where every key path converges, rather than at each of the
+    /// nine `EngineAction::Commit` sites — a commit that skipped the bookkeeping
+    /// would silently lose context for the following conversion.
+    fn record_context_from(&mut self, result: &EngineResult) {
+        let committed: String = result
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                EngineAction::Commit(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        self.record_committed_context(&committed);
     }
 
     /// Commit any pending input and return the text
@@ -612,6 +658,7 @@ impl InputMethodEngine {
     /// preedit/candidate-window teardown.
     pub fn commit_result(&mut self) -> EngineResult {
         let text = self.commit();
+        self.record_committed_context(&text);
         let mut result =
             EngineResult::consumed().with_action(EngineAction::UpdatePreedit(Preedit::new()));
         if !text.is_empty() {
@@ -626,7 +673,7 @@ impl InputMethodEngine {
     pub fn save_learning(&mut self) {
         if let Some(cache) = &mut self.learning
             && cache.is_dirty()
-            && let Some(path) = Settings::learning_file()
+            && let Some(path) = self.learning_path.clone()
         {
             if let Err(e) = cache.save(&path) {
                 debug!("Failed to save learning cache: {}", e);

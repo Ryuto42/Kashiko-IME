@@ -121,7 +121,9 @@ impl Default for EngineConfig {
         Self {
             num_candidates: 3, // Space conversion: beam search with 3 candidates
             display_context_len: 10,
-            max_api_context_len: 10,
+            // Must hold the preceding sentence: homophone choice depends on it
+            // (`雑誌に載る` / `車に乗る`). Kept in step with config/default.toml.
+            max_api_context_len: 32,
             composing_chunk_len: 30,
             short_input_threshold: 10,
             beam_width: 3,

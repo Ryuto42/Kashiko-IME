@@ -201,6 +201,28 @@ class CandidateWindowController {
         rowViews.removeAll()
     }
 
+    /// Longest kana row shown in full; beyond this the middle is elided.
+    private static let kanaDisplayLimit = 14
+
+    /// What a row shows, which is not always the whole candidate.
+    ///
+    /// The hiragana and katakana rows are the reading typed back verbatim, so on
+    /// a long sentence they add two full-width lines that say nothing the user
+    /// doesn't already know — and they set the panel's width for every other
+    /// row. Only these two are elided (they are the ones carrying a width
+    /// annotation); a real conversion is always shown in full, because there the
+    /// characters are the information. Display only — committing uses
+    /// `candidate.text`.
+    private static func displayText(for candidate: CandidateItem) -> String {
+        guard candidate.description != nil else { return candidate.text }
+        let chars = Array(candidate.text)
+        guard chars.count > kanaDisplayLimit else { return candidate.text }
+        // Head and tail kept, so both ends of the reading stay recognisable.
+        let head = kanaDisplayLimit / 2
+        let tail = kanaDisplayLimit - head - 1
+        return String(chars.prefix(head)) + "…" + String(chars.suffix(tail))
+    }
+
     private func addCandidateRow(_ candidate: CandidateItem, number: Int?, selected: Bool) {
         // A small negative baseline offset nudges the glyphs themselves down
         // within the label's frame. Container padding alone (below) can't
@@ -225,7 +247,7 @@ class CandidateWindowController {
         }
         text.append(
             NSAttributedString(
-                string: candidate.text,
+                string: Self.displayText(for: candidate),
                 attributes: [
                     .font: NSFont.systemFont(ofSize: Self.candidateFontSize),
                     .foregroundColor: selected ? NSColor.white : NSColor.labelColor,

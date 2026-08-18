@@ -797,6 +797,22 @@ impl<'a> NllScorer<'a> {
         surface: &str,
         context: &str,
     ) -> Result<f32> {
+        self.compute_nll_detail(reading_katakana, surface, context)
+            .map(|d| d.mean)
+    }
+
+    /// As [`Self::compute_nll`], but also reporting the single worst token.
+    ///
+    /// The mean alone cannot judge a long sentence: one wrong character in
+    /// twenty-six barely moves it, so `…形で対欧できます` sits within any
+    /// sensible margin of `…形で対応できます`. The worst token is where that
+    /// damage is still visible.
+    pub fn compute_nll_detail(
+        &mut self,
+        reading_katakana: &str,
+        surface: &str,
+        context: &str,
+    ) -> Result<NllDetail> {
         use super::{CONTEXT_TOKEN, INPUT_START_TOKEN, OUTPUT_START_TOKEN};
 
         let prompt = format!(
@@ -809,7 +825,7 @@ impl<'a> NllScorer<'a> {
         let full_tokens = self.model.tokenize(&full_text)?;
 
         if full_tokens.len() <= prompt_tokens.len() {
-            return Ok(100.0);
+            return Ok(NllDetail { mean: 100.0, worst: 100.0 });
         }
 
         let n_tokens = full_tokens.len();
@@ -828,6 +844,7 @@ impl<'a> NllScorer<'a> {
         let start_pos = prompt_tokens.len() - 1;
         let end_pos = n_tokens - 1;
         let mut total_nll: f32 = 0.0;
+        let mut worst: f32 = 0.0;
         let mut n_scored = 0;
 
         for pos in start_pos..end_pos {
@@ -844,16 +861,31 @@ impl<'a> NllScorer<'a> {
 
             let target = full_tokens[pos + 1].0 as usize;
             if target < self.vocab_size {
-                total_nll -= logits[target] - log_sum_exp;
+                let nll = -(logits[target] - log_sum_exp);
+                total_nll += nll;
+                worst = worst.max(nll);
             }
             n_scored += 1;
         }
 
         if n_scored == 0 {
-            return Ok(100.0);
+            return Ok(NllDetail { mean: 100.0, worst: 100.0 });
         }
 
         let n_chars = surface.chars().count().max(1);
-        Ok(total_nll / n_chars as f32)
+        Ok(NllDetail {
+            mean: total_nll / n_chars as f32,
+            worst,
+        })
     }
+}
+
+/// How well a candidate reads: the per-character average, and the single
+/// character the model disbelieved most.
+#[derive(Debug, Clone, Copy)]
+pub struct NllDetail {
+    /// Total NLL divided by the surface's character count.
+    pub mean: f32,
+    /// Largest single-token NLL in the surface.
+    pub worst: f32,
 }

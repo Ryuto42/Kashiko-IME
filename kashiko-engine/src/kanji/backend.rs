@@ -264,11 +264,26 @@ impl KanaKanjiConverter {
         context: &str,
         candidates: &[String],
     ) -> Result<Vec<Option<f32>>> {
+        Ok(self
+            .score_candidates_detailed(reading, context, candidates)?
+            .into_iter()
+            .map(|d| d.map(|d| d.mean))
+            .collect())
+    }
+
+    /// As [`Self::score_candidates`], but keeping the worst single character of
+    /// each candidate alongside its average.
+    pub fn score_candidates_detailed(
+        &self,
+        reading: &str,
+        context: &str,
+        candidates: &[String],
+    ) -> Result<Vec<Option<super::llamacpp::NllDetail>>> {
         let mut scorer = super::llamacpp::NllScorer::new(&self.model, 512)?;
         let katakana = hiragana_to_katakana(reading);
         Ok(candidates
             .iter()
-            .map(|cand| scorer.compute_nll(&katakana, cand, context).ok())
+            .map(|cand| scorer.compute_nll_detail(&katakana, cand, context).ok())
             .collect())
     }
 

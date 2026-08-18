@@ -108,6 +108,44 @@ fn annotated(items: &[(&str, CandidateSource)]) -> Vec<AnnotatedCandidate> {
         .collect()
 }
 
+/// Build gate input from `(index, score)` pairs; nothing is protected and no
+/// worst-character measurement is supplied, so only the average-based rules
+/// are exercised.
+fn scored(pairs: &[(usize, Option<f32>)]) -> Vec<super::super::conversion::Scored> {
+    pairs
+        .iter()
+        .map(|(index, score)| super::super::conversion::Scored {
+            index: *index,
+            score: *score,
+            worst: None,
+            never_drop: false,
+        })
+        .collect()
+}
+
+#[test]
+fn a_single_disbelieved_character_drops_the_candidate() {
+    // The average cannot see local damage in a long sentence: `…形で対欧できます`
+    // averages 0.62 against 0.03 for `…形で対応できます`, inside any sensible
+    // margin, while its worst character scores 13.8.
+    use super::super::conversion::{gate_and_reorder, Scored};
+    let cands = vec![
+        AnnotatedCandidate::new("対応".to_string(), CandidateSource::Model),
+        AnnotatedCandidate::new("対欧".to_string(), CandidateSource::Model),
+        AnnotatedCandidate::new("退陰".to_string(), CandidateSource::Model),
+    ];
+    let s = |index, mean, worst| Scored {
+        index,
+        score: Some(mean),
+        worst: Some(worst),
+        never_drop: false,
+    };
+    // The third candidate keeps the list at `MIN_KEPT_SCORED`, so the second
+    // being dropped is the worst-character rule and not the floor.
+    let out = gate_and_reorder(&cands, &[s(0, 0.03, 0.4), s(2, 0.10, 1.2), s(1, 0.10, 13.8)]);
+    assert_eq!(texts(&out), vec!["対応", "退陰"]);
+}
+
 fn texts(cands: &[AnnotatedCandidate]) -> Vec<&str> {
     cands.iter().map(|c| c.text.as_str()).collect()
 }
@@ -123,7 +161,7 @@ fn junk_candidates_are_dropped_not_just_ranked_lower() {
         ("役割りと構造要素", CandidateSource::Model),
         ("やくわり", CandidateSource::Fallback),
     ]);
-    let scored = vec![(0, Some(0.4)), (1, Some(1.9)), (2, Some(2.4))];
+    let scored = scored(&[(0, Some(0.4)), (1, Some(1.9)), (2, Some(2.4))]);
     cands = super::super::conversion::gate_and_reorder(&cands, &scored);
     // MIN_KEPT_SCORED keeps the runner-up, but the worst one is gone.
     assert_eq!(texts(&cands), vec!["役割と構造要素", "約割と構造要素", "やくわり"]);
@@ -138,7 +176,7 @@ fn a_uniformly_good_list_is_kept_in_full() {
         ("典器", CandidateSource::Model),
         ("てんき", CandidateSource::Fallback),
     ]);
-    let scored = vec![(0, Some(0.30)), (1, Some(0.40)), (2, Some(0.55))];
+    let scored = scored(&[(0, Some(0.30)), (1, Some(0.40)), (2, Some(0.55))]);
     cands = super::super::conversion::gate_and_reorder(&cands, &scored);
     assert_eq!(texts(&cands), vec!["天気", "転機", "典器", "てんき"]);
 }
@@ -153,7 +191,7 @@ fn gate_keeps_surrounding_groups_in_place() {
         ("天気", CandidateSource::Model),
         ("てんき", CandidateSource::Fallback),
     ]);
-    let scored = vec![(1, Some(2.0)), (2, Some(0.5))];
+    let scored = scored(&[(1, Some(2.0)), (2, Some(0.5))]);
     cands = super::super::conversion::gate_and_reorder(&cands, &scored);
     assert_eq!(texts(&cands), vec!["学習", "天気", "転機", "てんき"]);
 }
@@ -167,7 +205,7 @@ fn unscoreable_candidates_are_kept_after_scored_ones() {
     ]);
     // `あ` can't be scored: keep it (no evidence against it), but after the
     // scored ones.
-    let scored = vec![(0, None), (1, Some(0.5)), (2, Some(0.4))];
+    let scored = scored(&[(0, None), (1, Some(0.5)), (2, Some(0.4))]);
     cands = super::super::conversion::gate_and_reorder(&cands, &scored);
     assert_eq!(texts(&cands), vec!["う", "い", "あ"]);
 }
@@ -180,7 +218,7 @@ fn all_bad_scores_still_leave_something_to_pick() {
         ("乙", CandidateSource::Model),
         ("丙", CandidateSource::Model),
     ]);
-    let scored = vec![(0, Some(3.0)), (1, Some(3.5)), (2, Some(4.0))];
+    let scored = scored(&[(0, Some(3.0)), (1, Some(3.5)), (2, Some(4.0))]);
     cands = super::super::conversion::gate_and_reorder(&cands, &scored);
     assert_eq!(cands.len(), super::super::conversion::MIN_KEPT_SCORED);
     assert_eq!(texts(&cands), vec!["甲", "乙"]);
@@ -200,4 +238,41 @@ fn reranking_without_a_model_is_a_noop() {
     engine.rerank_by_likelihood("きょうのてんき", &mut cands);
     let after: Vec<String> = cands.iter().map(|c| c.text.clone()).collect();
     assert_eq!(before, after);
+}
+
+// --- deleting a candidate with the row's ✕ ---
+
+#[test]
+fn deletion_learns_the_phrase_that_was_rejected() {
+    // Suppressing the whole surface only helps if the identical sentence comes
+    // back, and a long one is never learned at all — so the ✕ has to isolate
+    // the phrase being rejected and learn *that*.
+    let spans = crate::core::engine::conversion::differing_spans(
+        "ごきぼうならしいんほかんをふくすうもじにひろげる",
+        "ご希望なら試飲保管を複数文字に広げる",
+        "ご希望なら子音補完を複数文字に広げる",
+    );
+    assert_eq!(
+        spans,
+        vec![(
+            "しいんほかんを".to_string(),
+            "試飲保管を".to_string(),
+            "子音補完を".to_string()
+        )],
+        "only the disagreeing phrase should be reported (the particle rides along)"
+    );
+}
+
+#[test]
+fn identical_conversions_teach_nothing() {
+    let spans = crate::core::engine::conversion::differing_spans("あいうえ", "藍上", "藍上");
+    assert!(spans.is_empty(), "got {spans:?}");
+}
+
+#[test]
+fn unalignable_conversions_teach_nothing() {
+    // A conversion that can't be aligned to the reading must not produce a
+    // made-up pairing; nothing is learned rather than something wrong.
+    let spans = crate::core::engine::conversion::differing_spans("あいうえ", "全然違う文", "藍上");
+    assert!(spans.is_empty(), "got {spans:?}");
 }
