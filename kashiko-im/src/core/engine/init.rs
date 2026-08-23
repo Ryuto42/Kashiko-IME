@@ -120,7 +120,7 @@ impl InputMethodEngine {
                 converter.model_display_name(),
                 threads_label(n_threads)
             );
-            self.converters.kanji = Some(converter);
+            self.converters.kanji = Some(std::sync::Arc::new(converter));
         }
         Ok(())
     }

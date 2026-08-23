@@ -85,6 +85,13 @@ KashikoInputController.candidateWindow.onDeleteCandidate = { pageIndex in
     KashikoInputController.applyAsyncCandidateUpdate(result.actions)
 }
 
+// Clicking the aux-line button asks for another inference pass; the extra
+// candidates arrive later as an `update_candidates` notification.
+KashikoInputController.candidateWindow.onDeepenInference = {
+    guard let result = engineClient.deepenInferenceSync() else { return }
+    KashikoInputController.applyAsyncCandidateUpdate(result.actions)
+}
+
 engineProcess.start()
 engineClient.startReaderLoop()
 // Model loading takes seconds (and downloads from HuggingFace on the very

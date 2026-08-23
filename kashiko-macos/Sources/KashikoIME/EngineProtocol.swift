@@ -53,11 +53,11 @@ enum EngineAction: Decodable {
     /// sits immediately before the caret, with the marked text from the
     /// following updatePreedit in the same batch.
     case deleteSurrounding(text: String)
-    case updateAux(text: String)
+    case updateAux(text: String, button: Bool)
     case hideAux
 
     private enum CodingKeys: String, CodingKey {
-        case type, text, caret, attributes, candidates, cursor, page, totalPages
+        case type, text, caret, attributes, candidates, cursor, page, totalPages, button
     }
 
     init(from decoder: Decoder) throws {
@@ -85,7 +85,9 @@ enum EngineAction: Decodable {
         case "delete_surrounding":
             self = .deleteSurrounding(text: try container.decode(String.self, forKey: .text))
         case "update_aux":
-            self = .updateAux(text: try container.decode(String.self, forKey: .text))
+            self = .updateAux(
+                text: try container.decode(String.self, forKey: .text),
+                button: try container.decodeIfPresent(Bool.self, forKey: .button) ?? false)
         case "hide_aux":
             self = .hideAux
         default:

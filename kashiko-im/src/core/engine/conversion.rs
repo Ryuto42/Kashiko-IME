@@ -2,7 +2,11 @@
 //! chunking lives in the sibling `chunk` module.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
+
+use kashiko_engine::KanaKanjiConverter;
 
 use tracing::debug;
 
@@ -30,9 +34,14 @@ pub(super) enum DeepTask {
     },
 }
 
-/// An in-flight deep search, advanced one task per `step_deep_search` call.
-pub(super) struct DeepSearchJob {
-    /// The request the job was started for; the job cancels itself when the
+/// A deep search ready to run, carrying everything the work needs.
+///
+/// Self-contained on purpose: this runs on a worker thread, so it holds its own
+/// converter handle and its own copy of the context rather than reaching back
+/// into the engine. Nothing here touches engine state, which is what lets the
+/// main loop keep serving keys while a wide beam is grinding away.
+pub struct DeepSearchJob {
+    /// The request the job was started for; the outcome is dropped when the
     /// buffer or conversion scope no longer matches (committed / re-edited /
     /// resized).
     request: DeepSearchRequest,
@@ -43,6 +52,130 @@ pub(super) struct DeepSearchJob {
     found: Vec<Candidate>,
     seen: HashSet<String>,
     max_results: usize,
+    /// Conversion context as of scheduling time.
+    ctx: String,
+    /// Character budget for the context handed to the model, so the worker can
+    /// build a tail context the same way the engine would.
+    max_ctx: usize,
+    /// Chunk-cached conversion of the tail task's prefix, when the live
+    /// conversion already produced one; saves the worker a model call.
+    cached_prefix: Option<String>,
+    /// Best score the quick pass recorded, the bar a finding has to clear.
+    quality_best: Option<f32>,
+    converter: Arc<KanaKanjiConverter>,
+    /// Set by the engine when the conversion this was started for is gone, so a
+    /// long job stops burning CPU on a result nobody will see.
+    cancel: Arc<AtomicBool>,
+}
+
+/// What a finished deep search hands back to the engine.
+pub struct DeepSearchOutcome {
+    request: DeepSearchRequest,
+    /// The scoped reading with stray ASCII stripped, as the job used it.
+    reading: String,
+    found: Vec<Candidate>,
+}
+
+/// Run a deep search to completion. Called on the worker thread; touches no
+/// engine state.
+pub fn run_deep_job(mut job: DeepSearchJob) -> DeepSearchOutcome {
+    while let Some(task) = job.queue.pop_front() {
+        if job.cancel.load(Ordering::Relaxed) || job.found.len() >= job.max_results {
+            break;
+        }
+        run_deep_task(task, &mut job);
+    }
+    let found = if job.cancel.load(Ordering::Relaxed) {
+        Vec::new()
+    } else {
+        gate_deep_findings(
+            &job.converter,
+            &job.reading,
+            &job.ctx,
+            job.request.kind,
+            job.quality_best,
+            std::mem::take(&mut job.found),
+        )
+    };
+    DeepSearchOutcome {
+        request: job.request,
+        reading: job.reading,
+        found,
+    }
+}
+
+/// Convert `reading` with the job's converter, or nothing when it isn't kana.
+fn job_convert(job: &DeepSearchJob, reading: &str, ctx: &str, n: usize) -> Vec<String> {
+    if !kashiko_engine::contains_kana(reading) {
+        return vec![];
+    }
+    let katakana = kashiko_engine::hiragana_to_katakana(reading);
+    job.converter.convert(&katakana, ctx, n).unwrap_or_default()
+}
+
+/// Execute one task, appending clean findings to the job.
+fn run_deep_task(task: DeepTask, job: &mut DeepSearchJob) {
+    fn accept(job: &mut DeepSearchJob, out: String, variant: &str) -> bool {
+        if out != variant
+            && !kashiko_engine::has_long_unconverted_run(&out, variant, UNCONVERTED_RUN_MIN)
+            && !kashiko_engine::has_unrenderable_char(&out)
+            && job.seen.insert(out.clone())
+        {
+            job.found.push(Candidate {
+                text: out,
+                reading: Some(variant.to_string()),
+                source_label: Some(CandidateSource::Model.label().to_string()),
+                description: None,
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    match task {
+        DeepTask::Convert { variant, beam, cap } => {
+            let mut added = 0usize;
+            for out in job_convert(job, &variant, &job.ctx.clone(), beam) {
+                if added >= cap || job.found.len() >= job.max_results {
+                    break;
+                }
+                if accept(job, out, &variant) {
+                    added += 1;
+                }
+            }
+        }
+        DeepTask::TailBeam {
+            prefix_reading,
+            tail_reading,
+            beam,
+        } => {
+            let ctx = job.ctx.clone();
+            let prefix_conv = match job.cached_prefix.clone() {
+                Some(p) => Some(p),
+                None => job_convert(job, &prefix_reading, &ctx, 1).into_iter().next(),
+            };
+            let Some(prefix_conv) = prefix_conv else {
+                return;
+            };
+            let reading = job.reading.clone();
+            let combined = format!("{ctx}{prefix_conv}");
+            let tail_ctx: String = {
+                let n = combined.chars().count();
+                if n > job.max_ctx {
+                    combined.chars().skip(n - job.max_ctx).collect()
+                } else {
+                    combined
+                }
+            };
+            for tail_out in job_convert(job, &tail_reading, &tail_ctx, beam) {
+                if job.found.len() >= job.max_results {
+                    break;
+                }
+                accept(job, format!("{prefix_conv}{tail_out}"), &reading);
+            }
+        }
+    }
 }
 
 /// Dictionary-form ending implied by a 連用形 ending.
@@ -122,16 +255,170 @@ const QUALITY_WORST_TOKEN_NLL: f32 = 6.0;
 /// gutted — the user needs something to pick even when the model is lost.
 pub(super) const MIN_KEPT_SCORED: usize = 2;
 
-/// Whether `text` contains ASCII letters or digits the reading never had.
+/// Characters that never come out of a kana reading on their own: brackets and
+/// decorative marks. A dictionary entry like `田中☆` or `任意(コピー)` is a
+/// nickname or a gloss that has no business in a conversion list.
 ///
-/// The model hallucinating a `2` into `な2回慰安ありますか` cannot be right:
-/// nothing in `なにかいいあんありますか` could have produced it. Latin output is
-/// only legitimate when the user actually typed those characters, which the
-/// reading then carries.
+/// Deliberately a list rather than a character-class test, so the punctuation
+/// that *is* legitimate in Japanese text (`ー`, `々`, `・`, `…`, `、`, `。`) is
+/// untouched.
+const NEVER_INVENTED: &[char] = &[
+    '(', ')', '（', '）', '[', ']', '［', '］', '{', '}', '｛', '｝', '【', '】', '〔', '〕', '〈',
+    '〉', '《', '》', '☆', '★', '♪', '♥', '♡', '◆', '◇', '■', '□', '▲', '▼', '●', '○', '※',
+];
+
+/// Whether `text` contains characters the reading never had.
+///
+/// A latin letter cannot come out of kana, so one the user did not type is the
+/// model inventing text; the same argument covers the brackets and decorations
+/// in [`NEVER_INVENTED`].
+///
+/// A **digit** is different, and treating it the same way was a bad bug: kana
+/// number readings legitimately become digits, so the rule deleted every
+/// conversion of a sentence containing a number. `こうほがよんけんみまんの…`
+/// converts to `候補が4件未満の…` (NLL 0.05) and that candidate was thrown
+/// away for spelling a `4`, which left only the kana fallbacks — and a fallback
+/// is by definition a long unconverted run, so the typo-correction path then
+/// fired and filled the window with `ウホが…` / `コホが…`. Every symptom came
+/// from that one deletion.
+///
+/// So digits are judged by position instead: Japanese writes one before a
+/// counter, and nowhere else. That still blocks a digit dropped into open text
+/// while letting a counted quantity through.
 fn invents_ascii(reading: &str, text: &str) -> bool {
     let reading_lower = reading.to_ascii_lowercase();
-    text.chars()
-        .any(|c| c.is_ascii_alphanumeric() && !reading_lower.contains(c.to_ascii_lowercase()))
+    let chars: Vec<char> = text.chars().collect();
+    chars.iter().enumerate().any(|(i, &c)| {
+        if c.is_ascii_digit() {
+            return !reading.contains(c)
+                && !chars
+                    .get(i + 1)
+                    .is_some_and(|&next| {
+                        next.is_ascii_digit() || kashiko_engine::counter::starts_counter(next)
+                    });
+        }
+        (c.is_ascii_alphabetic() && !reading_lower.contains(c.to_ascii_lowercase()))
+            || (NEVER_INVENTED.contains(&c) && !reading.contains(c))
+    })
+}
+
+/// Score-gate the deep search's findings before they join the list.
+///
+/// Findings come from beams over *edited* readings, so a wide beam or an
+/// unlucky keyboard edit yields text that parses as Japanese but means
+/// nothing. The quick pass gates its own candidates this way already;
+/// skipping it here was why one Space press could offer nine candidates of
+/// which only three were ever picked.
+///
+/// Everything is scored against the reading the user actually typed. That
+/// is deliberately *not* the reading each finding assumes: a keyboard-edit
+/// variant converts faithfully into its own hypothesis, so
+/// `ほあさま → ホア様` scores beautifully against `ほあさま` and the gate
+/// learns nothing. Scored against the typed reading the findings become
+/// comparable to each other, which is the only comparison that separates
+/// them.
+///
+/// What the margin is measured from depends on why the search ran:
+///
+/// - `MoreAlternatives` searched because the list was thin, so a finding
+///   has to hold up against the list already on screen — the quick pass's
+///   best (`last_quality_best`) joins the reference, and the absolute
+///   ceiling applies.
+/// - `TypoCorrection` searched because the input is broken, so every
+///   finding departs from the typed reading by design and scores poorly
+///   against it in absolute terms (measured on
+///   `さいびるどまえだったtまえ…`: real corrections 1.9–2.3, junk 2.7–2.9).
+///   Findings are ranked against each other only, with no ceiling.
+///
+/// Survivors come back best-first, and nothing caps the count: a search
+/// that turns up eight good sentences shows eight, one that turns up only
+/// junk shows none.
+fn gate_deep_findings(
+converter: &KanaKanjiConverter,
+typed_reading: &str,
+ctx: &str,
+kind: DeepSearchKind,
+quality_best: Option<f32>,
+found: Vec<Candidate>,
+) -> Vec<Candidate> {
+    // Half-converted kana is no more welcome from the background search than
+    // from the quick pass, and the rules that remove it there (10b3, 10d)
+    // run too early to see these. Before scoring, so the scores stay aligned
+    // with the candidates they belong to.
+    let short = typed_reading.chars().count() <= 4;
+    let loanword = kashiko_engine::loanword::english_for(typed_reading).is_some();
+    let found: Vec<Candidate> = if short || loanword {
+        let canonical = kashiko_engine::hiragana_to_katakana(typed_reading);
+        found
+            .into_iter()
+            .filter(|c| {
+                c.text == canonical
+                    || c.text == typed_reading
+                    || !kashiko_engine::is_all_kana(&c.text)
+                    || kashiko_engine::is_pure_hiragana(&c.text)
+                    || kashiko_engine::is_pure_full_katakana(&c.text)
+            })
+            .collect()
+    } else {
+        found
+    };
+    if found.is_empty() {
+        return found;
+    }
+
+    let texts: Vec<String> = found.iter().map(|c| c.text.clone()).collect();
+    let Ok(scores) = converter.score_candidates_detailed(typed_reading, ctx, &texts) else {
+        return found;
+    };
+    let worst: Vec<Option<f32>> = scores.iter().map(|d| d.map(|d| d.worst)).collect();
+    let scores: Vec<Option<f32>> = scores.iter().map(|d| d.map(|d| d.mean)).collect();
+
+    // Short readings are ranked, never thinned — the same rule the quick pass
+    // follows (`SHORT_READING_CHARS`), and for the same reason: with no sentence
+    // around it a name reading scores badly whatever it is. Gating these would
+    // throw away exactly the homophones this pass was scheduled to find (`優斗`
+    // scores 2.13 against 0.10 for the verb reading `言うと`). The
+    // worst-character rule still applies.
+    let rank_only = short;
+    let compare_with_shown = !rank_only && kind == DeepSearchKind::MoreAlternatives;
+    let best = scores
+        .iter()
+        .copied()
+        .flatten()
+        .chain(compare_with_shown.then_some(quality_best).flatten())
+        .fold(f32::INFINITY, f32::min);
+    if !best.is_finite() {
+        return found;
+    }
+    let ceiling = if compare_with_shown {
+        QUALITY_CEILING_NLL
+    } else {
+        f32::INFINITY
+    };
+    let margin = if rank_only {
+        f32::INFINITY
+    } else {
+        QUALITY_MARGIN_NLL
+    };
+
+    let mut kept: Vec<(f32, Candidate)> = found
+        .into_iter()
+        .zip(scores)
+        .zip(worst)
+        .filter_map(|((cand, score), worst)| match score {
+            // Unscoreable is not evidence against a candidate; rank it as
+            // if it tied the best so it keeps its place.
+            None => Some((best, cand)),
+            Some(s) => (s <= best + margin
+                && s <= ceiling
+                // Applies whatever the search's reason: a single character
+                // the model flatly disbelieves is junk either way.
+                && worst.is_none_or(|w| w <= QUALITY_WORST_TOKEN_NLL))
+                .then_some((s, cand)),
+        })
+        .collect();
+    kept.sort_by(|a, b| a.0.total_cmp(&b.0));
+    kept.into_iter().map(|(_, c)| c).collect()
 }
 
 /// The phrases where two conversions of the same reading disagree, as
@@ -238,6 +525,15 @@ pub(super) fn gate_and_reorder(
     }
     out
 }
+
+/// Aux line shown while an inference pass is running.
+const SEARCHING_AUX: &str = "推論中…";
+
+/// Aux line offering another pass. Rendered as a button by the frontend.
+const DEEPEN_AUX: &str = "さらに推論";
+
+/// Aux line shown when a pass came back with nothing the gate would accept.
+const NOTHING_MORE_AUX: &str = "候補なし・さらに推論";
 
 /// Minimum length of a passed-through hiragana run (present verbatim in the
 /// reading) for a model candidate to count as a low-quality "typo passthrough"
@@ -483,7 +779,12 @@ impl InputMethodEngine {
         // When the caller didn't pin a split (normal Space) and the input has
         // a leftover-romaji typo, cut the conversion just before it so the
         // clean prefix converts and the rest stays as raw reading.
-        let auto_split = if split_index.is_none() {
+        // Never in emoji mode: an emoji shortcode is `:` followed by ASCII by
+        // definition, so the leftover-romaji split fired on every one of them
+        // and cut the reading down to the bare `:`. That is why `:smile` and
+        // `:kiniku` offered colon variants (`：`, `︙`) instead of 😄 and 💪 —
+        // the rewriter never saw the shortcode.
+        let auto_split = if split_index.is_none() && self.input_mode != InputMode::Emoji {
             self.auto_failure_split(&full_reading)
         } else {
             None
@@ -620,7 +921,7 @@ impl InputMethodEngine {
             Some(c) => c,
             None => self.build_conversion_candidates(
                 &reading,
-                self.config.num_candidates,
+                self.sync_candidate_count(&reading),
                 skip_learning,
                 cached_model,
                 // Latin candidate only when converting the whole buffer.
@@ -646,7 +947,18 @@ impl InputMethodEngine {
                 kashiko_engine::has_long_unconverted_run(&c.text, &reading, UNCONVERTED_RUN_MIN)
                     .then(|| c.text.clone())
             });
-            if let Some(garbled_top) = garbled_top {
+            // A long kana run shared with the reading is not proof of failure:
+            // `皆さんおはようございます` legitimately keeps nine of them, and
+            // it converts at 0.05 NLL. Asking the model before believing the
+            // heuristic costs one forward pass and stops the correction search
+            // from replacing a good list with edits of the reading
+            // (`みなさんお様ございます`). Same guard as the deep search's, which
+            // is expressed against `last_quality_best`.
+            let confident_top = garbled_top
+                .as_deref()
+                .and_then(|top| self.score_one(&reading, top))
+                .is_some_and(|score| score <= 0.5);
+            if let Some(garbled_top) = garbled_top.filter(|_| !confident_top) {
                 typo_suspected = true;
                 let corrections = self.kana_typo_corrections(&reading, &garbled_top);
                 if !corrections.is_empty() {
@@ -858,13 +1170,17 @@ impl InputMethodEngine {
         // segment whose conversion failed (only fallback candidates) also
         // gets the recovery search.
         let scoped_raw: String = full_reading.chars().take(split_idx).collect();
-        let scope_has_ascii =
-            !deliberate_latin && scoped_raw.chars().any(|c| c.is_ascii_alphabetic());
-        // Alternatives are only worth a background pass on input long enough
-        // to have competing readings; short input would otherwise schedule a
-        // model run on nearly every Space press, since a thin candidate list
-        // is normal there.
-        const MIN_ALTERNATIVES_READING_CHARS: usize = 6;
+        // Emoji mode is excluded for the same reason as the split above: the
+        // ASCII in a shortcode is the query, not a mistyped key.
+        let scope_has_ascii = !deliberate_latin
+            && self.input_mode != InputMode::Emoji
+            && scoped_raw.chars().any(|c| c.is_ascii_alphabetic());
+        // A thin list is the trigger, whatever the reading's length. The length
+        // floor that used to guard this was there because a short reading
+        // normally produces few candidates, so the search would have run on
+        // nearly every Space press — but short readings now keep their
+        // homophones (see `SHORT_READING_CHARS`), so a thin list there means
+        // the same thing it means anywhere else: there is more to find.
         // A conversion the model is confident about is not a typo, whatever the
         // heuristics suspected. Both suspicions are heuristic and both misfire
         // on correct input: `みなさんおはようございます` converts to
@@ -884,26 +1200,85 @@ impl InputMethodEngine {
         {
             Some(DeepSearchKind::TypoCorrection)
         } else if real_candidate_count < MIN_QUICK_REAL_CANDIDATES
-            && reading.chars().count() >= MIN_ALTERNATIVES_READING_CHARS
+            || self.sync_candidate_count(&reading) < self.config.num_candidates
         {
+            // The second condition is the other half of moving beam width off
+            // the blocking path: the synchronous pass deliberately asked the
+            // model for fewer candidates than configured, so the ones it did not
+            // look for have to be found somewhere. Without it, narrowing the
+            // sync beam lost `ゆうと` → `優斗` and `かんじ` → `完治` outright,
+            // because a reading with a full dictionary never looked thin enough
+            // to trigger a search.
             Some(DeepSearchKind::MoreAlternatives)
         } else {
             None
         };
+        self.deep_round = 0;
+        // A new conversion supersedes any search still running for the old one:
+        // its result would be dropped as stale anyway, so stop it rather than
+        // let it keep a core busy. `build_deep_job` installs a fresh flag, so
+        // this never cancels the search we are about to schedule.
+        self.deep_cancel.store(true, Ordering::Relaxed);
         self.deep_search = kind.map(|kind| DeepSearchRequest {
-            reading: scoped_raw,
+            reading: scoped_raw.clone(),
             buffer: full_reading.clone(),
             scope: split_idx,
             kind,
+            round: 0,
         });
 
         let mut result = self.enter_conversion_state(&full_reading, candidate_list, split_idx);
-        if self.deep_search.is_some() {
-            result = result.with_action(EngineAction::UpdateAuxText(
-                "候補を検索中…".to_string(),
-            ));
-        }
+        // The aux line is either a progress message or the button that asks for
+        // another pass. It is offered whenever there is a reading to infer over,
+        // including the short ones the automatic search skips — those are
+        // exactly where the user is most likely to want more.
+        result = result.with_action(if self.deep_search.is_some() {
+            EngineAction::UpdateAuxText(SEARCHING_AUX.to_string())
+        } else if kashiko_engine::contains_kana(&scoped_raw) {
+            EngineAction::UpdateAuxButton(DEEPEN_AUX.to_string())
+        } else {
+            EngineAction::HideAuxText
+        });
         result
+    }
+
+    /// Run another, wider inference pass over the conversion on screen — the
+    /// aux-line button.
+    ///
+    /// Each press raises the round, which `build_deep_job` spends on wider beams
+    /// and a higher result cap, so pressing it repeatedly keeps finding new
+    /// things instead of re-running the same search. Returns immediately with
+    /// the progress message; the findings arrive later as an
+    /// `update_candidates` notification, exactly like the automatic pass.
+    pub fn deepen_inference(&mut self) -> EngineResult {
+        let InputState::Conversion { split_index, .. } = self.state else {
+            return EngineResult::not_consumed();
+        };
+        if self.deep_search.is_some() || self.deep_running {
+            // Already working — say so rather than queueing a second job.
+            return EngineResult::consumed()
+                .with_action(EngineAction::UpdateAuxText(SEARCHING_AUX.to_string()));
+        }
+        let reading: String = self.input_buf.text.chars().take(split_index).collect();
+        if !kashiko_engine::contains_kana(&reading) {
+            return EngineResult::not_consumed();
+        }
+        self.deep_round += 1;
+        // Typo correction first, then widening: a press after the correction
+        // pass has run should look for alternatives rather than repeat it.
+        let kind = if self.deep_round == 1 && reading.chars().any(|c| c.is_ascii_alphabetic()) {
+            DeepSearchKind::TypoCorrection
+        } else {
+            DeepSearchKind::MoreAlternatives
+        };
+        self.deep_search = Some(DeepSearchRequest {
+            reading,
+            buffer: self.input_buf.text.clone(),
+            scope: split_index,
+            kind,
+            round: self.deep_round,
+        });
+        EngineResult::consumed().with_action(EngineAction::UpdateAuxText(SEARCHING_AUX.to_string()))
     }
 
     /// Transition to Conversion state with the given reading and candidate list.
@@ -1087,6 +1462,123 @@ impl InputMethodEngine {
         (best > 0).then_some(best)
     }
 
+    /// Merge a finished deep search into the live candidate list and build the
+    /// notification result.
+    ///
+    /// The aux line goes back to offering another pass rather than clearing:
+    /// whatever this round found, the user can ask again and the next round
+    /// searches wider.
+    fn finish_deep_job(&mut self, job: DeepSearchOutcome) -> EngineResult {
+        let found = job.found;
+        let done = || {
+            EngineResult::consumed()
+                .with_action(EngineAction::UpdateAuxButton(NOTHING_MORE_AUX.to_string()))
+        };
+        if found.is_empty() {
+            return done();
+        }
+        if !matches!(self.state, InputState::Conversion { .. }) {
+            return done();
+        }
+        // Deleted candidates must not come back through the side door: the
+        // quick pass filters suppressed text but the deep search merges its
+        // findings straight into the list, so a ✕-ed candidate reappeared a
+        // second later when the background search rediscovered it.
+        // ...and neither may the model invent characters here, the same rule
+        // the quick pass applies: `ごKIBOUなら試飲補完を…` is a beam over an
+        // edited reading spelling out keystrokes that were never typed.
+        //
+        // Both need the learning cache and so stay on this thread; the scoring
+        // gate, which needs the model, already ran in the worker.
+        let mut found: Vec<Candidate> = found
+            .into_iter()
+            .filter(|c| !invents_ascii(&job.reading, &c.text))
+            .collect();
+        if let Some(cache) = self.learning.as_ref() {
+            found.retain(|c| !cache.is_suppressed(&job.reading, &c.text));
+        }
+        if found.is_empty() {
+            return done();
+        }
+        let InputState::Conversion { candidates, .. } = &mut self.state else {
+            return done();
+        };
+        // Insert findings right after the currently selected candidate so they
+        // are visible on the *current page* — inserting at the bottom (above
+        // the fallbacks) buried them on page 2 whenever the quick pass had
+        // already filled page 1, which made the deep results look like they
+        // never arrived. Capped at the hiragana/katakana fallback position so
+        // those always stay at the very bottom, and the user's currently
+        // selected candidate stays selected — the list grows below the
+        // selection, it never jumps.
+        let selected_text = candidates.selected_text().map(str::to_string);
+        let cursor = candidates.cursor();
+        let mut all: Vec<Candidate> = candidates.candidates().to_vec();
+        let fallback_at = all
+            .iter()
+            .position(|c| {
+                matches!(c.description.as_deref(), Some("[全]ひらがな") | Some("[全]カタカナ"))
+            })
+            .unwrap_or(all.len());
+        let insert_at = (cursor + 1).min(fallback_at);
+        all.splice(insert_at..insert_at, found);
+        let mut list = CandidateList::new(all);
+        if let Some(sel) = selected_text
+            && let Some(idx) = list.candidates().iter().position(|c| c.text == sel)
+        {
+            list.select(idx);
+        }
+        *candidates = list.clone();
+        EngineResult::consumed()
+            .with_action(EngineAction::ShowCandidates(list))
+            .with_action(EngineAction::UpdateAuxButton(DEEPEN_AUX.to_string()))
+    }
+
+    /// Split `reading` into `(prefix, tail)` for tail-alternative generation:
+    /// the last live-conversion chunk when the chunk cache still matches the
+    /// reading, else the trailing hiragana run (2..=8 chars, strictly shorter
+    /// than the whole reading). `None` when no sensible tail exists.
+    fn split_tail_for_alternatives(&self, reading: &str) -> Option<(String, String)> {
+        // Chunk-aligned split (multi-chunk long input).
+        if self.chunks.len() >= 2 {
+            let concat: String = self.chunks.iter().map(|c| c.reading.as_str()).collect();
+            if concat == reading
+                && let Some(last) = self.chunks.last()
+            {
+                let tail = last.reading.clone();
+                let prefix_len = reading.chars().count() - tail.chars().count();
+                if prefix_len > 0 && !tail.is_empty() {
+                    let prefix: String = reading.chars().take(prefix_len).collect();
+                    return Some((prefix, tail));
+                }
+            }
+        }
+        // Trailing hiragana run.
+        let chars: Vec<char> = reading.chars().collect();
+        let is_hira = |c: char| matches!(c, '\u{3041}'..='\u{3096}');
+        let mut n = 0usize;
+        while n < chars.len() && n < 8 && is_hira(chars[chars.len() - 1 - n]) {
+            n += 1;
+        }
+        (n >= 2 && n < chars.len()).then(|| {
+            let prefix: String = chars[..chars.len() - n].iter().collect();
+            let tail: String = chars[chars.len() - n..].iter().collect();
+            (prefix, tail)
+        })
+    }
+
+    /// Per-character NLL of one candidate, or `None` when unscoreable.
+    fn score_one(&mut self, reading: &str, text: &str) -> Option<f32> {
+        let ctx = self.truncate_context_for_api();
+        let converter = self.converters.kanji.as_ref()?;
+        converter
+            .score_candidates(reading, &ctx, std::slice::from_ref(&text.to_string()))
+            .ok()?
+            .into_iter()
+            .next()
+            .flatten()
+    }
+
     /// Kana-level typo correction search: when the model can't convert
     /// `reading` cleanly (its best output passes a garbled stretch through as
     /// raw kana), guess what the user *meant* by trying small edits — single
@@ -1158,6 +1650,10 @@ impl InputMethodEngine {
                     &variant,
                     UNCONVERTED_RUN_MIN,
                 )
+                // Corrections are merged after `build_conversion_candidates`,
+                // so the filters there never see them. Checked against the
+                // reading the user actually typed, not the edited variant.
+                && !invents_ascii(reading, &converted)
                 && seen.insert(converted.clone())
             {
                 corrections.push(
@@ -1199,7 +1695,7 @@ impl InputMethodEngine {
     /// loop uses this to decide between blocking on stdin and stepping the
     /// search, so key events are served between model calls.
     pub fn deep_search_pending(&self) -> bool {
-        self.deep_search.is_some() || self.deep_job.is_some()
+        self.deep_search.is_some() || self.deep_running
     }
 
     /// Advance the pending deep search by one task (at most a couple of
@@ -1213,41 +1709,84 @@ impl InputMethodEngine {
     /// started for is no longer on screen — the user committed a candidate,
     /// kept typing, or dismissed the conversion — so no model time is spent
     /// on a conversion that is already over.
-    pub fn step_deep_search(&mut self) -> Option<EngineResult> {
-        // Lazily build the job from the scheduled request.
-        if self.deep_job.is_none()
-            && let Some(request) = self.deep_search.take()
-        {
-            self.deep_job = self.build_deep_job(request);
+    /// How many candidates the *synchronous* pass asks the model for — the one
+    /// the user waits on after pressing Space.
+    ///
+    /// Beam width is what this costs. Measured against the real model: a 9-wide
+    /// beam takes 0.58s on a six-character reading and 4.7s on a thirty-four
+    /// character one, while a greedy pass is 20–47ms at any length. That wide
+    /// beam was the freeze — the whole of a 6.1s Space press was this one call,
+    /// paid on the thread that answers key events.
+    ///
+    /// So the sync pass stays narrow and the width moves to the background
+    /// worker, which cannot block anything: a thin list schedules a deep search
+    /// automatically, and its findings arrive as `update_candidates` a moment
+    /// later. Short readings keep a small beam because their homophones are
+    /// what Space is usually for; long ones take the greedy conversion, which
+    /// is also what live conversion was already showing.
+    fn sync_candidate_count(&self, reading: &str) -> usize {
+        /// Above this length the model gets one greedy pass and nothing more.
+        const SHORT_ENOUGH_TO_BEAM: usize = 8;
+        /// Beam width for a short reading: 0.2s, against 0.58s for nine.
+        const SYNC_BEAM: usize = 3;
+        if reading.chars().count() <= SHORT_ENOUGH_TO_BEAM {
+            self.config.num_candidates.min(SYNC_BEAM)
+        } else {
+            1
         }
-        let job = self.deep_job.as_ref()?;
+    }
 
-        // Cancel when the conversion has moved on (committed / re-edited /
-        // resized to a different segment).
-        let still_valid = matches!(
-            &self.state,
-            InputState::Conversion { split_index, .. }
-                if *split_index == job.request.scope
-        ) && self.input_buf.text == job.request.buffer;
-        if !still_valid {
-            self.deep_job = None;
+    /// Hand the scheduled deep search over to be run elsewhere.
+    ///
+    /// Returns the job once, when one has been scheduled; the caller runs it
+    /// (`run_deep_job`) off the main loop and gives the result back through
+    /// [`Self::apply_deep_outcome`]. Nothing here calls the model, so this is
+    /// always fast — which is the point: a wide beam over a long sentence takes
+    /// seconds, and the loop that answers key events must not be inside it.
+    pub fn take_deep_job(&mut self) -> Option<DeepSearchJob> {
+        if self.deep_running {
             return None;
         }
+        let request = self.deep_search.take()?;
+        let job = self.build_deep_job(request)?;
+        self.deep_running = true;
+        Some(job)
+    }
 
-        let mut job = self.deep_job.take()?;
-        let done = match job.queue.pop_front() {
-            None => true,
-            Some(task) => {
-                self.run_deep_task(task, &mut job);
-                job.queue.is_empty() || job.found.len() >= job.max_results
-            }
-        };
-        if done {
-            Some(self.finish_deep_job(job))
-        } else {
-            self.deep_job = Some(job);
-            None
+    /// Merge a finished deep search into the candidate list.
+    ///
+    /// `None` when the outcome is stale — the user committed, kept typing, or
+    /// resized the segment while the search was running — or when there was
+    /// nothing to add.
+    pub fn apply_deep_outcome(&mut self, outcome: DeepSearchOutcome) -> Option<EngineResult> {
+        self.deep_running = false;
+        let stale = !matches!(
+            &self.state,
+            InputState::Conversion { split_index, .. }
+                if *split_index == outcome.request.scope
+        ) || self.input_buf.text != outcome.request.buffer;
+        if stale {
+            return None;
         }
+        Some(self.finish_deep_job(outcome))
+    }
+
+    /// Stop the running deep search from finishing its work.
+    ///
+    /// The outcome would be discarded as stale anyway; this just avoids
+    /// grinding a wide beam for a conversion that is already over.
+    pub fn cancel_deep_search(&mut self) {
+        self.deep_search = None;
+        self.deep_cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Run the scheduled deep search here and now, blocking until it finishes.
+    ///
+    /// The frontend never uses this — it would be the freeze this design exists
+    /// to remove — but it makes the search testable without threads.
+    pub fn step_deep_search(&mut self) -> Option<EngineResult> {
+        let job = self.take_deep_job()?;
+        self.apply_deep_outcome(run_deep_job(job))
     }
 
     /// Build the task queue for a scheduled deep search. No model calls —
@@ -1280,8 +1819,12 @@ impl InputMethodEngine {
 
         // Pre-gate cap. Higher than what reaches the window, because
         // `gate_deep_findings` removes the ones that read as nonsense — the
-        // search needs room to find the good ones before that selection.
-        const MAX_TOTAL_RESULTS: usize = 10;
+        // search needs room to find the good ones before that selection. Each
+        // press of the aux button raises it, so asking again keeps finding new
+        // things instead of re-running the same search.
+        let max_total_results = 10 + 6 * request.round;
+        // Extra beam width per round, spent the same way.
+        let widen = request.round;
         let mut queue: VecDeque<DeepTask> = VecDeque::new();
         let mut uniq: HashSet<String> = HashSet::new();
         let mut push_convert = |queue: &mut VecDeque<DeepTask>, variant: String, beam: usize, cap: usize| {
@@ -1333,14 +1876,14 @@ impl InputMethodEngine {
                 // the interrupted keystroke), keyboard edits of the region,
                 // coarse kana edits, and finally base-beam extras.
                 for v in kashiko_engine::typo::romaji_completion_variants(&original) {
-                    push_convert(&mut queue, v, 3, 2);
+                    push_convert(&mut queue, v, 3 + widen, 2);
                 }
                 for (i, kb) in
                     kashiko_engine::typo::keyboard_typo_variants(&region, MAX_KEYBOARD_VARIANTS)
                         .into_iter()
                         .enumerate()
                 {
-                    let beam = if i < 4 { 3 } else { 1 };
+                    let beam = if i < 4 { 3 + widen } else { 1 + widen };
                     push_convert(&mut queue, format!("{prefix}{kb}{suffix}"), beam, 2);
                 }
                 let chars: Vec<char> = cleaned.chars().collect();
@@ -1366,19 +1909,22 @@ impl InputMethodEngine {
                         push_convert(&mut queue, v.into_iter().collect(), 1, 1);
                     }
                 }
-                push_convert(&mut queue, cleaned, 5, 2);
+                push_convert(&mut queue, cleaned, 5 + widen, 2 + widen);
             }
             DeepSearchKind::MoreAlternatives => {
                 // Wide main-model beam over the whole reading, then tail
                 // alternatives (`かき` → 書き/下記/柿) with the prefix held
                 // fixed.
                 let tail_split = self.split_tail_for_alternatives(&cleaned);
-                push_convert(&mut queue, cleaned.clone(), 8, 4);
+                // Cap raised to the beam width: the results are already
+                // computed, and keeping only four of an eight-wide beam threw
+                // away homophones the sync pass no longer looks for.
+                push_convert(&mut queue, cleaned.clone(), 8 + 4 * widen, 8 + 4 * widen);
                 if let Some((prefix_reading, tail_reading)) = tail_split {
                     queue.push_back(DeepTask::TailBeam {
                         prefix_reading,
                         tail_reading,
-                        beam: 6,
+                        beam: 6 + 3 * widen,
                     });
                 }
             }
@@ -1388,292 +1934,36 @@ impl InputMethodEngine {
             .chars()
             .filter(|c| !c.is_ascii_alphabetic())
             .collect();
+        let converter = self.converters.kanji.clone()?;
+        // A fresh flag per job: the previous one may still belong to a job in
+        // flight, and cancelling that must not cancel this.
+        self.deep_cancel = Arc::new(AtomicBool::new(false));
+        // Resolved here rather than in the worker: it comes from the live
+        // conversion's chunk cache, which is engine state.
+        let cached_prefix = queue
+            .iter()
+            .find_map(|t| match t {
+                DeepTask::TailBeam { prefix_reading, .. } => Some(prefix_reading.chars().count()),
+                _ => None,
+            })
+            .and_then(|n| self.cached_prefix_conversion(n))
+            .and_then(|v| v.into_iter().next());
         (!queue.is_empty()).then(|| DeepSearchJob {
             request,
             reading,
             queue,
             found: Vec::new(),
             seen: existing.into_iter().collect(),
-            max_results: MAX_TOTAL_RESULTS,
+            max_results: max_total_results,
+            ctx: self.truncate_context_for_api(),
+            max_ctx: self.config.max_api_context_len,
+            cached_prefix,
+            quality_best: self.last_quality_best,
+            converter,
+            cancel: self.deep_cancel.clone(),
         })
     }
 
-    /// Execute one deep-search task, appending clean findings to the job.
-    fn run_deep_task(&mut self, task: DeepTask, job: &mut DeepSearchJob) {
-        let ctx = self.truncate_context_for_api();
-        fn accept(job: &mut DeepSearchJob, out: String, variant: &str) -> bool {
-            if out != variant
-                && !kashiko_engine::has_long_unconverted_run(&out, variant, UNCONVERTED_RUN_MIN)
-                && !kashiko_engine::has_unrenderable_char(&out)
-                && job.seen.insert(out.clone())
-            {
-                job.found.push(Candidate {
-                    text: out,
-                    reading: Some(variant.to_string()),
-                    source_label: Some(CandidateSource::Model.label().to_string()),
-                    description: None,
-                });
-                true
-            } else {
-                false
-            }
-        }
-
-        match task {
-            DeepTask::Convert { variant, beam, cap } => {
-                let mut added = 0usize;
-                for out in self.deep_convert(&variant, &ctx, beam) {
-                    if added >= cap || job.found.len() >= job.max_results {
-                        break;
-                    }
-                    if accept(job, out, &variant) {
-                        added += 1;
-                    }
-                }
-            }
-            DeepTask::TailBeam {
-                prefix_reading,
-                tail_reading,
-                beam,
-            } => {
-                let prefix_conv = self
-                    .cached_prefix_conversion(prefix_reading.chars().count())
-                    .and_then(|v| v.into_iter().next());
-                let prefix_conv = match prefix_conv {
-                    Some(p) => Some(p),
-                    None => self
-                        .deep_convert(&prefix_reading, &ctx, 1)
-                        .into_iter()
-                        .next(),
-                };
-                let Some(prefix_conv) = prefix_conv else {
-                    return;
-                };
-                let reading = job.reading.clone();
-                let tail_ctx = self.lctx_for(&ctx, &prefix_conv);
-                for tail_out in self.deep_convert(&tail_reading, &tail_ctx, beam) {
-                    if job.found.len() >= job.max_results {
-                        break;
-                    }
-                    accept(job, format!("{prefix_conv}{tail_out}"), &reading);
-                }
-            }
-        }
-    }
-
-    /// Per-character NLL of one candidate, or `None` when unscoreable.
-    fn score_one(&mut self, reading: &str, text: &str) -> Option<f32> {
-        let ctx = self.truncate_context_for_api();
-        let converter = self.converters.kanji.as_ref()?;
-        converter
-            .score_candidates(reading, &ctx, std::slice::from_ref(&text.to_string()))
-            .ok()?
-            .into_iter()
-            .next()
-            .flatten()
-    }
-
-    /// Score-gate the deep search's findings before they join the list.
-    ///
-    /// Findings come from beams over *edited* readings, so a wide beam or an
-    /// unlucky keyboard edit yields text that parses as Japanese but means
-    /// nothing. The quick pass gates its own candidates this way already;
-    /// skipping it here was why one Space press could offer nine candidates of
-    /// which only three were ever picked.
-    ///
-    /// Everything is scored against the reading the user actually typed. That
-    /// is deliberately *not* the reading each finding assumes: a keyboard-edit
-    /// variant converts faithfully into its own hypothesis, so
-    /// `ほあさま → ホア様` scores beautifully against `ほあさま` and the gate
-    /// learns nothing. Scored against the typed reading the findings become
-    /// comparable to each other, which is the only comparison that separates
-    /// them.
-    ///
-    /// What the margin is measured from depends on why the search ran:
-    ///
-    /// - `MoreAlternatives` searched because the list was thin, so a finding
-    ///   has to hold up against the list already on screen — the quick pass's
-    ///   best (`last_quality_best`) joins the reference, and the absolute
-    ///   ceiling applies.
-    /// - `TypoCorrection` searched because the input is broken, so every
-    ///   finding departs from the typed reading by design and scores poorly
-    ///   against it in absolute terms (measured on
-    ///   `さいびるどまえだったtまえ…`: real corrections 1.9–2.3, junk 2.7–2.9).
-    ///   Findings are ranked against each other only, with no ceiling.
-    ///
-    /// Survivors come back best-first, and nothing caps the count: a search
-    /// that turns up eight good sentences shows eight, one that turns up only
-    /// junk shows none.
-    fn gate_deep_findings(
-        &mut self,
-        typed_reading: &str,
-        kind: DeepSearchKind,
-        found: Vec<Candidate>,
-    ) -> Vec<Candidate> {
-        if self.converters.kanji.is_none() {
-            return found;
-        }
-        let ctx = self.truncate_context_for_api();
-        let texts: Vec<String> = found.iter().map(|c| c.text.clone()).collect();
-        let Some(converter) = self.converters.kanji.as_ref() else {
-            return found;
-        };
-        let Ok(scores) = converter.score_candidates_detailed(typed_reading, &ctx, &texts) else {
-            return found;
-        };
-        let worst: Vec<Option<f32>> = scores.iter().map(|d| d.map(|d| d.worst)).collect();
-        let scores: Vec<Option<f32>> = scores.iter().map(|d| d.map(|d| d.mean)).collect();
-
-        let compare_with_shown = kind == DeepSearchKind::MoreAlternatives;
-        let best = scores
-            .iter()
-            .copied()
-            .flatten()
-            .chain(compare_with_shown.then_some(self.last_quality_best).flatten())
-            .fold(f32::INFINITY, f32::min);
-        if !best.is_finite() {
-            return found;
-        }
-        let ceiling = if compare_with_shown {
-            QUALITY_CEILING_NLL
-        } else {
-            f32::INFINITY
-        };
-
-        let mut kept: Vec<(f32, Candidate)> = found
-            .into_iter()
-            .zip(scores)
-            .zip(worst)
-            .filter_map(|((cand, score), worst)| match score {
-                // Unscoreable is not evidence against a candidate; rank it as
-                // if it tied the best so it keeps its place.
-                None => Some((best, cand)),
-                Some(s) => (s <= best + QUALITY_MARGIN_NLL
-                    && s <= ceiling
-                    // Applies whatever the search's reason: a single character
-                    // the model flatly disbelieves is junk either way.
-                    && worst.is_none_or(|w| w <= QUALITY_WORST_TOKEN_NLL))
-                    .then_some((s, cand)),
-            })
-            .collect();
-        kept.sort_by(|a, b| a.0.total_cmp(&b.0));
-        kept.into_iter().map(|(_, c)| c).collect()
-    }
-
-    /// Merge the finished job's findings into the live candidate list and
-    /// build the notification result (always at least `HideAuxText`, to
-    /// clear the loading indicator).
-    fn finish_deep_job(&mut self, job: DeepSearchJob) -> EngineResult {
-        let found = job.found;
-        let done = || EngineResult::consumed().with_action(EngineAction::HideAuxText);
-        if found.is_empty() {
-            // Nothing new — just clear the loading indicator.
-            return done();
-        }
-        if !matches!(self.state, InputState::Conversion { .. }) {
-            return done();
-        }
-        // Deleted candidates must not come back through the side door: the
-        // quick pass filters suppressed text but the deep search merged its
-        // findings straight into the list, so a ✕-ed candidate reappeared a
-        // second later when the background search rediscovered it.
-        // ...and neither may the model invent ASCII here, the same rule the
-        // quick pass applies: `ごKIBOUなら試飲補完を…` is a beam over an edited
-        // reading spelling out keystrokes that were never typed.
-        let mut found: Vec<Candidate> = found
-            .into_iter()
-            .filter(|c| !invents_ascii(&job.reading, &c.text))
-            .collect();
-        if let Some(cache) = self.learning.as_ref() {
-            found.retain(|c| !cache.is_suppressed(&job.reading, &c.text));
-        }
-        if found.is_empty() {
-            return done();
-        }
-        let found = self.gate_deep_findings(&job.reading, job.request.kind, found);
-        if found.is_empty() {
-            return done();
-        }
-        let InputState::Conversion { candidates, .. } = &mut self.state else {
-            return done();
-        };
-        // Insert findings right after the currently selected candidate so
-        // they are visible on the *current page* — inserting at the bottom
-        // (above the fallbacks) buried them on page 2 whenever the quick
-        // pass had already filled page 1, which made the deep results look
-        // like they never arrived. Capped at the hiragana/katakana fallback
-        // position so those always stay at the very bottom, and the user's
-        // currently selected candidate stays selected — the list grows
-        // below the selection, it never jumps.
-        let selected_text = candidates.selected_text().map(str::to_string);
-        let cursor = candidates.cursor();
-        let mut all: Vec<Candidate> = candidates.candidates().to_vec();
-        let fallback_at = all
-            .iter()
-            .position(|c| {
-                matches!(c.description.as_deref(), Some("[全]ひらがな") | Some("[全]カタカナ"))
-            })
-            .unwrap_or(all.len());
-        let insert_at = (cursor + 1).min(fallback_at);
-        all.splice(insert_at..insert_at, found);
-        let mut list = CandidateList::new(all);
-        if let Some(sel) = selected_text
-            && let Some(idx) = list.candidates().iter().position(|c| c.text == sel)
-        {
-            list.select(idx);
-        }
-        *candidates = list.clone();
-        EngineResult::consumed()
-            .with_action(EngineAction::ShowCandidates(list))
-            .with_action(EngineAction::HideAuxText)
-    }
-
-    /// Split `reading` into `(prefix, tail)` for tail-alternative generation:
-    /// the last live-conversion chunk when the chunk cache still matches the
-    /// reading, else the trailing hiragana run (2..=8 chars, strictly shorter
-    /// than the whole reading). `None` when no sensible tail exists.
-    fn split_tail_for_alternatives(&self, reading: &str) -> Option<(String, String)> {
-        // Chunk-aligned split (multi-chunk long input).
-        if self.chunks.len() >= 2 {
-            let concat: String = self.chunks.iter().map(|c| c.reading.as_str()).collect();
-            if concat == reading
-                && let Some(last) = self.chunks.last()
-            {
-                let tail = last.reading.clone();
-                let prefix_len = reading.chars().count() - tail.chars().count();
-                if prefix_len > 0 && !tail.is_empty() {
-                    let prefix: String = reading.chars().take(prefix_len).collect();
-                    return Some((prefix, tail));
-                }
-            }
-        }
-        // Trailing hiragana run.
-        let chars: Vec<char> = reading.chars().collect();
-        let is_hira = |c: char| matches!(c, '\u{3041}'..='\u{3096}');
-        let mut n = 0usize;
-        while n < chars.len() && n < 8 && is_hira(chars[chars.len() - 1 - n]) {
-            n += 1;
-        }
-        (n >= 2 && n < chars.len()).then(|| {
-            let prefix: String = chars[..chars.len() - n].iter().collect();
-            let tail: String = chars[chars.len() - n..].iter().collect();
-            (prefix, tail)
-        })
-    }
-
-    /// Direct main-model conversion for the deep search, bypassing the
-    /// adaptive strategy (which would downshift long input to the light
-    /// model — the deep pass explicitly wants the strong model).
-    fn deep_convert(&mut self, reading: &str, ctx: &str, num_candidates: usize) -> Vec<String> {
-        if !kashiko_engine::contains_kana(reading) {
-            return vec![];
-        }
-        let Some(converter) = self.converters.kanji.as_ref() else {
-            return vec![];
-        };
-        let katakana = kashiko_engine::hiragana_to_katakana(reading);
-        converter.convert(&katakana, ctx, num_candidates).unwrap_or_default()
-    }
 
     /// Whether the current input buffer (the not-yet-converted remainder after
     /// a partial commit) is worth converting as its own segment, judged by the
@@ -1933,7 +2223,14 @@ impl InputMethodEngine {
         //       Runs *before* the latin-word step below, whose candidate comes
         //       from the keystrokes rather than the reading and is exempt.
         {
-            let invents_ascii = |text: &str| invents_ascii(reading, text);
+            // A counted quantity's digit is not an invention — `にげん` really
+            // does convert to `2限`. Without this exemption the rule deleted
+            // exactly the candidates step 10c2 exists to supply, and the model's
+            // own `2階` for `にかい` only survived because the live-conversion
+            // pin put it back afterwards.
+            let counted = kashiko_engine::counter::candidates(reading);
+            let invents_ascii =
+                |text: &str| !counted.iter().any(|c| c == text) && invents_ascii(reading, text);
             // Fallback and Rewriter output is derived from the reading by rule
             // (width/case variants such as `abc` → `ABC`/`ａｂｃ`), so only
             // free-form model/dictionary output is checked.
@@ -1963,6 +2260,123 @@ impl InputMethodEngine {
                 at,
                 AnnotatedCandidate::new(latin, CandidateSource::UserDictionary),
             );
+        }
+
+        // 10b3. On a short reading, drop pure-kana candidates that mix the two
+        //       scripts (`にゲン`, `コバやし`, `カンじ`). Those are the model
+        //       giving up half way through, and with nothing deleted on a short
+        //       reading (see `SHORT_READING_CHARS`) they would otherwise take
+        //       slots from the homophones that reading exists for. The same
+        //       shape is legitimate on longer input — `メールする` is katakana
+        //       plus a hiragana verb ending — so the rule stops at four
+        //       characters, and the two kana fallbacks are exempt.
+        if reading.chars().count() <= 4 {
+            builder.candidates.retain(|c| {
+                c.source == CandidateSource::Fallback
+                    || !kashiko_engine::is_all_kana(&c.text)
+                    || kashiko_engine::is_pure_hiragana(&c.text)
+                    || kashiko_engine::is_pure_full_katakana(&c.text)
+            });
+        }
+
+        // 10c2. Counted quantities written with a digit (`にげん` → `2限`).
+        //       Nothing upstream can produce these: the dictionary is keyed on
+        //       whole readings and has no `にげん`, and the model's beam only
+        //       sometimes stumbles on the digit form — it finds `2階` for
+        //       `にかい` and misses `2限` entirely. Measured on the real model,
+        //       `2限` scores 1.03 against 0.42 for the best candidate that *was*
+        //       offered and above 2.0 for every other one, so the right answer
+        //       simply was not on the list.
+        //
+        //       Inserted after the invented-character filter, which would drop
+        //       them for spelling a digit the kana reading never had, and as
+        //       `UserDictionary` so reranking leaves them alone: with no
+        //       sentence around it a counted quantity scores no better than the
+        //       homophones it is competing with.
+        {
+            let at = builder
+                .candidates
+                .iter()
+                .position(|c| c.source == CandidateSource::Fallback)
+                .unwrap_or(builder.candidates.len())
+                .min(1);
+            let new: Vec<AnnotatedCandidate> = kashiko_engine::counter::candidates(reading)
+                .into_iter()
+                // Against the live list, not `seen`: `seen` also remembers text
+                // an earlier filter deliberately removed, which is how `2限`
+                // ended up silently skipped here after 10b2 dropped the model's
+                // copy of it.
+                .filter(|t| !builder.candidates.iter().any(|c| c.text == *t))
+                .filter(|t| {
+                    self.learning
+                        .as_ref()
+                        .is_none_or(|cache| !cache.is_suppressed(reading, t))
+                })
+                .map(|t| AnnotatedCandidate::new(t, CandidateSource::UserDictionary))
+                .collect();
+            for t in &new {
+                builder.seen.insert(t.text.clone());
+            }
+            builder.candidates.splice(at..at, new);
+        }
+
+        // 10d. The English spelling of a listed katakana loanword
+        //      (`てんぷれーと` → `template`). Nothing upstream can produce it:
+        //      the dictionary and the model only ever emit Japanese script, so
+        //      a borrowed word's own spelling is unreachable without a table.
+        //
+        //      Placed second, directly under the katakana form, so it is
+        //      visible without displacing whatever the conversion chain
+        //      decided, and always above the kana fallbacks. Inserted here —
+        //      after the ASCII-invention filter (10b2), which would otherwise
+        //      throw it out for spelling letters the kana reading never had —
+        //      and as `UserDictionary`, which reranking leaves alone: an
+        //      English word scored as if it were Japanese reads badly, and
+        //      that is a fact about the scorer, not about the candidate.
+        if let Some(english) = kashiko_engine::loanword::english_for(reading) {
+            // A matched reading is a single borrowed word, which pins down what
+            // the right answers are: the katakana form and the English spelling.
+            // That is enough to clear out the half-converted kana the model
+            // offers here — `てんプレート`, `テンプレーと`, `リポジとり` — which
+            // score close enough to the katakana form to pass the quality gate
+            // and are never what anyone meant. Kept narrow on purpose: the same
+            // shape is legitimate in general (`メールする` is katakana plus a
+            // hiragana verb ending), so only readings the table recognises as
+            // one whole word are treated this way.
+            let canonical = kashiko_engine::hiragana_to_katakana(reading);
+            builder.candidates.retain(|c| {
+                c.source != CandidateSource::Model
+                    || c.text == canonical
+                    || !kashiko_engine::is_all_kana(&c.text)
+            });
+            // The katakana form leads: for a borrowed word it is the answer, and
+            // the model often has it only as the kana fallback at the bottom.
+            if let Some(at) = builder.candidates.iter().position(|c| c.text == canonical)
+                && at > 0
+            {
+                let c = builder.candidates.remove(at);
+                builder.candidates.insert(0, c);
+            }
+            // English directly under it, and always above the kana fallbacks.
+            if !builder.candidates.iter().any(|c| c.text == english)
+                // The ✕ has to work here too, and 10a2 already ran.
+                && self
+                    .learning
+                    .as_ref()
+                    .is_none_or(|cache| !cache.is_suppressed(reading, english))
+            {
+                let fallback_at = builder
+                    .candidates
+                    .iter()
+                    .position(|c| c.source == CandidateSource::Fallback)
+                    .unwrap_or(builder.candidates.len());
+                let at = fallback_at.min(1);
+                builder.seen.insert(english.to_string());
+                builder.candidates.insert(
+                    at,
+                    AnnotatedCandidate::new(english.to_string(), CandidateSource::UserDictionary),
+                );
+            }
         }
 
         // 11. Drop low-quality model guesses: when the user mistypes mid-phrase
@@ -2646,6 +3060,23 @@ impl InputMethodEngine {
         // conversion, and a stale one from the previous conversion would set
         // the deep search's bar from unrelated text.
         self.last_quality_best = None;
+        /// Readings up to this length are only reordered, never thinned.
+        ///
+        /// A single word gives the model no sentence to judge a candidate
+        /// against, so a bad score there means "unusual", not "wrong". `ゆうと`
+        /// offered `言うと` and nothing else for exactly that reason: the
+        /// dictionary lists 96 readings and the model's beam adds 優斗, 悠と,
+        /// 佑都 — and every one of them scored badly enough to be deleted,
+        /// leaving a verb form to win a reading that is nearly always a name.
+        /// Homophone variety is the point of a short reading, and the scoring
+        /// budget already bounds how many are shown.
+        ///
+        /// Long readings keep the strict gate: there the score is measured
+        /// against a real sentence, and a homophone that reads badly in one is
+        /// genuinely wrong.
+        const SHORT_READING_CHARS: usize = 4;
+
+        let short_reading = reading.chars().count() <= SHORT_READING_CHARS;
         if reading.chars().count() < MIN_RERANK_READING_CHARS || self.converters.kanji.is_none() {
             return;
         }
@@ -2667,6 +3098,17 @@ impl InputMethodEngine {
             .map(|(i, _)| i)
             .collect();
         if positions.len() < 2 {
+            // One candidate cannot be reordered, but its score is still the
+            // answer to "did this convert well?" — which the typo-correction
+            // heuristics need. Narrowing the synchronous beam made this the
+            // common case, and without the score those heuristics fall back to
+            // their false-positive behaviour: `皆さんおはようございます` has a
+            // nine-character kana run shared with the reading, so it reads as a
+            // failed conversion until something says otherwise.
+            if let Some(&i) = positions.first() {
+                let text = candidates[i].text.clone();
+                self.last_quality_best = self.score_one(reading, &text);
+            }
             return;
         }
         // Anything past the scoring budget is removed, not shown unjudged.
@@ -2723,7 +3165,7 @@ impl InputMethodEngine {
                     score: detail
                         .map(|d| if learned { d.mean - LEARNED_SCORE_BONUS } else { d.mean }),
                     worst: detail.map(|d| d.worst),
-                    never_drop: learned,
+                    never_drop: learned || short_reading,
                 }
             })
             .collect();

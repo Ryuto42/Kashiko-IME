@@ -34,18 +34,29 @@ fn main() {
     let mut server = ImServer::new();
     let mut stdout = std::io::stdout().lock();
 
-    // stdin is read on its own thread and fed through a channel so the main
-    // loop can interleave deep-search steps with request handling: while a
-    // search is pending, each iteration first drains any waiting request
-    // (keys stay responsive — worst case they wait one model call), and only
-    // steps the search when the channel is idle.
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    // Everything the loop reacts to arrives on one channel, so the loop is
+    // *always* blocked on `recv` and never inside a model call. That is the
+    // whole point: a wide beam over a long sentence takes seconds, and while it
+    // runs the user still has to be able to move through candidates and commit.
+    //
+    // The previous design interleaved instead — it stepped the search whenever
+    // no request was waiting — which left a key event stuck behind whichever
+    // task was running. One greedy pass over a 30-character reading is already
+    // ~350ms, and the inference button widens the beam from there.
+    enum Msg {
+        Request(String),
+        DeepDone(kashiko_im::DeepSearchOutcome),
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+
+    let stdin_tx = tx.clone();
     std::thread::spawn(move || {
         let stdin = std::io::stdin().lock();
         for line in stdin.lines() {
             match line {
                 Ok(line) => {
-                    if tx.send(line).is_err() {
+                    if stdin_tx.send(Msg::Request(line)).is_err() {
                         break;
                     }
                 }
@@ -57,35 +68,49 @@ fn main() {
         }
     });
 
+    // The deep-search worker. It holds its own handle on the (immutable) model
+    // and builds its own llama.cpp context, so it needs no lock against the
+    // main thread's own inference.
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<kashiko_im::DeepSearchJob>();
+    let done_tx = tx.clone();
+    std::thread::spawn(move || {
+        for job in job_rx {
+            if done_tx
+                .send(Msg::DeepDone(kashiko_im::run_deep_job(job)))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    // Both threads hold a sender; drop ours so `recv` ends when they are gone.
+    drop(tx);
+
     tracing::info!("kashiko-imserver started (pid={})", std::process::id());
 
-    'main: loop {
-        let line = if server.deep_search_pending() {
-            match rx.try_recv() {
-                Ok(line) => Some(line),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // No request waiting: advance the search by one step.
-                    // The step cancels itself if the conversion was already
-                    // committed, so no time is wasted on finished input.
-                    if let Some(note) = server.step_deep_search()
-                        && writeln!(stdout, "{note}")
-                            .and_then(|_| stdout.flush())
-                            .is_err()
-                    {
-                        break 'main;
-                    }
-                    continue;
+    loop {
+        // A request may have scheduled a search; hand it over before waiting.
+        if let Some(job) = server.take_deep_job()
+            && job_tx.send(job).is_err()
+        {
+            tracing::error!("deep-search worker is gone");
+        }
+
+        let Ok(msg) = rx.recv() else { break };
+        let line = match msg {
+            Msg::DeepDone(outcome) => {
+                if let Some(note) = server.apply_deep_outcome(outcome)
+                    && writeln!(stdout, "{note}")
+                        .and_then(|_| stdout.flush())
+                        .is_err()
+                {
+                    break;
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                continue;
             }
-        } else {
-            match rx.recv() {
-                Ok(line) => Some(line),
-                Err(_) => break, // stdin closed: frontend is gone
-            }
+            Msg::Request(line) => line,
         };
 
-        let Some(line) = line else { continue };
         if line.trim().is_empty() {
             continue;
         }

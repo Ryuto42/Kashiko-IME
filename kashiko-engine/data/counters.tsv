@@ -1,0 +1,111 @@
+# Japanese counters (助数詞): the reading that follows a number, then the
+# surface(s) it converts to.
+#
+# Tab-separated; the first column is the reading, the rest are surfaces in
+# preference order. Voiced and geminated variants get their own rows
+# (`かい`/`がい` → 階), because that is how they appear after a number.
+#
+# Only counters belong here. A row like `ごと` → `毎` would make `しごと` parse
+# as 4+毎 and offer `4毎`, so the list is kept to readings that genuinely only
+# follow a number.
+
+# --- time ---
+ねん	年
+ねんせい	年生
+がつ	月
+かげつ	か月	ヶ月
+にち	日
+じつ	日
+じ	時
+じかん	時間
+ふん	分
+ぷん	分
+びょう	秒
+しゅう	週
+しゅうかん	週間
+はく	泊
+ぱく	泊
+き	期	機
+がっき	学期
+だい	台	代
+せいき	世紀
+
+# --- place / order ---
+かい	階	回
+がい	階
+げん	限	軒
+こま	コマ
+じげん	時限
+ばん	番
+ばんめ	番目
+ばんせん	番線
+い	位
+ごう	号
+ごうしつ	号室
+しつ	室
+せき	席
+れつ	列
+ぎょう	行
+ぺーじ	ページ
+しょう	章
+せつ	節
+こう	項
+かじょう	箇条
+ちょうめ	丁目
+
+# --- people / things ---
+にん	人
+めい	名
+り	人
+たり	人
+こ	個
+つ	つ
+ほん	本
+ぼん	本
+ぽん	本
+まい	枚
+さつ	冊
+きゃく	脚	客
+ひき	匹
+びき	匹
+ぴき	匹
+とう	頭
+わ	羽
+ば	羽
+ぱ	羽
+はい	杯
+ばい	倍	杯
+ぱい	杯
+そく	足
+ぞく	足
+ちゃく	着
+けん	件	軒
+くみ	組
+ぐみ	組
+たば	束
+つぶ	粒
+てき	滴
+みん	名
+
+# --- quantity / rate ---
+ど	度
+わり	割
+ぱーせんと	パーセント
+ぷろ	プロ
+えん	円
+せん	銭
+どる	ドル
+きろ	キロ
+ぐらむ	グラム
+きろぐらむ	キログラム
+とん	トン
+めーとる	メートル
+きろめーとる	キロメートル
+せんち	センチ
+みり	ミリ
+りっとる	リットル
+へいべい	平米
+つぼ	坪
+さい	歳	才
+にんぶん	人分
+にんまえ	人前

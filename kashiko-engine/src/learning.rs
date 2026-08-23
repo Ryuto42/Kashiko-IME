@@ -5,7 +5,7 @@
 //! simple TSV file (`reading\tsurface\tfrequency\tlast_access`).
 
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
+
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -101,7 +101,13 @@ impl LearningCache {
         // them is the only way to offer the spelling back later. Recognized
         // here because the leftover-romaji and no-kanji rules below exist for
         // *Japanese* surfaces and would both reject it.
-        let pure_latin = surface.chars().all(|c| c.is_ascii_alphanumeric())
+        // Spaces, hyphens and dots are part of the word here: the loanword table
+        // offers `pull request`, `in-memory`, `one-time password`. Without them
+        // a multi-word entry counted as Japanese with no kanji and was rejected
+        // by the rule below — offered every time, learned never.
+        let pure_latin = surface
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '.' | '_'))
             && surface.chars().any(|c| c.is_ascii_alphabetic());
         // Feature 1: length cap. Latin words get a longer allowance — the cap
         // targets runaway *sentences*, and `InputMethodKit` is one word.
@@ -270,17 +276,18 @@ impl LearningCache {
         results
     }
 
-    /// Load a learning cache from a TSV file.
+    /// Load a learning cache from disk.
     ///
-    /// Format: `reading\tsurface\tfrequency\tlast_access`
-    /// Lines starting with `#` are comments.
+    /// Format: `reading\tsurface\tfrequency\tlast_access`, lines starting with
+    /// `#` are comments. The file is encrypted (see [`crate::learning_file`]);
+    /// a plaintext one written before encryption existed still loads, and is
+    /// rewritten encrypted on the next save.
     pub fn load(path: &Path, max_entries: usize) -> anyhow::Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let reader = std::io::BufReader::new(file);
+        let text = crate::learning_file::read_maybe_encrypted(path)?;
         let mut cache = Self::new(max_entries);
+        let encrypted_on_disk = text.starts_with(Self::ENCRYPTED_HEADER);
 
-        for line in reader.lines() {
-            let line = line?;
+        for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -317,12 +324,21 @@ impl LearningCache {
                 });
         }
 
-        // Not dirty — just loaded from disk
-        cache.dirty = false;
+        // Not dirty — just loaded from disk. A plaintext file is the exception:
+        // it has to be rewritten encrypted, and only a dirty cache gets saved.
+        cache.dirty = !encrypted_on_disk;
         Ok(cache)
     }
 
-    /// Save the cache to a TSV file, evicting low-score entries if over capacity.
+    /// Header the encrypted form carries once decrypted, used to tell a cache
+    /// that was already encrypted from a plaintext one being migrated.
+    const ENCRYPTED_HEADER: &'static str = "# kashiko learning cache v2";
+
+    /// Save the cache, evicting low-score entries if over capacity.
+    ///
+    /// Written encrypted: this is a record of what the user has typed and does
+    /// not belong on disk as readable text. See [`crate::learning_file`] for
+    /// what that protects against and what it does not.
     pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
         self.evict();
 
@@ -330,9 +346,9 @@ impl LearningCache {
             std::fs::create_dir_all(parent)?;
         }
 
-        let file = std::fs::File::create(path)?;
-        let mut writer = std::io::BufWriter::new(file);
-        writeln!(writer, "# kashiko learning cache v1")?;
+        let mut out = String::new();
+        out.push_str(Self::ENCRYPTED_HEADER);
+        out.push('\n');
 
         // Sort readings for deterministic output
         let mut readings: Vec<&String> = self.entries.keys().collect();
@@ -341,8 +357,9 @@ impl LearningCache {
         for reading in readings {
             if let Some(entries) = self.entries.get(reading) {
                 for entry in entries {
+                    use std::fmt::Write as _;
                     writeln!(
-                        writer,
+                        out,
                         "{}\t{}\t{}\t{}",
                         reading, entry.surface, entry.frequency, entry.last_access
                     )?;
@@ -350,7 +367,7 @@ impl LearningCache {
             }
         }
 
-        writer.flush()?;
+        crate::learning_file::write_encrypted(path, &out)?;
         self.dirty = false;
         Ok(())
     }
@@ -714,9 +731,40 @@ mod tests {
         let file = NamedTempFile::new().unwrap();
         cache.save(file.path()).unwrap();
 
-        let content = std::fs::read_to_string(file.path()).unwrap();
-        assert!(content.starts_with("# kashiko learning cache v1"));
+        // The TSV is the *decrypted* form now — on disk the file is
+        // ChaCha20-Poly1305, so what the user typed is not readable there.
+        let content = crate::learning_file::read_maybe_encrypted(file.path()).unwrap();
+        assert!(content.starts_with(LearningCache::ENCRYPTED_HEADER));
         assert!(content.contains("きょう\t今日\t1\t"));
+        let raw = std::fs::read(file.path()).unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains("今日"));
+    }
+
+    #[test]
+    fn a_plaintext_cache_is_rewritten_encrypted() {
+        // Upgrading must keep what the user already taught the IME, and must
+        // not leave the plaintext behind.
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "# kashiko learning cache v1\nきょう\t今日\t5\t1700000000\n",
+        )
+        .unwrap();
+
+        let mut cache = LearningCache::load(file.path(), 100).unwrap();
+        assert_eq!(cache.lookup("きょう").first().map(|(s, _)| s.as_str()), Some("今日"));
+        // Loading a plaintext cache marks it dirty precisely so this happens.
+        assert!(cache.is_dirty());
+        cache.save(file.path()).unwrap();
+
+        let raw = std::fs::read(file.path()).unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains("今日"));
+        let reloaded = LearningCache::load(file.path(), 100).unwrap();
+        assert_eq!(
+            reloaded.lookup("きょう").first().map(|(s, _)| s.as_str()),
+            Some("今日")
+        );
+        assert!(!reloaded.is_dirty());
     }
 
     #[test]
@@ -747,5 +795,36 @@ mod tests {
         let cache = LearningCache::load(file.path(), 100).unwrap();
         // Only the first valid line should be loaded
         assert_eq!(cache.entry_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod learnability_tests {
+    use super::*;
+
+    #[test]
+    fn every_added_candidate_source_is_learnable() {
+        // The tables that supply candidates no other source can produce
+        // (loanwords, counted quantities) are only the *seed*: once the user
+        // picks one it has to be learned, so ranking is driven by their own
+        // choices from then on. A surface these filters reject would be offered
+        // forever without ever being promoted.
+        let mut cache = LearningCache::new(100);
+        for (reading, surface) in [
+            ("てんぷれーと", "template"),
+            ("ぷるりくえすと", "pull request"),
+            ("にげん", "2限"),
+            ("じゅうにじ", "12時"),
+            ("ごねん", "5年"),
+            ("ゆうと", "優斗"),
+            ("たなか", "田仲"),
+        ] {
+            cache.record(reading, surface);
+            assert_eq!(
+                cache.lookup(reading).first().map(|(s, _)| s.as_str()),
+                Some(surface),
+                "{reading} → {surface} was not learned"
+            );
+        }
     }
 }

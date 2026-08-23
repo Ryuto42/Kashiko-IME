@@ -87,6 +87,9 @@ class CandidateWindowController {
     private let stackView: NSStackView
     private var rowViews: [NSView] = []
     private var auxText: String?
+    /// Whether the aux line is the "run another inference pass" button rather
+    /// than plain status text. Only the button reacts to a click.
+    private var auxIsButton: Bool = false
 
     private struct PageState {
         let candidates: [CandidateItem]
@@ -99,6 +102,9 @@ class CandidateWindowController {
     /// Called with a page row index when its ✕ is clicked, to stop the engine
     /// offering the candidate on that row.
     var onDeleteCandidate: ((Int) -> Void)?
+    /// Called when the aux-line button is clicked, to run another inference
+    /// pass over the conversion on screen.
+    var onDeepenInference: (() -> Void)?
 
     init() {
         panel = NSPanel(
@@ -161,8 +167,9 @@ class CandidateWindowController {
     /// Pass `deferRender: true` when a `show`/`hide` follows in the same
     /// action batch, so the panel is rendered once per batch instead of
     /// once for the aux change and again for the candidates.
-    func setAux(_ text: String?, deferRender: Bool = false) {
+    func setAux(_ text: String?, deferRender: Bool = false, isButton: Bool = false) {
         auxText = text
+        auxIsButton = isButton
         if !deferRender, panel.isVisible, pageState != nil {
             render(cursorRect: nil)
         }
@@ -187,7 +194,11 @@ class CandidateWindowController {
             addFooterLabel("[\(state.page + 1)/\(state.totalPages)]")
         }
         if let aux = auxText, !aux.isEmpty {
-            addFooterLabel(aux)
+            if auxIsButton {
+                addFooterButton(aux)
+            } else {
+                addFooterLabel(aux)
+            }
         }
 
         positionPanel(cursorRect: cursorRect)
@@ -310,6 +321,26 @@ class CandidateWindowController {
 
         stackView.addArrangedSubview(container)
         rowViews.append(container)
+    }
+
+    /// The aux line as a clickable button. Deliberately styled like the footer
+    /// label rather than as a system button: it sits inside a candidate popup,
+    /// where a bordered control would read as part of the conversion.
+    private func addFooterButton(_ text: String) {
+        let button = NSButton(frame: .zero)
+        button.title = text
+        button.font = NSFont.systemFont(ofSize: Self.footerFontSize)
+        button.isBordered = false
+        button.contentTintColor = NSColor.controlAccentColor
+        button.target = self
+        button.action = #selector(deepenClicked)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        stackView.addArrangedSubview(button)
+        rowViews.append(button)
+    }
+
+    @objc private func deepenClicked() {
+        onDeepenInference?()
     }
 
     private func addFooterLabel(_ text: String) {

@@ -445,3 +445,4 @@ mod tests {
         assert_eq!(count, 1, "😄 should appear once, got {:?}", out);
     }
 }
+

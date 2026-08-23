@@ -1,8 +1,11 @@
+pub mod counter;
 pub mod dict;
 pub mod kana;
 pub mod latin;
 pub mod kanji;
 pub mod learning;
+pub mod learning_file;
+pub mod loanword;
 pub mod rewriter;
 pub mod romaji;
 pub mod segment;
@@ -10,7 +13,8 @@ pub mod typo;
 
 pub use dict::{Candidate as DictCandidate, DictEntry, Dictionary, LookupResult};
 pub use kana::{
-    contains_kana, has_long_unconverted_run, hiragana_to_katakana, is_pure_full_katakana,
+    contains_kana, has_long_unconverted_run, hiragana_to_katakana, is_all_kana,
+    is_pure_full_katakana,
     is_pure_hiragana, katakana_to_hiragana, longest_passthrough_run, normalize_nfkc,
 };
 pub use kanji::{Backend, KanaKanjiConverter};

@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 
 use crate::config::Settings;
 use crate::core::candidate::CandidateList;
-use crate::core::engine::{EngineAction, EngineConfig, EngineResult, InputMethodEngine};
+use crate::core::engine::{
+    DeepSearchJob, DeepSearchOutcome, EngineAction, EngineConfig, EngineResult, InputMethodEngine,
+};
 use crate::core::keycode::{KeyEvent, Keysym};
 use crate::core::state::InputState;
 
@@ -104,6 +106,10 @@ impl ImServer {
                 let result = self.engine.select_candidate_on_page(params.page_index);
                 self.key_result(result)
             }
+            "deepen_inference" => {
+                let result = self.engine.deepen_inference();
+                self.key_result(result)
+            }
             "forget_candidate" => {
                 let params: SelectCandidateParams = parse_params(params)?;
                 if params.page_index >= CandidateList::DEFAULT_PAGE_SIZE {
@@ -174,26 +180,36 @@ impl ImServer {
         .map_err(internal_error)
     }
 
-    /// Whether deep-search work is scheduled or in flight. The main loop
-    /// uses this to decide between blocking on stdin and stepping the
-    /// search, so key events are served between model calls.
+    /// Whether deep-search work is scheduled or in flight.
     pub fn deep_search_pending(&self) -> bool {
         self.engine.deep_search_pending()
     }
 
-    /// Advance the pending deep search by one increment (at most a couple
-    /// of model calls). Returns the JSON-RPC `update_candidates`
-    /// notification line when the search just finished with actions to push
-    /// to the frontend; `None` while still working or when it was canceled.
-    pub fn step_deep_search(&mut self) -> Option<String> {
-        let result = self.engine.step_deep_search()?;
+    /// Hand any scheduled deep search out to be run on the worker thread.
+    ///
+    /// Cheap and non-blocking — it only builds the task list. The model work
+    /// happens on the worker, which is what keeps key events from ever waiting
+    /// behind a wide beam.
+    pub fn take_deep_job(&mut self) -> Option<DeepSearchJob> {
+        self.engine.take_deep_job()
+    }
+
+    /// Merge a finished deep search and render the `update_candidates`
+    /// notification. `None` when the outcome is stale or added nothing.
+    pub fn apply_deep_outcome(&mut self, outcome: DeepSearchOutcome) -> Option<String> {
+        let result = self.engine.apply_deep_outcome(outcome)?;
+        Some(self.notification(result))
+    }
+
+    /// Wrap an engine result as a server-initiated `update_candidates` line.
+    fn notification(&self, result: EngineResult) -> String {
         let actions: Vec<Action> = result.actions.into_iter().map(to_action).collect();
-        let note = json!({
+        json!({
             "jsonrpc": "2.0",
             "method": "update_candidates",
             "params": { "actions": actions },
-        });
-        Some(note.to_string())
+        })
+        .to_string()
     }
 
     fn key_result(&self, result: EngineResult) -> Result<Value, RpcError> {
@@ -263,9 +279,13 @@ fn to_action(action: EngineAction) -> Action {
             if text.is_empty() {
                 Action::HideAux
             } else {
-                Action::UpdateAux { text }
+                Action::UpdateAux {
+                    text,
+                    button: false,
+                }
             }
         }
+        EngineAction::UpdateAuxButton(text) => Action::UpdateAux { text, button: true },
         EngineAction::HideAuxText => Action::HideAux,
     }
 }

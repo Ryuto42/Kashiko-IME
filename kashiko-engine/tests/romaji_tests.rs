@@ -709,20 +709,20 @@ fn test_real_words() {
     });
     assert_eq!(conv.output(), "あんにんどうふ"); // "annin doufu" - almond jelly
 
-    // "kashiko" (single n at end) -> "かるかん" after flush
+    // "kan" (single n at end) -> "かん" after flush
     conv.reset();
-    "kashiko".chars().for_each(|c| {
+    "kan".chars().for_each(|c| {
         conv.push(c);
     });
     conv.flush();
-    assert_eq!(conv.output(), "かるかん"); // Single trailing 'n' becomes 'ん' on flush
+    assert_eq!(conv.output(), "かん"); // Single trailing 'n' becomes 'ん' on flush
 
-    // "kashikon" (nn at end) -> "かるかん" immediately (nn converts right away)
+    // "kann" (nn at end) -> "かん" immediately (nn converts right away)
     conv.reset();
-    "kashikon".chars().for_each(|c| {
+    "kann".chars().for_each(|c| {
         conv.push(c);
     });
-    assert_eq!(conv.output(), "かるかん"); // nn -> ん immediately
+    assert_eq!(conv.output(), "かん"); // nn -> ん immediately
     assert_eq!(conv.buffer(), ""); // Buffer is empty
 
     // Test multiple input styles for same output
@@ -805,13 +805,13 @@ fn test_nn_edge_cases() {
     });
     assert_eq!(conv.output(), "かんな");
 
-    // Test 8: Word ending in "nn" - e.g., "kashikon"
+    // Test 8: Word ending in "nn" - e.g., "kann"
     // "nn" converts immediately to ん
     conv.reset();
-    "kashikon".chars().for_each(|c| {
+    "kann".chars().for_each(|c| {
         conv.push(c);
     });
-    assert_eq!(conv.output(), "かるかん"); // nn -> ん immediately
+    assert_eq!(conv.output(), "かん"); // nn -> ん immediately
     assert_eq!(conv.buffer(), ""); // Buffer is empty
 
     // Test 9: ny* patterns should be yōon, not n + vowel

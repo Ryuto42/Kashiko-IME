@@ -32,6 +32,10 @@ yada = "0.5"
 # HuggingFace model download
 hf-hub = "0.4"
 
+# Authenticated encryption for the learning cache at rest (ChaCha20-Poly1305).
+# Already in the dependency graph via the HuggingFace download path.
+ring = "0.17"
+
 # Unicode normalization (NFKC) for models whose tokenizer doesn't support full-width ASCII
 unicode-normalization = "0.1"
 

@@ -34,6 +34,18 @@ pub fn contains_kana(text: &str) -> bool {
         .any(|c| matches!(c, '\u{3041}'..='\u{3096}' | '\u{30A1}'..='\u{30FA}'))
 }
 
+/// True if every character is kana — a letter, or the punctuation that belongs
+/// to a kana word (`ー`, `・`, iteration marks). Empty text is not kana.
+///
+/// The complement of "contains a kanji, a latin letter or a digit", which is
+/// what a caller checking for an unconverted reading actually wants.
+pub fn is_all_kana(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().all(|c| {
+            matches!(c, '\u{3041}'..='\u{3096}' | '\u{309D}'..='\u{309E}' | '\u{30A0}'..='\u{30FE}')
+        })
+}
+
 /// Convert hiragana to katakana
 pub fn hiragana_to_katakana(text: &str) -> String {
     text.chars()

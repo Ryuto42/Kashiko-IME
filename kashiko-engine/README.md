@@ -1,151 +1,84 @@
 # kashiko-engine
 
-日本語入力エンジン：ローマ字からひらがなへの変換と、llama.cppによるニューラルかな漢字変換。
+Kashiko のコアライブラリ。ローマ字→ひらがな変換、llama.cpp によるニューラルかな漢字変換、辞書、学習キャッシュを提供します。
 
-## Overview
+サーバー・CLIツールは [kashiko-cli](../kashiko-cli/)、IMEのステートマシンと候補生成は [kashiko-im](../kashiko-im/) を参照してください。
 
-kashiko-engineは、kashikoプロジェクトのコアライブラリです。以下の機能を提供します：
+## モジュール
 
-- **ニューラルかな漢字変換** — llama.cppによるGGUF形式のGPT-2モデル
-- **辞書検索** — Double-array trieによる高速な前方一致・完全一致検索
-- **変換学習** — ユーザーの変換履歴を記憶し、完全一致・前方一致（予測変換）で候補を優先表示。TSV形式で永続化
+| モジュール | 役割 |
+|---|---|
+| `romaji` | ローマ字→ひらがな変換 |
+| `kanji` | llama.cpp による GGUF 推論。変換、候補の尤度評価、ライブ変換 |
+| `dict` | double-array trie 辞書（完全一致・前方一致） |
+| `learning` | 変換学習キャッシュ。抑制リスト（候補削除）も同じ仕組みで保持 |
+| `learning_file` | 学習キャッシュの暗号化（ChaCha20-Poly1305） |
+| `segment` | 変換結果を読みに整列させる文節アラインメント |
+| `counter` | 数詞＋助数詞の分解 |
+| `loanword` | カタカナ借用語の英語表記 |
+| `latin` | 打鍵内容からの英単語復元 |
+| `typo` | キーボード配置に基づく打鍵誤りの推定 |
+| `kana` | かな種別の判定・変換ユーティリティ |
+| `rewriter` | 記号・絵文字・全角半角・数値表記のバリアント生成 |
 
-サーバー・CLIツールについては [kashiko-cli](../kashiko-cli/) を参照してください。
-
-## Quick Start
+## ビルド
 
 ```bash
-# Build（リポジトリルートから実行）
 cargo build -p kashiko-engine --release
+```
 
-# テスト実行（ユニットテスト、モデルのダウンロード不要）
+```bash
 cargo test -p kashiko-engine
+```
 
-# 統合テスト実行（モデルのダウンロードが必要）
+統合テストはモデルのダウンロードが必要です。
+
+```bash
 cargo test -p kashiko-engine -- --ignored
 ```
 
-## Library Usage
+## 候補の評価
 
-### Romaji-to-Hiragana
+候補の自然さを文字単位の負の対数尤度（NLL）で評価します。値が小さいほど自然で、文字数で正規化しているため長さの違う候補も比較できます。文脈にはカーソル左側の確定済みテキストを渡します（文脈込みで評価することがリスコアリングの目的なので、空にすると効果が落ちます）。
 
-```rust
-use kashiko_engine::RomajiConverter;
+平均に加えて**最悪の1文字**も返します。平均だけでは長文を判定できず、多数の文字のうち1つが誤変換でもほとんど動かないためです。局所的な破損は局所的な指標でしか見えません。
 
-let mut converter = RomajiConverter::new();
-// "nn" は常に「ん」なので、「こんにちは」には n が3つ必要:
-// ko→こ, nn→ん, ni→に, chi→ち, ha→は
-for ch in "konnnichiha".chars() {
-    converter.push(ch);
-}
-assert_eq!(converter.output(), "こんにちは");
-```
+候補リストはまとめて評価します。スコアラを1つだけ生成することで、共有プロンプトがKVキャッシュに残り候補ごとの作り直しを避けられます。
 
-### Kana-Kanji Conversion
+`KanaKanjiConverter` は `Send + Sync` です。推論は `&self` で呼び出しごとに自前のコンテキストを作るため、複数スレッドから同時に使えます（IMEはこれを利用してバックグラウンド探索を別スレッドで走らせます）。
 
-```rust
-use kashiko_engine::{Backend, KanaKanjiConverter};
+## ライブ変換
 
-// モデルの読み込み（初回使用時にHuggingFaceからダウンロード）
-let backend = Backend::from_variant_id("jinen-v1-small-q5")?;
-let converter = KanaKanjiConverter::new(backend)?;
+1候補のgreedyデコードを行い、**モデル自身が自分の出力を不確からしいと評価したときだけ**ビーム探索で作り直します。greedyは各ステップで最善手に飛びつくため近視眼的で、ビームなら避けられる不自然な文に入り込むことがあります。
 
-let candidates = converter.convert("かんじ", "", 3)?;
-// => ["漢字", "感じ", "幹事"]
-```
+判定に使う対数確率は生成時のlogitsから得るため**追加の推論コストはゼロ**で、毎キーストロークで呼ばれる経路でも使えます。
 
-### Candidate Scoring
+## 学習キャッシュ
 
-候補の自然さを文字単位の負の対数尤度（NLL）で評価します。値が小さいほど自然で、文字数で正規化しているため候補の長さが違っても比較できます。`context` にはカーソル左側の確定済みテキストを渡します（文脈込みで評価することがリスコアリングの目的なので、空にすると効果が落ちます）。
+読みと確定した表層形を記録し、完全一致と前方一致（予測変換）で引けます。誤変換やスペルミスに由来する意味の取れない組み合わせと、極端に長い表層形は記録しません。
 
-```rust
-// 候補リストをまとめて評価。スコアラを1つだけ生成するため、
-// 共有プロンプトがKVキャッシュに残り候補ごとの作り直しを避けられる
-let scores = converter.score_candidates("てんき", "きょうの", &candidates)?;
-// => [Some(0.31), Some(0.42), None]  入力と同じ順序。None は評価不能
+保存時は暗号化します。入力内容の記録なので、平文でディスクに残すべきものではありません。鍵はインストール時に生成してキャッシュの隣に置きます。認証付きなので改変されたファイルはエラーになり、暗号化前の平文キャッシュは読み込んで次回保存時に書き直します。詳細は [kashiko-im の README](../kashiko-im/README.md#learning-cache) を参照してください。
 
-// 閾値による判定（既定 1.5）
-let bad = converter.is_typo("てんき", "転機", "きょうの")?;
-```
+## モデル
 
-### Self-checking Live Conversion
+`models.toml` で定義され、バリアントIDを指定すると自動的にダウンロードされます。
 
-`convert_live` は1候補のgreedyデコードを行い、**モデル自身が自分の出力を不確からしいと評価したときだけ**ビーム探索で作り直します。greedyは各ステップで最善手に飛びつくため近視眼的で、ビームなら避けられる不自然な文に入り込むことがあります。
-
-判定に使う対数確率は生成時のlogitsから得るため**追加の推論コストはゼロ**で、毎キーストロークで呼ばれるライブ変換の経路でも使えます。
-
-```rust
-// 通常は greedy 1回分のコスト。不自然な結果のときのみビーム再生成が走る
-let text = converter.convert_live("きょうのてんき", "")?;
-```
-
-### Learning Cache
-
-```rust
-use kashiko_engine::LearningCache;
-use std::path::Path;
-
-// 新規作成（最大エントリ数: 10,000）
-let mut cache = LearningCache::new(10_000);
-
-// 変換結果を記録
-cache.record("わせだだいがく", "早稲田大学");
-cache.record("きょう", "今日");
-
-// 完全一致検索（読みが一致する候補をスコア順に返す）
-let results = cache.lookup("きょう");
-// => [("今日", score)]
-
-// 前方一致検索（予測変換: 読みが前方一致する候補を返す）
-let results = cache.prefix_lookup("わせだ");
-// => [("わせだだいがく", "早稲田大学", score)]
-
-// TSVファイルに保存・読み込み
-cache.save(Path::new("learning.tsv"))?;
-let cache = LearningCache::load(Path::new("learning.tsv"), 10_000)?;
-```
-
-### Dictionary
-
-```rust
-use kashiko_engine::Dictionary;
-
-// バイナリ辞書の読み込み
-let dict = Dictionary::load("dict.bin")?;
-
-// 完全一致検索
-if let Some(result) = dict.exact_match_search("きょう") {
-    for candidate in result.candidates {
-        println!("{} (score: {})", candidate.surface, candidate.score);
-    }
-}
-
-// 前方一致検索
-let results = dict.common_prefix_search("きょうと");
-```
-
-## Models
-
-モデルは`models.toml`で定義されています。`Backend::from_variant_id()`で指定すると自動的にダウンロードされます。
-
-| バリアントID | パラメータ数 | 量子化 | デフォルト |
-|------------|-----------|--------------|---------|
+| バリアントID | パラメータ数 | 量子化 | 既定 |
+|---|---|---|---|
 | `jinen-v1-xsmall-q5` | 26M | Q5_K_M | |
 | `jinen-v1-small-q5` | 90M | Q5_K_M | Yes |
 
-### jinen Format
+### jinen 形式
 
-モデルはPrivate Use Areaの特殊Unicodeトークンを使用するjinen形式でトレーニングされています。
-この形式は[zenzai](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/zenzai.md)のかな漢字変換モデル「zenz」の第3世代（zenz-v3）フォーマットを参考にしています。
-zenz-v3ではコンテキストを前置する `\uEE02<context>\uEE00<input_katakana>\uEE01<output></s>` 方式を推奨しており、jinen形式も同じトークン配置を採用しています。
+モデルは Private Use Area の特殊Unicodeトークンを使う jinen 形式で学習されています。この形式は [zenzai](https://github.com/azooKey/AzooKeyKanaKanjiConverter/blob/main/Docs/zenzai.md) のかな漢字変換モデル zenz の第3世代（zenz-v3）フォーマットを参考にしており、同じトークン配置を採用しています。
 
 | トークン | Unicode | 用途 |
-|-------|---------|---------|
+|---|---|---|
 | INPUT_START | U+EE00 | カタカナ入力開始 |
 | OUTPUT_START | U+EE01 | 漢字出力開始 |
 | CONTEXT | U+EE02 | 左コンテキストマーカー |
 
-プロンプト形式：`{CONTEXT}<context>{INPUT_START}<katakana>{OUTPUT_START}`
+プロンプト形式: `{CONTEXT}<context>{INPUT_START}<katakana>{OUTPUT_START}`
 
 ## License
 

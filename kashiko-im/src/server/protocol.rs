@@ -185,6 +185,11 @@ pub enum Action {
     },
     UpdateAux {
         text: String,
+        /// Whether the aux line is a button the user can click to run another,
+        /// wider inference pass. Plain status text (`推論中…`, mode changes) is
+        /// not, and must not look clickable.
+        #[serde(default)]
+        button: bool,
     },
     HideAux,
 }

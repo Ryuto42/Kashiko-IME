@@ -406,3 +406,15 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod thread_safety {
+    /// The deep search runs on a worker thread sharing this converter with the
+    /// main loop, so both must be able to hold it at once. Nothing here mutates
+    /// the model: every inference call builds its own llama.cpp context.
+    #[test]
+    fn the_converter_can_be_shared_across_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<super::KanaKanjiConverter>();
+    }
+}

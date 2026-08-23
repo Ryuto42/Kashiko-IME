@@ -65,6 +65,14 @@ __pycache__/
 user_dict.txt
 user_dictionary/
 learning_cache/
+# The real names the app uses. `learning_cache/` and `user_dictionary/` above
+# match neither, so a cache copied into the repo to debug something — the
+# obvious thing to do — would have been committed by `git add .`. The live files
+# live in ~/Library and never inside the tree, but the foot-gun is worth closing:
+# learning.tsv is a record of everything the user has typed.
+learning.tsv
+learning.key
+user_dicts/
 custom_dict/
 private/
 secret/

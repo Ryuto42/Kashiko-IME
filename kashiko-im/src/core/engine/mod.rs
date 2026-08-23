@@ -5,6 +5,7 @@
 
 mod chunk;
 mod conversion;
+pub use conversion::{DeepSearchJob, DeepSearchOutcome, run_deep_job};
 mod cursor;
 mod display;
 mod init;
@@ -169,8 +170,14 @@ pub struct InputMethodEngine {
     /// asynchronously as an `update_candidates` notification without ever
     /// blocking typing or candidate selection.
     deep_search: Option<DeepSearchRequest>,
-    /// The in-flight deep search, if one is running.
-    deep_job: Option<conversion::DeepSearchJob>,
+    /// Whether a deep search is out with the worker. It runs off this thread,
+    /// so the engine only tracks that one is in flight — no key event ever
+    /// waits behind a model call.
+    deep_running: bool,
+    /// Raised when the conversion a running deep search belongs to is gone, so
+    /// the worker can stop instead of finishing work nobody will see. Replaced
+    /// (not cleared) per job, so a job already in flight keeps its own flag.
+    deep_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Best per-character NLL seen by the quick pass's quality gate for the
     /// conversion currently on screen. Reused as the bar the deep search's
     /// findings must clear, so they are judged against the true best reading
@@ -183,6 +190,9 @@ pub struct InputMethodEngine {
     /// somewhere harmless — deleting a candidate now writes through immediately,
     /// and a test doing that must not touch the user's own cache.
     pub(super) learning_path: Option<std::path::PathBuf>,
+    /// Inference rounds already run for the conversion on screen, so the aux
+    /// button escalates instead of repeating. Reset by every new conversion.
+    deep_round: usize,
     /// The last committed conversion `(reading, surface)`, kept for exactly
     /// one following key so Ctrl+Backspace can take it back into conversion
     /// mode (undo commit / reconversion). Cleared by any other key.
@@ -242,6 +252,12 @@ struct DeepSearchRequest {
     /// itself when the user resizes the segment again.
     scope: usize,
     kind: DeepSearchKind,
+    /// How many times inference has been asked for on this conversion. Round 0
+    /// is the automatic pass; each press of the aux button raises it, and
+    /// `build_deep_job` spends the extra rounds on wider beams and a higher
+    /// result cap. Without this the button would re-run the identical search
+    /// and find the same things.
+    round: usize,
 }
 
 impl InputMethodEngine {
@@ -268,9 +284,11 @@ impl InputMethodEngine {
             last_key_was_backspace: false,
             learning: None,
             deep_search: None,
-            deep_job: None,
+            deep_running: false,
+            deep_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_quality_best: None,
             learning_path: None,
+            deep_round: 0,
             last_commit: None,
             committed_tail: String::new(),
             tail_text: None,
@@ -340,6 +358,8 @@ impl InputMethodEngine {
     /// the session. fcitx5 may send reset events between activate
     /// and the first keyEvent, which would wipe the context.
     pub fn reset(&mut self) {
+        // Whatever the deep search was working on is gone.
+        self.cancel_deep_search();
         self.state = InputState::Empty;
         self.converters.romaji.reset();
         self.input_mode = InputMode::Hiragana;

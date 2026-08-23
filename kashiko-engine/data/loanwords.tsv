@@ -1,0 +1,433 @@
+# Katakana loanwords that are normally wanted in Latin script.
+#
+# Two columns, tab-separated: katakana reading, English spelling. Only words
+# whose English form a Japanese writer actually reaches for belong here —
+# engineering vocabulary and business terms that are usually written in Latin
+# script even in Japanese prose. Everyday loanwords that read naturally in
+# katakana (パン, コーヒー, テレビ) are deliberately absent: offering `bread`
+# for パン would be noise.
+#
+# One entry per reading. Lines starting with # and blank lines are ignored.
+
+# --- version control / collaboration ---
+リポジトリ	repository
+レポジトリ	repository
+コミット	commit
+ブランチ	branch
+マージ	merge
+リベース	rebase
+プルリクエスト	pull request
+プルリク	pull request
+クローン	clone
+フォーク	fork
+コンフリクト	conflict
+スタッシュ	stash
+タグ	tag
+イシュー	issue
+チェックアウト	checkout
+リモート	remote
+ローカル	local
+プッシュ	push
+プル	pull
+ディフ	diff
+パッチ	patch
+リリース	release
+マイルストーン	milestone
+
+# --- build / deploy / ops ---
+ビルド	build
+デプロイ	deploy
+デプロイメント	deployment
+コンパイル	compile
+リンク	link
+パイプライン	pipeline
+ワークフロー	workflow
+ジョブ	job
+ランナー	runner
+ステージング	staging
+プロダクション	production
+ロールバック	rollback
+オーケストレーション	orchestration
+コンテナ	container
+イメージ	image
+クラスタ	cluster
+クラスター	cluster
+ノード	node
+ポッド	pod
+レプリカ	replica
+スケーリング	scaling
+オートスケール	autoscale
+プロビジョニング	provisioning
+インフラ	infrastructure
+インフラストラクチャ	infrastructure
+モニタリング	monitoring
+メトリクス	metrics
+トレース	trace
+アラート	alert
+ダッシュボード	dashboard
+ログ	log
+ロギング	logging
+ヘルスチェック	health check
+アップタイム	uptime
+ダウンタイム	downtime
+レイテンシ	latency
+スループット	throughput
+ボトルネック	bottleneck
+
+# --- code structure ---
+テンプレート	template
+フレームワーク	framework
+ライブラリ	library
+パッケージ	package
+モジュール	module
+コンポーネント	component
+インターフェース	interface
+インターフェイス	interface
+クラス	class
+メソッド	method
+プロパティ	property
+フィールド	field
+パラメータ	parameter
+パラメーター	parameter
+アトリビュート	attribute
+コンストラクタ	constructor
+デストラクタ	destructor
+オーバーライド	override
+オーバーロード	overload
+ジェネリクス	generics
+トレイト	trait
+ミックスイン	mixin
+デコレータ	decorator
+アノテーション	annotation
+マクロ	macro
+イテレータ	iterator
+クロージャ	closure
+ラムダ	lambda
+コールバック	callback
+プロミス	promise
+フック	hook
+ミドルウェア	middleware
+プラグイン	plugin
+アダプタ	adapter
+ラッパー	wrapper
+ファクトリ	factory
+シングルトン	singleton
+リファクタリング	refactoring
+リファクタ	refactor
+デザインパターン	design pattern
+アーキテクチャ	architecture
+ボイラープレート	boilerplate
+スニペット	snippet
+スケルトン	skeleton
+スタブ	stub
+モック	mock
+フィクスチャ	fixture
+
+# --- data / storage ---
+データベース	database
+テーブル	table
+カラム	column
+レコード	record
+ロー	row
+クエリ	query
+インデックス	index
+スキーマ	schema
+マイグレーション	migration
+トランザクション	transaction
+ロック	lock
+コネクション	connection
+コネクションプール	connection pool
+キャッシュ	cache
+バッファ	buffer
+ストレージ	storage
+バケット	bucket
+パーティション	partition
+シャード	shard
+バックアップ	backup
+リストア	restore
+ダンプ	dump
+シード	seed
+プライマリキー	primary key
+フォーリンキー	foreign key
+ジョイン	join
+アグリゲーション	aggregation
+インメモリ	in-memory
+
+# --- network / API ---
+サーバー	server
+サーバ	server
+クライアント	client
+プロトコル	protocol
+エンドポイント	endpoint
+リクエスト	request
+レスポンス	response
+ヘッダー	header
+ヘッダ	header
+ボディ	body
+ペイロード	payload
+ステータスコード	status code
+ソケット	socket
+ポート	port
+ホスト	host
+ドメイン	domain
+サブドメイン	subdomain
+ゲートウェイ	gateway
+プロキシ	proxy
+リバースプロキシ	reverse proxy
+ロードバランサ	load balancer
+ファイアウォール	firewall
+タイムアウト	timeout
+リトライ	retry
+スロットリング	throttling
+レートリミット	rate limit
+ウェブフック	webhook
+ストリーミング	streaming
+ポーリング	polling
+ハンドシェイク	handshake
+ブロードキャスト	broadcast
+バンドル	bundle
+ペイロードサイズ	payload size
+
+# --- security / auth ---
+セキュリティ	security
+プライバシー	privacy
+オーセンティケーション	authentication
+オーソライゼーション	authorization
+アカウント	account
+パスワード	password
+パスフレーズ	passphrase
+トークン	token
+セッション	session
+クッキー	cookie
+クレデンシャル	credential
+シークレット	secret
+ハッシュ	hash
+ソルト	salt
+エンクリプション	encryption
+サイン	sign
+シグネチャ	signature
+サニタイズ	sanitize
+バリデーション	validation
+エスケープ	escape
+インジェクション	injection
+パーミッション	permission
+ロール	role
+スコープ	scope
+ログイン	login
+ログアウト	logout
+サインイン	sign in
+サインアウト	sign out
+サインアップ	sign up
+ワンタイムパスワード	one-time password
+ツーファクタ	two-factor
+
+# --- runtime concepts ---
+プロセス	process
+スレッド	thread
+コルーチン	coroutine
+スタック	stack
+キュー	queue
+ヒープ	heap
+ポインタ	pointer
+リファレンス	reference
+インスタンス	instance
+オブジェクト	object
+ステート	state
+コンテキスト	context
+ミュータブル	mutable
+イミュータブル	immutable
+シリアライズ	serialize
+デシリアライズ	deserialize
+エンコード	encode
+デコード	decode
+パース	parse
+パーサ	parser
+トークナイザ	tokenizer
+コンパイラ	compiler
+インタプリタ	interpreter
+ランタイム	runtime
+ガベージコレクション	garbage collection
+メモリリーク	memory leak
+セグメンテーションフォルト	segmentation fault
+デッドロック	deadlock
+レースコンディション	race condition
+オーバーフロー	overflow
+アンダーフロー	underflow
+バイナリ	binary
+バイト	byte
+ビット	bit
+エンディアン	endian
+アライメント	alignment
+
+# --- front end ---
+レンダリング	rendering
+レイアウト	layout
+スタイル	style
+テーマ	theme
+ダークモード	dark mode
+ルーティング	routing
+ルーター	router
+ナビゲーション	navigation
+モーダル	modal
+ツールチップ	tooltip
+プレースホルダ	placeholder
+アニメーション	animation
+トランジション	transition
+レスポンシブ	responsive
+ビューポート	viewport
+アクセシビリティ	accessibility
+バンドラ	bundler
+トランスパイル	transpile
+ホットリロード	hot reload
+サーバーサイドレンダリング	server-side rendering
+
+# --- testing / quality ---
+テスト	test
+ユニットテスト	unit test
+インテグレーションテスト	integration test
+リグレッション	regression
+カバレッジ	coverage
+アサーション	assertion
+デバッグ	debug
+デバッガ	debugger
+ブレークポイント	breakpoint
+スタックトレース	stack trace
+リント	lint
+リンター	linter
+フォーマッタ	formatter
+ベンチマーク	benchmark
+プロファイリング	profiling
+バグ	bug
+フィックス	fix
+ワークアラウンド	workaround
+エッジケース	edge case
+ハッピーパス	happy path
+
+# --- tooling ---
+コマンド	command
+オプション	option
+フラグ	flag
+サブコマンド	subcommand
+スクリプト	script
+シェル	shell
+ターミナル	terminal
+コンソール	console
+ディレクトリ	directory
+ファイル	file
+パス	path
+シンボリックリンク	symbolic link
+アーカイブ	archive
+エクスポート	export
+インポート	import
+インストール	install
+アンインストール	uninstall
+アップデート	update
+アップグレード	upgrade
+ダウングレード	downgrade
+ダウンロード	download
+アップロード	upload
+マウント	mount
+プロンプト	prompt
+エイリアス	alias
+リダイレクト	redirect
+パイプ	pipe
+ワイルドカード	wildcard
+リポジトリミラー	repository mirror
+
+# --- AI / data science ---
+モデル	model
+トレーニング	training
+ファインチューニング	fine-tuning
+インファレンス	inference
+トークナイゼーション	tokenization
+エンベディング	embedding
+ベクトル	vector
+テンソル	tensor
+レイヤー	layer
+ニューラルネットワーク	neural network
+トランスフォーマー	transformer
+アテンション	attention
+バッチ	batch
+エポック	epoch
+ロス	loss
+グラディエント	gradient
+オプティマイザ	optimizer
+オーバーフィッティング	overfitting
+データセット	dataset
+ラベル	label
+アノテーター	annotator
+パイプライン処理	pipeline
+ハイパーパラメータ	hyperparameter
+ベースライン	baseline
+リランキング	reranking
+ビームサーチ	beam search
+
+# --- project / business ---
+プロジェクト	project
+タスク	task
+サブタスク	subtask
+チケット	ticket
+バックログ	backlog
+スプリント	sprint
+スクラム	scrum
+カンバン	kanban
+マイルストン	milestone
+デッドライン	deadline
+スケジュール	schedule
+ミーティング	meeting
+アジェンダ	agenda
+フィードバック	feedback
+レビュー	review
+ドキュメント	document
+ドキュメンテーション	documentation
+マニュアル	manual
+スペック	spec
+リクワイアメント	requirement
+ロードマップ	roadmap
+ステークホルダー	stakeholder
+オーナー	owner
+アサイン	assign
+プライオリティ	priority
+ステータス	status
+プログレス	progress
+ブロッカー	blocker
+リスク	risk
+コスト	cost
+バジェット	budget
+リソース	resource
+キャパシティ	capacity
+パフォーマンス	performance
+クオリティ	quality
+スコープクリープ	scope creep
+オンボーディング	onboarding
+ワークショップ	workshop
+レトロスペクティブ	retrospective
+ポストモーテム	postmortem
+
+# --- product / users ---
+プロダクト	product
+サービス	service
+フィーチャー	feature
+ユースケース	use case
+ユーザー	user
+ユーザ	user
+カスタマー	customer
+ペルソナ	persona
+セグメント	segment
+ターゲット	target
+コンバージョン	conversion
+リテンション	retention
+チャーン	churn
+エンゲージメント	engagement
+サブスクリプション	subscription
+ライセンス	license
+トライアル	trial
+フリーミアム	freemium
+ローンチ	launch
+ベータ	beta
+アルファ	alpha
+マイグレート	migrate
+デプリケート	deprecate
+サポート	support
+エスカレーション	escalation
+サービスレベル	service level

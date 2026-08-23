@@ -80,6 +80,13 @@ class EngineClient {
             method: "forget_candidate", params: ["page_index": pageIndex], timeout: 1.0)
     }
 
+    /// Run another, wider inference pass over the conversion on screen (the
+    /// aux-line button). Findings arrive later as an `update_candidates`
+    /// notification, so the response only carries the progress message.
+    func deepenInferenceSync() -> KeyResult? {
+        keyResultSync(method: "deepen_inference", params: [:], timeout: 1.0)
+    }
+
     func saveLearningAsync() {
         sendRequest(method: "save_learning", params: [:]) { _ in }
     }

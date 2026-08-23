@@ -24,6 +24,10 @@ pub enum EngineAction {
     DeleteSurrounding(String),
     /// Update auxiliary text (e.g., reading hint, mode indicator)
     UpdateAuxText(String),
+    /// Aux line rendered as a button: clicking it runs another inference pass
+    /// (`deepen_inference`). Kept separate from `UpdateAuxText` so ordinary
+    /// status text never looks clickable.
+    UpdateAuxButton(String),
     /// Hide auxiliary text
     HideAuxText,
 }
@@ -139,7 +143,10 @@ pub(in crate::core) struct Converters {
     /// Romaji to hiragana converter
     pub romaji: RomajiConverter,
     /// Kanji converter (lazy loaded)
-    pub kanji: Option<KanaKanjiConverter>,
+    /// Behind an `Arc` so the deep-search worker thread can hold it at the same
+    /// time as the main loop: inference takes `&self` and builds its own
+    /// llama.cpp context per call, so sharing needs no lock.
+    pub kanji: Option<std::sync::Arc<KanaKanjiConverter>>,
     /// Light model for beam search
     pub light_kanji: Option<KanaKanjiConverter>,
     /// Candidate rewriters (half-width katakana, symbol variants)

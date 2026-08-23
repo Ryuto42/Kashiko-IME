@@ -1333,6 +1333,7 @@ dependencies = [
  "criterion",
  "hf-hub",
  "llama-cpp-2",
+ "ring",
  "serde",
  "serde_json",
  "serde_yaml",

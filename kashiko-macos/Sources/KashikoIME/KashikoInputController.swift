@@ -28,8 +28,8 @@ class KashikoInputController: IMKInputController {
                     cursorRect: nil,
                     liveMode: false
                 )
-            case .updateAux(let text):
-                candidateWindow.setAux(text)
+            case .updateAux(let text, let button):
+                candidateWindow.setAux(text, isButton: button)
             case .hideAux:
                 candidateWindow.setAux(nil)
             default:
@@ -143,8 +143,9 @@ class KashikoInputController: IMKInputController {
 
         for action in actions {
             switch action {
-            case .updateAux(let text):
-                Self.candidateWindow.setAux(text, deferRender: updatesCandidates)
+            case .updateAux(let text, let button):
+                Self.candidateWindow.setAux(
+                    text, deferRender: updatesCandidates, isButton: button)
             case .hideAux:
                 Self.candidateWindow.setAux(nil, deferRender: updatesCandidates)
             default:
