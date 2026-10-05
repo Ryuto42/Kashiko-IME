@@ -55,8 +55,9 @@ pub struct Span {
 /// what lets a caller swap one word for a homophone without disturbing the rest
 /// of the sentence.
 pub fn align(reading: &str, converted: &str) -> Option<Vec<Span>> {
-    let r: Vec<char> = reading.chars().collect();
-    let c: Vec<char> = converted.chars().collect();
+    let r: Vec<char> = crate::katakana_to_hiragana(reading).chars().collect();
+    // Katakana words (`イメージ`) are matched against their hiragana reading.
+    let c: Vec<char> = crate::katakana_to_hiragana(converted).chars().collect();
     if r.is_empty() {
         return None;
     }
@@ -183,6 +184,12 @@ mod tests {
             boundaries_from_conversion("わたしはがっこうにいきます", "私は学校に行きます")
                 .expect("should align");
         assert_eq!(bounds, vec![4, 9, 13]);
+    }
+
+    #[test]
+    fn katakana_words_anchor_against_their_hiragana_reading() {
+        let bounds = boundaries_from_conversion("いめーじのしゅうたいせい", "イメージの集大成");
+        assert_eq!(bounds, Some(vec![5, 12]));
     }
 
     #[test]

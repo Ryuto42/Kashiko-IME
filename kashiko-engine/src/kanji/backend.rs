@@ -30,6 +30,25 @@ pub fn build_jinen_prompt(katakana: &str, context: &str) -> String {
     )
 }
 
+/// `right` (text after the cursor) split into its leading hiragana run, which
+/// can join the reading, and the following text up to the end of the sentence.
+pub fn split_right_context(right: &str) -> (String, String) {
+    const MAX_KANA: usize = 8;
+    const MAX_REST: usize = 12;
+    let kana: String = right
+        .chars()
+        .take_while(|c| ('\u{3041}'..='\u{3096}').contains(c))
+        .take(MAX_KANA)
+        .collect();
+    let rest: String = right
+        .chars()
+        .skip(kana.chars().count())
+        .take_while(|c| !"。！？!?\n".contains(*c))
+        .take(MAX_REST)
+        .collect();
+    (kana, rest)
+}
+
 /// Clean model output by trimming whitespace.
 ///
 /// Special tokens (BOS/EOS) are handled at the decode level via
@@ -45,6 +64,7 @@ pub struct Backend {
     tokenizer_json_path: String,
     /// Display name for the model (variant id for registry models, "custom" for GGUF paths)
     display_name: String,
+    nfkc_prompt: bool,
 }
 
 impl Backend {
@@ -58,6 +78,7 @@ impl Backend {
             gguf_path: path.to_string_lossy().to_string(),
             tokenizer_json_path: tokenizer_path.to_string_lossy().to_string(),
             display_name: variant.id.clone(),
+            nfkc_prompt: family.nfkc_prompt,
         })
     }
 
@@ -87,7 +108,8 @@ impl KanaKanjiConverter {
 
     /// Create a new converter with the specified backend and configuration
     pub fn with_config(backend: Backend, config: ConversionConfig) -> Result<Self> {
-        let model = LlamaCppModel::from_file(&backend.gguf_path, &backend.tokenizer_json_path)?;
+        let mut model = LlamaCppModel::from_file(&backend.gguf_path, &backend.tokenizer_json_path)?;
+        model.set_nfkc(backend.nfkc_prompt);
         Ok(KanaKanjiConverter {
             model,
             config,
@@ -134,7 +156,7 @@ impl KanaKanjiConverter {
                 .generate(&tokens, self.config.max_new_tokens, eos)?;
             let generated = &output_tokens[tokens.len()..];
             let text = self.model.decode(generated, true)?;
-            let clean = clean_model_output(&text);
+            let clean = self.restore_width(reading, clean_model_output(&text));
 
             if !clean.is_empty() {
                 candidates.push(clean);
@@ -150,7 +172,7 @@ impl KanaKanjiConverter {
 
             for (output_tokens, _score) in results {
                 let text = self.model.decode(&output_tokens, true)?;
-                let clean = clean_model_output(&text);
+                let clean = self.restore_width(reading, clean_model_output(&text));
 
                 if !clean.is_empty() && !candidates.contains(&clean) {
                     candidates.push(clean);
@@ -164,6 +186,29 @@ impl KanaKanjiConverter {
         }
 
         Ok(candidates)
+    }
+
+    /// An NFKC model answers in NFKC form (`(` for a typed `（`); map such
+    /// characters back to the form the reading used.
+    fn restore_width(&self, reading: &str, text: String) -> String {
+        if !self.model.nfkc() {
+            return text;
+        }
+        let map: std::collections::HashMap<char, char> = reading
+            .chars()
+            .filter_map(|c| {
+                let n = crate::kana::normalize_nfkc(c.encode_utf8(&mut [0; 4]));
+                let mut it = n.chars();
+                match (it.next(), it.next()) {
+                    (Some(n), None) if n != c => Some((n, c)),
+                    _ => None,
+                }
+            })
+            .collect();
+        if map.is_empty() {
+            return text;
+        }
+        text.chars().map(|c| map.get(&c).copied().unwrap_or(c)).collect()
     }
 
     /// Convert for live display, retrying with a small beam only when greedy
@@ -187,7 +232,7 @@ impl KanaKanjiConverter {
             self.model
                 .generate_greedy_scored(&tokens, self.config.max_new_tokens, eos)?;
         let generated = &out_tokens[tokens.len()..];
-        let greedy = clean_model_output(&self.model.decode(generated, true)?);
+        let greedy = self.restore_width(reading, clean_model_output(&self.model.decode(generated, true)?));
 
         // Normalize per output character so the threshold means the same thing
         // for a two-character word and a whole clause.
@@ -218,7 +263,7 @@ impl KanaKanjiConverter {
         let rescued = beams
             .iter()
             .filter_map(|(toks, score)| {
-                let text = clean_model_output(&self.model.decode(toks, true).ok()?);
+                let text = self.restore_width(reading, clean_model_output(&self.model.decode(toks, true).ok()?));
                 (!text.is_empty()).then(|| (text, *score))
             })
             .max_by(|a, b| a.1.total_cmp(&b.1))
@@ -284,6 +329,51 @@ impl KanaKanjiConverter {
         Ok(candidates
             .iter()
             .map(|cand| scorer.compute_nll_detail(&katakana, cand, context).ok())
+            .collect())
+    }
+
+    /// Total NLL of each candidate with the text after the cursor (`right`)
+    /// taken into account; lower is better. Comparable only within one call.
+    ///
+    /// The model has no slot for right context, so it is used in two ways.
+    /// Leading hiragana of `right` (okurigana and particles: `ている`, `が`) is
+    /// appended to both the reading and the candidate, which the model reads
+    /// exactly. What follows is scored as the continuation of the context slot
+    /// after the candidate, weighted down because the model is weaker there:
+    /// that is what tells 記者 (`が取材に来た`) from 汽車 (`が駅に着いた`).
+    ///
+    /// Each score is `(per-char NLL of the candidate and that hiragana, total)`;
+    /// the first is how plausible the candidate is on its own.
+    pub fn score_with_right_context(
+        &self,
+        reading: &str,
+        left: &str,
+        candidates: &[String],
+        right: &str,
+    ) -> Result<Vec<Option<(f32, f32)>>> {
+        const CONTINUATION_WEIGHT: f32 = 0.5;
+        let (kana, rest) = split_right_context(right);
+        let rest_counts = rest
+            .chars()
+            .filter(|c| !c.is_ascii_punctuation() && !"、，,・「」『』（）".contains(*c))
+            .count()
+            >= 2;
+        let mut scorer = super::llamacpp::NllScorer::new(&self.model, 512)?;
+        let katakana = hiragana_to_katakana(&format!("{reading}{kana}"));
+        Ok(candidates
+            .iter()
+            .map(|cand| {
+                let ext = format!("{cand}{kana}");
+                let mean = scorer.compute_nll_detail(&katakana, &ext, left).ok()?.mean;
+                let base = mean * ext.chars().count() as f32;
+                if !rest_counts {
+                    return Some((mean, base));
+                }
+                let cont = scorer
+                    .compute_continuation_nll(&format!("{left}{ext}"), &rest)
+                    .ok()?;
+                Some((mean, base + CONTINUATION_WEIGHT * cont * rest.chars().count() as f32))
+            })
             .collect())
     }
 

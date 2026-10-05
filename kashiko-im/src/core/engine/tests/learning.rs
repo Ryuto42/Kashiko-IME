@@ -41,16 +41,12 @@ fn build_candidates_includes_learning_when_not_skipped() {
 fn build_candidates_omits_learning_when_skipped() {
     let mut engine = engine_with_learned("あい", "藍");
 
-    let texts: Vec<String> = engine
-        .build_conversion_candidates("あい", 9, true, None, true)
-        .into_iter()
-        .map(|c| c.text)
-        .collect();
-
+    // Judged by source: a model that is loaded may offer 藍 on its own.
+    let cands = engine.build_conversion_candidates("あい", 9, true, None, true);
     assert!(
-        !texts.contains(&"藍".to_string()),
+        cands.iter().all(|c| c.source != CandidateSource::Learning),
         "Tab path (skip_learning=true) must drop learned `藍`, got {:?}",
-        texts,
+        cands.iter().map(|c| (&c.text, &c.source)).collect::<Vec<_>>(),
     );
 }
 

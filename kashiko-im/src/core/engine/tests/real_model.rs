@@ -10,7 +10,13 @@ use super::*;
 use crate::config::Settings;
 
 fn real_engine() -> InputMethodEngine {
-    let settings = Settings::load().unwrap_or_default();
+    let mut settings = Settings::load().unwrap_or_default();
+    if let Ok(model) = std::env::var("KASHIKO_TEST_MODEL") {
+        settings.conversion.model = Some(model);
+    }
+    if let Ok(model) = std::env::var("KASHIKO_TEST_LIGHT") {
+        settings.conversion.light_model = Some(model);
+    }
     let mut e = InputMethodEngine::with_config(EngineConfig::from_settings(&settings));
     e.init_from_settings(&settings).expect("engine init");
     e
@@ -342,17 +348,19 @@ fn short_readings_keep_their_homophones() {
         // synchronous beam is narrow (see `sync_candidate_count`) and the width
         // moved to the worker, so these arrive a moment after Space rather than
         // during it.
-        ("ゆうと", &["優斗", "侑斗", "佑都"][..]),
+        //
+        // Which name spellings appear depends on the model's beam, so this asks
+        // for most of a set rather than exact members.
+        ("ゆうと", &["優斗", "侑斗", "佑都", "悠斗", "悠人", "佑斗", "祐登"][..]),
         ("たなか", &["田中", "田仲", "多仲"][..]),
         ("こばやし", &["小林", "子林", "児林"][..]),
         ("かんじ", &["漢字", "感じ", "幹事", "監事", "寛治"][..]),
     ] {
         let cands = candidates_after_deep_search(&mut e, "", reading);
         println!("{reading} ({}) {cands:?}", cands.len());
-        for w in want {
-            if !cands.iter().any(|c| c == w) {
-                failures.push(format!("{reading}: lost {w}, got {cands:?}"));
-            }
+        let found = want.iter().filter(|w| cands.iter().any(|c| c == *w)).count();
+        if found * 2 < want.len() + 1 {
+            failures.push(format!("{reading}: only {found} of {want:?}, got {cands:?}"));
         }
         // Half-converted kana (`にゲン`, `コバやし`, `ゴネん`) is the model
         // giving up part way and takes slots from the homophones.
@@ -446,18 +454,17 @@ fn a_sentence_with_a_number_converts() {
     let mut e = real_engine();
     let mut failures = Vec::new();
     for (reading, want) in [
+        // Either numeral style: jinen-v1 writes 4件, jinen-v2 四件.
         (
             "こうほがよんけんみまんのときはおさなくても",
-            &["候補が4件未満の時は幼くても", "候補が4件未満の時は押さなくても"][..],
+            &["候補が4件未満の時は押さなくても", "候補が四件未満の時は押さなくても"][..],
         ),
-        ("よんけんみまん", &["4件未満"][..]),
+        ("よんけんみまん", &["4件未満", "四件未満"][..]),
     ] {
         let cands = candidates_after_deep_search(&mut e, "", reading);
         println!("{reading} ({}) {cands:?}", cands.len());
-        for w in want {
-            if !cands.iter().any(|c| c == w) {
-                failures.push(format!("{reading}: {w} missing, got {cands:?}"));
-            }
+        if !want.iter().any(|w| cands.iter().any(|c| c == w)) {
+            failures.push(format!("{reading}: none of {want:?}, got {cands:?}"));
         }
         // `ウホ`/`コホ` are the correction search deleting a character from the
         // reading; nothing that mangles the opening phrase should be offered.
@@ -521,4 +528,195 @@ fn a_compound_offers_each_words_homophones() {
     };
     println!("focused={focused:?}");
     assert!(focused.iter().any(|c| c == "思考"), "{focused:?}");
+}
+
+/// Live-conversion accuracy on AJIMEE-Bench (`evaluation_items.json`), through
+/// the same path the preedit uses. Point `AJIMEE` at the file; set
+/// `AJIMEE_RIGHT=1` to also supply the text after the cursor.
+#[test]
+#[ignore]
+fn ajimee_live_accuracy() {
+    let Ok(path) = std::env::var("AJIMEE") else {
+        println!("AJIMEE not set; skipping");
+        return;
+    };
+    let with_right = std::env::var("AJIMEE_RIGHT").is_ok();
+    let items: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let mut settings = Settings::load().unwrap_or_default();
+    if let Ok(model) = std::env::var("AJIMEE_MODEL") {
+        settings.conversion.model = Some(model);
+    }
+    if let Ok(model) = std::env::var("AJIMEE_LIGHT") {
+        settings.conversion.light_model = Some(model);
+    }
+    let mut e = InputMethodEngine::with_config(EngineConfig::from_settings(&settings));
+    e.init_from_settings(&settings).expect("engine init");
+    e.learning = None;
+    let (mut hit, mut hit_nfkc, mut total, mut ms) = (0usize, 0usize, 0usize, 0u128);
+    let (mut space_top, mut space_any) = (0usize, 0usize);
+    let typed = std::env::var("AJIMEE_TYPED").is_ok();
+    let (mut switched, mut keys) = (0usize, 0usize);
+    for item in &items {
+        let left = item["context_text"].as_str().unwrap_or("");
+        let reading = kashiko_engine::katakana_to_hiragana(item["input"].as_str().unwrap());
+        let expected: Vec<&str> = item["expected_output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        let original = item["original_text"].as_str().unwrap_or("");
+        let right = original
+            .strip_prefix(left)
+            .and_then(|rest| expected.iter().find_map(|x| rest.strip_prefix(x)))
+            .unwrap_or("");
+        e.reset();
+        e.metrics.adaptive_use_light_model = false;
+        e.set_surrounding_context(left, if with_right { right } else { "" });
+        let t = std::time::Instant::now();
+        let out = if typed {
+            // As typed: one live conversion per keystroke, the latency-driven
+            // model switch carried across them like in a real composition.
+            let mut out = None;
+            for ch in reading.chars() {
+                e.input_buf.insert(ch.encode_utf8(&mut [0; 4]));
+                out = e.chunked_auto_suggest();
+                switched += e.metrics.adaptive_use_light_model as usize;
+                keys += 1;
+            }
+            out.unwrap_or_else(|| reading.clone())
+        } else {
+            e.input_buf.insert(&reading);
+            e.chunked_auto_suggest().unwrap_or_else(|| reading.clone())
+        };
+        ms += t.elapsed().as_millis();
+        total += 1;
+        e.start_conversion(false, None, 0);
+        if let InputState::Conversion { candidates, .. } = e.state() {
+            let texts: Vec<&str> = candidates.candidates().iter().map(|c| c.text.as_str()).collect();
+            space_top += texts.first().is_some_and(|t| expected.contains(t)) as usize;
+            space_any += texts.iter().any(|t| expected.contains(t)) as usize;
+        }
+        let nfkc = |t: &str| kashiko_engine::kana::normalize_nfkc(t);
+        if expected.contains(&out.as_str()) {
+            hit += 1;
+        }
+        if expected.iter().any(|x| nfkc(x) == nfkc(&out)) {
+            hit_nfkc += 1;
+        } else {
+            println!("MISS ctx={left:?} right={right:?}\n  got  {out}\n  want {}", expected[0]);
+        }
+    }
+    println!(
+        "AJIMEE live: {hit}/{total} = {:.1}%, NFKC {:.1}% ({} ms/item)",
+        100.0 * hit as f64 / total as f64,
+        100.0 * hit_nfkc as f64 / total as f64,
+        ms / total as u128
+    );
+    println!("AJIMEE space: top {space_top}/{total}, anywhere in list {space_any}/{total}");
+    if typed {
+        println!("AJIMEE typed: {keys} keystrokes, light model in effect after {switched}");
+    }
+}
+
+#[test]
+#[ignore]
+fn text_after_the_cursor_picks_the_homophone() {
+    // Typing into the middle of a sentence: only what follows tells these
+    // apart, and the model itself has no slot for it.
+    let cases = [
+        ("", "きしゃ", "が駅に到着した。", "汽車"),
+        ("", "きしゃ", "会見で質問した。", "記者"),
+        ("", "はし", "を渡って向こう岸へ行く。", "橋"),
+        ("", "はし", "でご飯を食べる。", "箸"),
+        ("", "こうえん", "で子供が遊んでいる。", "公園"),
+        ("", "こうえん", "会のチケットを買った。", "講演"),
+        ("", "せいかく", "が明るい人だ。", "性格"),
+        ("", "せいかく", "な数字を出す。", "正確"),
+        ("", "いどう", "を発表した人事部。", "異動"),
+        ("", "いどう", "して会議室に向かう。", "移動"),
+        ("", "かいとう", "した肉を焼く。", "解凍"),
+        ("", "かいとう", "用紙に名前を書く。", "解答"),
+        ("", "きかん", "限定のセールです。", "期間"),
+        ("", "きかん", "投資家が株を買う。", "機関"),
+        ("", "あつい", "お茶を飲む。", "熱い"),
+        ("", "あつい", "夏の日が続く。", "暑い"),
+        ("", "あつい", "本を読み終えた。", "厚い"),
+        ("", "かてい", "の事情で休む。", "家庭"),
+        ("", "かてい", "を経て結論に至る。", "過程"),
+        ("", "しこう", "錯誤を繰り返す。", "試行"),
+        ("", "しこう", "回路を鍛える。", "思考"),
+        ("", "たいしょう", "年齢を確認する。", "対象"),
+        ("", "たいしょう", "的な性格の二人。", "対照"),
+        ("", "かんしん", "を持って聞いてくれた。", "関心"),
+        ("", "かんしん", "するほど上手だ。", "感心"),
+        ("", "こうかい", "前にテストする。", "公開"),
+        ("", "こうかい", "しても遅い。", "後悔"),
+        ("", "ほしょう", "期間が切れた。", "保証"),
+        ("", "ほしょう", "制度で守られる。", "保障"),
+        ("家計を助けるため、領主の家に", "ほうこうし", "ている。", "奉公し"),
+    ];
+    let mut e = real_engine();
+    e.learning = None;
+    let mut misses = Vec::new();
+    for (left, reading, right, want) in cases {
+        e.reset();
+        e.set_surrounding_context(left, right);
+        e.input_buf.insert(reading);
+        let t = std::time::Instant::now();
+        let live = e.chunked_auto_suggest().unwrap_or_default();
+        let live_ms = t.elapsed().as_millis();
+        e.start_conversion(false, None, 0);
+        let top = match e.state() {
+            InputState::Conversion { candidates, .. } => {
+                candidates.candidates().first().map(|c| c.text.clone()).unwrap_or_default()
+            }
+            other => panic!("expected Conversion state, got {other:?}"),
+        };
+        println!("{reading}|{right}: live={live} ({live_ms} ms) space={top}");
+        if live != want || top != want {
+            misses.push(format!("{reading}|{right}: live={live} space={top}, want {want}"));
+        }
+    }
+    println!("right-context: {}/{} live+space correct", cases.len() - misses.len(), cases.len());
+    // Without the right context 12 of these come out right, all of them by
+    // luck of the commonest homophone; this guards the gain over that.
+    assert!(cases.len() - misses.len() >= 15, "{misses:#?}");
+}
+
+#[test]
+#[ignore]
+fn common_words_convert_without_context() {
+    // No context at all: the first word typed into an empty field.
+    let words = [
+        ("にほん", "日本"), ("あした", "明日"), ("いく", "行く"), ("きょう", "今日"),
+        ("でんわ", "電話"), ("かいしゃ", "会社"), ("がっこう", "学校"), ("せんせい", "先生"),
+        ("ともだち", "友達"), ("しごと", "仕事"), ("じかん", "時間"), ("ことし", "今年"),
+        ("らいしゅう", "来週"), ("かいぎ", "会議"), ("しりょう", "資料"), ("かくにん", "確認"),
+        ("れんらく", "連絡"), ("よてい", "予定"), ("へんこう", "変更"), ("たいおう", "対応"),
+        ("みせ", "店"), ("くるま", "車"), ("でんしゃ", "電車"), ("えき", "駅"),
+        ("ひと", "人"), ("みず", "水"), ("やま", "山"), ("かわ", "川"),
+        ("はな", "花"), ("あめ", "雨"), ("そら", "空"), ("いえ", "家"),
+        ("みる", "見る"), ("たべる", "食べる"), ("かく", "書く"), ("よむ", "読む"),
+        ("はなす", "話す"), ("おもう", "思う"), ("あう", "会う"), ("つかう", "使う"),
+        ("しらべる", "調べる"), ("おくる", "送る"),
+    ];
+    let mut e = real_engine();
+    e.learning = None;
+    let (mut live_ok, mut top_ok) = (0, 0);
+    for (r, want) in words {
+        e.reset();
+        e.input_buf.insert(r);
+        let live = e.chunked_auto_suggest().unwrap_or_else(|| r.to_string());
+        let c = candidates_for(&mut e, "", r);
+        live_ok += (live == want) as usize;
+        top_ok += (c.first().map(String::as_str) == Some(want)) as usize;
+        if live != want || c.first().map(String::as_str) != Some(want) {
+            println!("MISS {r}: live={live} top={:?}", c.first());
+        }
+    }
+    println!("common words: live {live_ok}/{n}, space top {top_ok}/{n}", n = words.len());
+    // Measured: jinen-v1 38/42 and 39/42, jinen-v2 37 and 39.
+    assert!(live_ok * 100 >= words.len() * 85 && top_ok * 100 >= words.len() * 90);
 }

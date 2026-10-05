@@ -68,6 +68,8 @@ pub struct LlamaCppModel {
     external_tokenizer: tokenizers::Tokenizer,
     /// Number of threads for inference (0 = use llama.cpp default)
     n_threads: u32,
+    /// NFKC-normalize text before tokenizing (see `ModelFamily::nfkc_prompt`).
+    nfkc: bool,
 }
 
 impl LlamaCppModel {
@@ -89,6 +91,7 @@ impl LlamaCppModel {
             n_ctx: 256,
             external_tokenizer,
             n_threads: 0,
+            nfkc: false,
         })
     }
 
@@ -132,6 +135,7 @@ impl LlamaCppModel {
             n_ctx: 256,
             external_tokenizer,
             n_threads: 0,
+            nfkc: false,
         })
     }
 
@@ -154,6 +158,7 @@ impl LlamaCppModel {
             n_ctx,
             external_tokenizer,
             n_threads: 0,
+            nfkc: false,
         })
     }
 
@@ -161,6 +166,14 @@ impl LlamaCppModel {
     /// 0 means use llama.cpp default (typically all cores).
     pub fn set_n_threads(&mut self, n: u32) {
         self.n_threads = n;
+    }
+
+    pub fn set_nfkc(&mut self, nfkc: bool) {
+        self.nfkc = nfkc;
+    }
+
+    pub fn nfkc(&self) -> bool {
+        self.nfkc
     }
 
     /// Build LlamaContextParams with configured n_threads
@@ -179,6 +192,13 @@ impl LlamaCppModel {
 
     /// Tokenize a string using the external tokenizer
     pub fn tokenize(&self, text: &str) -> Result<Vec<LlamaToken>> {
+        let normalized;
+        let text = if self.nfkc {
+            normalized = crate::kana::normalize_nfkc(text);
+            normalized.as_str()
+        } else {
+            text
+        };
         let encoding = self
             .external_tokenizer
             .encode(text, false)
@@ -799,6 +819,35 @@ impl<'a> NllScorer<'a> {
     ) -> Result<f32> {
         self.compute_nll_detail(reading_katakana, surface, context)
             .map(|d| d.mean)
+    }
+
+    /// Per-character NLL of `following` as the continuation of the context
+    /// slot holding `preceding` — how naturally the text after the cursor
+    /// reads once a candidate has been placed before it.
+    pub fn compute_continuation_nll(&mut self, preceding: &str, following: &str) -> Result<f32> {
+        let prompt = format!("{}{}", super::CONTEXT_TOKEN, preceding);
+        let full_text = format!("{prompt}{following}");
+        let prompt_tokens = self.model.tokenize(&prompt)?;
+        let full_tokens = self.model.tokenize(&full_text)?;
+        if full_tokens.len() <= prompt_tokens.len() {
+            return Ok(100.0);
+        }
+        self.ctx.clear_kv_cache();
+        let mut batch = LlamaBatch::new(full_tokens.len().max(512), 1);
+        batch
+            .add_sequence(&full_tokens, 0, true)
+            .map_err(|e| KanjiError::Inference(e.into()))?;
+        self.ctx
+            .decode(&mut batch)
+            .map_err(|e| KanjiError::Inference(e.into()))?;
+        let mut total = 0.0f32;
+        for pos in prompt_tokens.len() - 1..full_tokens.len() - 1 {
+            let target = full_tokens[pos + 1].0 as usize;
+            if target < self.vocab_size {
+                total -= log_prob_of(self.ctx.get_logits_ith(pos as i32), target, self.vocab_size);
+            }
+        }
+        Ok(total / following.chars().count().max(1) as f32)
     }
 
     /// As [`Self::compute_nll`], but also reporting the single worst token.

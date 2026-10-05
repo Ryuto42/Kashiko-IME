@@ -76,7 +76,10 @@ cargo test -p kashiko-engine -- --ignored
 | バリアントID | パラメータ数 | 量子化 | 既定 |
 |---|---|---|---|
 | `jinen-v1-xsmall-q5` | 26M | Q5_K_M | |
-| `jinen-v1-small-q5` | 90M | Q5_K_M | Yes |
+| `jinen-v1-small-q5` | 90M | Q5_K_M | |
+| `jinen-v2-small-q5` | 110M | Q5_K_M | Yes |
+| `jinen-v2-xsmall-q5` | — | Q5_K_M | 補助 |
+| `kanakanji-edge-33m-q8` | 33.5M | Q8_0 | |
 
 ### jinen 形式
 

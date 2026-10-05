@@ -204,11 +204,11 @@ class KashikoInputController: IMKInputController {
     }
 
 
-    /// Send the text left of the cursor to the engine as conversion
+    /// Send the text around the cursor to the engine as conversion
     /// context. Gated on `selectedRange` only: `client.length()` is the
     /// least-implemented part of IMKTextInput (it returns 0 even in apps
     /// whose `attributedSubstring` works fine), and the request below is
-    /// capped to 40 UTF-16 units anyway, so document size doesn't matter.
+    /// capped to 80 UTF-16 units each side, so document size doesn't matter.
     /// Whether a client supports this at all is app-dependent (Cocoa text
     /// views do; Electron/Chromium/terminals mostly don't), so the skip
     /// reasons are logged for dogfooding visibility.
@@ -220,7 +220,7 @@ class KashikoInputController: IMKInputController {
         // wrong one. selectedRange flakiness is per-keystroke in some
         // apps, so this also self-heals on the next successful capture.
         let selected = client.selectedRange()
-        guard selected.location != NSNotFound, selected.location > 0 else {
+        guard selected.location != NSNotFound else {
             NSLog("KashikoIME: surrounding text cleared (no usable selection)")
             engineClient.setSurroundingTextAsync(text: "", cursorPos: 0)
             return
@@ -231,23 +231,30 @@ class KashikoInputController: IMKInputController {
         // on the preceding sentence, so a window shorter than one sentence
         // silently defeats context-aware conversion.
         let maxContextUTF16 = 80
-        let start = max(0, selected.location - maxContextUTF16)
-        let range = NSRange(location: start, length: selected.location - start)
         // string(from:actualRange:) rather than attributedSubstring(from:):
         // it's the IMKTextInput document-access method clients actually
         // implement (azooKey-Desktop settled on the same call).
         var actualRange = NSRange()
-        guard let leftContext = client.string(from: range, actualRange: &actualRange),
-            !leftContext.isEmpty
-        else {
+        let start = max(0, selected.location - maxContextUTF16)
+        let leftContext = selected.location > 0
+            ? client.string(
+                from: NSRange(location: start, length: selected.location - start),
+                actualRange: &actualRange) ?? ""
+            : ""
+        // Text after the cursor (past any selection, which typing replaces).
+        // Clients clamp the range at the end of the document.
+        let rightContext = client.string(
+            from: NSRange(location: NSMaxRange(selected), length: maxContextUTF16),
+            actualRange: &actualRange) ?? ""
+        guard !leftContext.isEmpty || !rightContext.isEmpty else {
             NSLog("KashikoIME: surrounding text cleared (string(from:) unavailable)")
             engineClient.setSurroundingTextAsync(text: "", cursorPos: 0)
             return
         }
 
-        NSLog("KashikoIME: surrounding text captured (\(leftContext.count) chars)")
+        NSLog("KashikoIME: surrounding text captured (\(leftContext.count) + \(rightContext.count) chars)")
         engineClient.setSurroundingTextAsync(
-            text: leftContext,
+            text: leftContext + rightContext,
             cursorPos: leftContext.unicodeScalars.count
         )
     }

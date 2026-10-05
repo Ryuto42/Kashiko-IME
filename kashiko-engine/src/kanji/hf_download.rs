@@ -69,13 +69,16 @@ pub fn get_tokenizer_path_by_id(variant_id: &str) -> Result<PathBuf> {
     get_tokenizer_path(family)
 }
 
-/// Download every model variant (GGUF + tokenizer) listed in `models.toml`
-/// into the HuggingFace cache, without loading any of them.
+/// Download the given model variants (GGUF + tokenizer) into the HuggingFace
+/// cache, without loading any of them.
 ///
 /// Used by `kashiko-imserver --prefetch-models` so installers can warm the
 /// cache up front instead of blocking the first conversion on a download.
-pub fn prefetch_all_models() -> Result<()> {
-    for (family, variant) in registry().iter_variants() {
+pub fn prefetch_models(variant_ids: &[&str]) -> Result<()> {
+    for id in variant_ids {
+        let (family, variant) = registry()
+            .find_variant(id)
+            .ok_or_else(|| KanjiError::UnknownVariant(id.to_string()))?;
         let model_path = get_variant_path(family, variant)?;
         let tokenizer_path = get_tokenizer_path(family)?;
         tracing::info!(

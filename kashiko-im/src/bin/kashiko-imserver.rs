@@ -6,8 +6,8 @@
 //! frontend should close the child's stdin (or send `save_learning`) before
 //! terminating it.
 //!
-//! `--prefetch-models` downloads every conversion model listed in
-//! `models.toml` into the HuggingFace cache and exits (used by `make install`
+//! `--prefetch-models` downloads the configured conversion models (main and
+//! light) into the HuggingFace cache and exits (used by `make install`
 //! to avoid a multi-minute download on first launch).
 
 use std::io::{BufRead, Write};
@@ -24,7 +24,14 @@ fn main() {
         .init();
 
     if std::env::args().any(|arg| arg == "--prefetch-models") {
-        if let Err(e) = kashiko_engine::kanji::hf_download::prefetch_all_models() {
+        let settings = kashiko_im::config::Settings::load().unwrap_or_default();
+        let default = kashiko_engine::kanji::registry().default_model.clone();
+        let main = settings.conversion.model.unwrap_or(default);
+        let mut ids = vec![main.as_str()];
+        if let Some(light) = settings.conversion.light_model.as_deref() {
+            ids.push(light);
+        }
+        if let Err(e) = kashiko_engine::kanji::hf_download::prefetch_models(&ids) {
             tracing::error!("model prefetch failed: {e}");
             std::process::exit(1);
         }

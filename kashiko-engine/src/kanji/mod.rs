@@ -8,6 +8,7 @@ pub mod model_config;
 
 pub use backend::{
     Backend, ConversionConfig, KanaKanjiConverter, build_jinen_prompt, clean_model_output,
+    split_right_context,
 };
 pub use error::KanjiError;
 pub use hf_download::{

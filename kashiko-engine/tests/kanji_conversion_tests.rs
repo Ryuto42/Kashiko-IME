@@ -54,7 +54,9 @@ mod llamacpp_tests {
         let reg = registry();
         let path = get_path_by_id(&reg.default_model).ok()?;
         let tok_path = get_tokenizer_path_by_id(&reg.default_model).ok()?;
-        LlamaCppModel::from_file(&path, &tok_path).ok()
+        let mut model = LlamaCppModel::from_file(&path, &tok_path).ok()?;
+        model.set_nfkc(reg.default_variant()?.0.nfkc_prompt);
+        Some(model)
     }
 
     fn build_prompt(katakana: &str) -> String {
@@ -93,7 +95,7 @@ mod llamacpp_tests {
         let test_cases = [
             ("ワセダ", "早稲田"),
             ("トウキョウ", "東京"),
-            ("ニホン", "日本"),
+            ("ニホンゴ", "日本語"),
         ];
 
         for (input, expected) in test_cases {
@@ -489,3 +491,4 @@ mod llamacpp_tests {
         }
     }
 }
+

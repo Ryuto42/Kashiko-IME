@@ -276,3 +276,11 @@ fn unalignable_conversions_teach_nothing() {
     let spans = crate::core::engine::conversion::differing_spans("あいうえ", "全然違う文", "藍上");
     assert!(spans.is_empty(), "got {spans:?}");
 }
+
+#[test]
+fn compatibility_ideograph_spellings_are_one_candidate() {
+    let mut b = super::super::conversion::CandidateBuilder::new();
+    b.push(AnnotatedCandidate::new("有難う", CandidateSource::Dictionary));
+    b.push(AnnotatedCandidate::new("有\u{FA68}う", CandidateSource::Dictionary));
+    assert_eq!(b.into_candidates().len(), 1);
+}

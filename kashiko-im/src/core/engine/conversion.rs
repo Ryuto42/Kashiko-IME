@@ -1,7 +1,7 @@
 //! Conversion state handling (candidates, commit). The live-conversion
 //! chunking lives in the sibling `chunk` module.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -576,13 +576,29 @@ fn width_annotation(text: &str) -> Option<&'static str> {
 /// Two push paths exist: [`push`] dedups by text (skips duplicates), and
 /// [`push_force`] always inserts (used for learning candidates that should
 /// appear at the top even if a later source re-emits the same text).
-struct CandidateBuilder {
+pub(super) struct CandidateBuilder {
     candidates: Vec<AnnotatedCandidate>,
     seen: HashSet<String>,
 }
 
+/// `text` with CJK compatibility ideographs replaced by their unified form.
+/// The dictionary spells some words both ways (有難う with U+96E3 and with
+/// U+FA68), which render identically and so showed as a duplicate row.
+fn compatibility_folded(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| match c {
+            '\u{F900}'..='\u{FAFF}' | '\u{2F800}'..='\u{2FA1F}' => {
+                kashiko_engine::kana::normalize_nfkc(c.encode_utf8(&mut [0; 4]))
+                    .chars()
+                    .collect::<Vec<_>>()
+            }
+            _ => vec![c],
+        })
+        .collect()
+}
+
 impl CandidateBuilder {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             candidates: Vec::new(),
             seen: HashSet::new(),
@@ -590,8 +606,10 @@ impl CandidateBuilder {
     }
 
     /// Push a candidate if its text hasn't been seen yet.
-    fn push(&mut self, ac: AnnotatedCandidate) {
-        if self.seen.insert(ac.text.clone()) {
+    pub(super) fn push(&mut self, ac: AnnotatedCandidate) {
+        let key = compatibility_folded(&ac.text);
+        if !self.seen.contains(&key) && self.seen.insert(ac.text.clone()) {
+            self.seen.insert(key);
             self.candidates.push(ac);
         }
     }
@@ -600,6 +618,7 @@ impl CandidateBuilder {
     /// dedup'd inserts skip it. Use only for sources that should win over
     /// duplicates from later steps (e.g. learning cache).
     fn push_force(&mut self, ac: AnnotatedCandidate) {
+        self.seen.insert(compatibility_folded(&ac.text));
         self.seen.insert(ac.text.clone());
         self.candidates.push(ac);
     }
@@ -608,7 +627,7 @@ impl CandidateBuilder {
         self.candidates.is_empty()
     }
 
-    fn into_candidates(self) -> Vec<AnnotatedCandidate> {
+    pub(super) fn into_candidates(self) -> Vec<AnnotatedCandidate> {
         self.candidates
     }
 }
@@ -2787,7 +2806,7 @@ impl InputMethodEngine {
     /// Consecutive characters with no dictionary entry (okurigana tails,
     /// interjections, ...) are merged into a single segment so the
     /// boundaries stay word-sized instead of degrading to per-character.
-    fn word_boundaries(&self, reading: &str) -> Vec<usize> {
+    pub(super) fn word_boundaries(&self, reading: &str) -> Vec<usize> {
         let chars: Vec<char> = reading.chars().collect();
         let longest_at = |pos: usize| -> usize {
             let rest: String = chars[pos..].iter().collect();
@@ -3188,8 +3207,11 @@ impl InputMethodEngine {
         /// particle) is judged like a short reading: with no sentence around
         /// it the model just prefers the commonest homophone (施工中の 0.05 vs
         /// 思考中の 1.10), which says nothing about which one the user means.
-        /// Only candidates with a genuinely broken character are dropped.
+        /// Only candidates with a genuinely broken character are dropped, by a
+        /// looser bar than a sentence gets: jinen-v2 puts 思考中の's worst
+        /// character at 6.5, against 10.0 for 志向中の.
         const SINGLE_PHRASE_MAX_CHARS: usize = 8;
+        const SINGLE_PHRASE_WORST_TOKEN_NLL: f32 = 8.0;
 
         let short_reading = reading.chars().count() <= SHORT_READING_CHARS;
         let single_phrase = reading.chars().count() <= SINGLE_PHRASE_MAX_CHARS
@@ -3288,7 +3310,7 @@ impl InputMethodEngine {
                     never_drop: learned
                         || short_reading
                         || (single_phrase
-                            && detail.is_some_and(|d| d.worst <= QUALITY_WORST_TOKEN_NLL)),
+                            && detail.is_some_and(|d| d.worst <= SINGLE_PHRASE_WORST_TOKEN_NLL)),
                 }
             })
             .collect();
@@ -3304,7 +3326,69 @@ impl InputMethodEngine {
             .filter(|e| !candidates[e.index].text.chars().any(|c| c.is_ascii_alphabetic()))
             .filter_map(|e| e.score)
             .reduce(f32::min);
+        let plain: HashMap<String, f32> = scored
+            .iter()
+            .filter_map(|e| Some((candidates[e.index].text.clone(), e.score?)))
+            .collect();
         *candidates = gate_and_reorder(candidates, &scored);
+        if let Some(right) = self.scope_right_context(reading) {
+            self.reorder_by_right_context(reading, &right, candidates, &plain);
+        }
+    }
+
+    /// What follows `reading` when it is converted: the unconverted rest of
+    /// the composition, then the document text after the cursor.
+    fn scope_right_context(&self, reading: &str) -> Option<String> {
+        let rest = self.input_buf.text.strip_prefix(reading).unwrap_or("");
+        let right = format!("{rest}{}", self.right_context().unwrap_or_default());
+        (!right.trim().is_empty()).then_some(right)
+    }
+
+    /// Reorder the leading plausible model/dictionary candidates by how they
+    /// read before `right` (see `KanaKanjiConverter::score_with_right_context`).
+    /// Nothing is added or removed; `plain` holds each one's score without
+    /// the right context, which bounds which ones may move up.
+    fn reorder_by_right_context(
+        &self,
+        reading: &str,
+        right: &str,
+        candidates: &mut [AnnotatedCandidate],
+        plain: &HashMap<String, f32>,
+    ) {
+        /// Scoring budget: two passes per candidate.
+        const MAX_REORDERED: usize = 6;
+        const PLAUSIBLE_MARGIN: f32 = 1.0;
+        let Some(converter) = self.converters.kanji.as_ref() else {
+            return;
+        };
+        let floor = plain.values().copied().fold(f32::INFINITY, f32::min);
+        let slots: Vec<usize> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| matches!(c.source, CandidateSource::Model | CandidateSource::Dictionary))
+            .filter(|(_, c)| plain.get(&c.text).is_some_and(|&p| p <= floor + PLAUSIBLE_MARGIN))
+            .map(|(i, _)| i)
+            .take(MAX_REORDERED)
+            .collect();
+        if slots.len() < 2 {
+            return;
+        }
+        let texts: Vec<String> = slots.iter().map(|&i| candidates[i].text.clone()).collect();
+        let ctx = self.truncate_context_for_api();
+        let Ok(scores) = converter.score_with_right_context(reading, &ctx, &texts, right) else {
+            return;
+        };
+        let mut order: Vec<(usize, f32)> = slots
+            .iter()
+            .zip(scores)
+            .map(|(&i, s)| (i, s.map_or(f32::INFINITY, |(_, total)| total)))
+            .collect();
+        order.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let moved: Vec<AnnotatedCandidate> =
+            order.iter().map(|&(i, _)| candidates[i].clone()).collect();
+        for (&slot, cand) in slots.iter().zip(moved) {
+            candidates[slot] = cand;
+        }
     }
 
     /// Take the settled segments' text (left of the focus), learning each
@@ -3360,6 +3444,9 @@ impl InputMethodEngine {
         if self.segment_bounds.is_empty() {
             self.segment_bounds =
                 self.phrase_boundaries(&full_reading, &selected)
+                    // A conversion left in kana is one opaque phrase; the
+                    // dictionary can still find the words in it.
+                    .filter(|b| b.len() > 1)
                     .unwrap_or_else(|| self.word_boundaries(&full_reading));
         }
         let boundaries = self.segment_bounds.clone();

@@ -91,4 +91,4 @@ MIT OR Apache-2.0 のデュアルライセンスです（[MIT](LICENSE-MIT) / [A
 
 本プロジェクトは [togatoga/kashiko](https://github.com/togatoga/kashiko)（MIT OR Apache-2.0）の派生物です。MITライセンスの要求に従い、原著作権表示は [LICENSE-MIT](LICENSE-MIT) に本フォークの表示と併記して保持しています。
 
-第三者素材の帰属は [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES) に一覧しています。主なものは記号・絵文字データ（Mozc / BSD 3-Clause）、システム辞書（SudachiDict / Apache-2.0）、ニューラルモデル（jinen-v1シリーズ）です。モデルとシステム辞書はリポジトリに含まれず、ビルド時に取得されます。
+第三者素材の帰属は [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES) に一覧しています。主なものは記号・絵文字データ（Mozc / BSD 3-Clause）、システム辞書（SudachiDict / Apache-2.0）、ニューラルモデル（jinen-v1/v2シリーズ / CC BY-SA 4.0）です。モデルとシステム辞書はリポジトリに含まれず、ビルド時に取得されます。

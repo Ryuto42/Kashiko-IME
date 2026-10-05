@@ -210,6 +210,15 @@ impl InputMethodEngine {
         }
     }
 
+    /// Text after the cursor in the document, when the application reports it.
+    pub(super) fn right_context(&self) -> Option<String> {
+        self.surrounding_context
+            .as_ref()?
+            .right
+            .clone()
+            .filter(|r| !r.trim().is_empty())
+    }
+
     /// Append committed text to the fallback context tail, keeping only as much
     /// as conversion can actually use.
     pub(super) fn record_committed_context(&mut self, text: &str) {

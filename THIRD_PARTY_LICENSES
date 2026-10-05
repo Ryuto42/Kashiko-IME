@@ -36,3 +36,28 @@ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+===============================================================================
+jinen kana-kanji conversion models (jinen-v1-xsmall, jinen-v1-small, jinen-v2-small,
+jinen-v2-xsmall)
+https://huggingface.co/togatogah
+===============================================================================
+
+Downloaded at build/first launch; not included in this repository.
+Licensed under CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/).
+
+jinen-v2 was trained in part on processed bibliographic data of the National
+Diet Library:
+  出典：国立国会図書館「全国書誌データ」（2026年7月9日に取得）および
+  国立国会図書館サーチの書誌データを加工して作成
+The processing and the model were made by Hitoshi Togasaki; they are not made,
+provided or guaranteed by the National Diet Library.
+
+===============================================================================
+kanakanji-edge-33m (optional model, not downloaded by default)
+https://huggingface.co/yuuki14202028/kanakanji-edge-33m
+===============================================================================
+
+Model weights: Apache License 2.0.
+Tokenizer vocabulary: ku-nlp/gpt2-small-japanese-char (Kurohashi Lab, Kyoto
+University), CC BY-SA 4.0.

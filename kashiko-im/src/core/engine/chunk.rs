@@ -124,10 +124,16 @@ impl ChunkPlan {
         // across a group boundary: a non-Japanese char never merges into a
         // Japanese chunk (or vice versa) — re-chunking would only split them
         // apart again, forcing a needless reconversion.
+        //
+        // A full Japanese chunk at the very end is reopened once too: it was
+        // cut by the length cap with nothing after it yet, so only now can the
+        // phrase it ends mid-way be handed to the next chunk (`phrase_cut`).
+        // After that it is no longer last, so it is not reconverted again.
         if lead_count > 0
             && lead_chars == cp
             && cp < text.len()
-            && old_lens[lead_count - 1] < chunk_len
+            && (old_lens[lead_count - 1] < chunk_len
+                || (lead_count == old_lens.len() && is_japanese(text[cp])))
             && same_group(old_text[lead_chars - 1], text[cp])
         {
             lead_count -= 1;
@@ -219,10 +225,30 @@ impl InputMethodEngine {
 
         // 2. Changed middle span: re-chunk and reconvert each new chunk against
         //    everything converted so far.
+        //    A chunk cut by the length cap mid-sentence usually ends mid-word
+        //    (`かじょうせっし|ゅ` → 過剰摂氏ュ), so its last phrase is handed to
+        //    the next chunk instead of being converted without its ending.
         let middle = &text[plan.mid_start..plan.mid_end];
-        for chunk in group_chunks(middle, chunk_len) {
+        let right = self.right_context();
+        let mut pos = 0;
+        while pos < middle.len() {
+            let chunk = group_chunks(&middle[pos..], chunk_len)[0];
             let reading: String = chunk.iter().collect();
-            let new = self.convert_new_chunk(reading, &base_ctx, &combined);
+            let next = pos + chunk.len();
+            // Only the chunk the document's following text attaches to.
+            let before = right
+                .as_deref()
+                .filter(|_| next >= middle.len() && plan.trail_count == 0);
+            let mut new = self.convert_new_chunk(reading, &base_ctx, &combined, before);
+            if chunk.len() == chunk_len
+                && next < middle.len()
+                && is_japanese(chunk[0])
+                && is_japanese(middle[next])
+                && let Some(cut) = self.phrase_cut(&new, &self.lctx_for(&base_ctx, &combined), chunk_len / 2)
+            {
+                new = cut;
+            }
+            pos += new.reading.chars().count();
             combined.push_str(&new.converted);
             chunks.push(new);
         }
@@ -256,10 +282,14 @@ impl InputMethodEngine {
         reading: String,
         base_ctx: &str,
         combined: &str,
+        right: Option<&str>,
     ) -> ComposingChunk {
         let converted = if reading.chars().next().is_some_and(is_japanese) {
             let lctx = self.lctx_for(base_ctx, combined);
-            let model = self.convert_chunk(&reading, &lctx);
+            let model = match right {
+                Some(right) => self.convert_chunk_before(&reading, &lctx, right),
+                None => self.convert_chunk(&reading, &lctx),
+            };
             // A learned form used to short-circuit the model entirely, which
             // meant live conversion ignored context: `のります` learned as
             // `乗ります` from `車に乗ります` kept winning under `雑誌に`, even
@@ -286,6 +316,41 @@ impl InputMethodEngine {
             reading.clone()
         };
         ComposingChunk { reading, converted }
+    }
+
+    /// `chunk` shortened to end before its last phrase or two, keeping at most
+    /// `max_tail` reading chars for the next chunk. Uses the conversion's own phrase
+    /// alignment, falling back to dictionary word boundaries (and a fresh
+    /// conversion of the shortened reading) when the two can't be aligned.
+    fn phrase_cut(&mut self, chunk: &ComposingChunk, lctx: &str, max_tail: usize) -> Option<ComposingChunk> {
+        let r: Vec<char> = chunk.reading.chars().collect();
+        let fits = |at: usize| at > 0 && r.len() - at <= max_tail;
+        if let Some(spans) = kashiko_engine::segment::align(&chunk.reading, &chunk.converted)
+            && spans.len() >= 2
+        {
+            // The last phrase is converted without its ending, so the one
+            // before it can be wrong too (`しゅうた` → 種|うた); cut before both
+            // when that still fits.
+            let last = spans
+                .iter()
+                .rev()
+                .take(2)
+                .filter(|span| fits(span.reading_start))
+                .last()?;
+            return Some(ComposingChunk {
+                reading: r[..last.reading_start].iter().collect(),
+                converted: chunk.converted.chars().take(last.converted_start).collect(),
+            });
+        }
+        let at = self
+            .word_boundaries(&chunk.reading)
+            .into_iter()
+            .rev()
+            .find(|&b| b < r.len())
+            .filter(|&b| fits(b))?;
+        let reading: String = r[..at].iter().collect();
+        let converted = self.convert_chunk(&reading, lctx);
+        Some(ComposingChunk { reading, converted })
     }
 
     /// Choose between a learned form and the model's own reading of the same
@@ -429,6 +494,73 @@ impl InputMethodEngine {
         self.run_kana_kanji_conversion(reading, lctx, 1)
             .into_iter()
             .next()
+            .unwrap_or_else(|| reading.to_string())
+    }
+
+    /// As [`Self::convert_chunk`], for a chunk followed by `right` in the
+    /// document. The following hiragana joins the reading (`ほうこうし|ている`
+    /// converts as one), and a short reading — where homophones are the
+    /// question — picks among the beam by how the rest of `right` reads after
+    /// each (see `KanaKanjiConverter::score_with_right_context`).
+    fn convert_chunk_before(&mut self, reading: &str, lctx: &str, right: &str) -> String {
+        /// Longer readings carry their own context; the extra passes buy little.
+        const RERANK_MAX_CHARS: usize = 12;
+        const DICTIONARY_WORDS: usize = 3;
+        /// Candidates this far (per-char NLL) behind the best are not revived
+        /// by the right context, which is too weak a signal to outvote the
+        /// reading itself.
+        const PLAUSIBLE_MARGIN: f32 = 1.0;
+
+        let Some(converter) = self.converters.kanji.clone() else {
+            return reading.to_string();
+        };
+        let (kana, _) = kashiko_engine::kanji::split_right_context(right);
+        let extended = format!("{reading}{kana}");
+        let strip = |out: String| {
+            out.strip_suffix(kana.as_str())
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+        };
+        if reading.chars().count() > RERANK_MAX_CHARS {
+            return converter
+                .convert_live(&extended, lctx)
+                .ok()
+                .and_then(strip)
+                .unwrap_or_else(|| self.convert_chunk(reading, lctx));
+        }
+        let greedy = converter
+            .convert_live(&extended, lctx)
+            .ok()
+            .and_then(strip)
+            .unwrap_or_else(|| self.convert_chunk(reading, lctx));
+        let mut cands = vec![greedy];
+        // The homophones of a single word (汽車 behind 記者) are what the
+        // right context decides; a beam would find them too, at several times
+        // the cost per keystroke.
+        let words = self
+            .search_dictionaries(reading, DICTIONARY_WORDS)
+            .into_iter()
+            .map(|c| c.text)
+            .filter(|t| !t.chars().any(|c| c.is_ascii()) && !kashiko_engine::kana::is_all_kana(t));
+        for cand in words {
+            if !cands.contains(&cand) {
+                cands.push(cand);
+            }
+        }
+        if cands.len() < 2 {
+            return cands.pop().unwrap_or_else(|| self.convert_chunk(reading, lctx));
+        }
+        let Ok(scores) = converter.score_with_right_context(reading, lctx, &cands, right) else {
+            return cands.swap_remove(0);
+        };
+        let floor = scores.iter().flatten().map(|s| s.0).fold(f32::INFINITY, f32::min);
+        cands
+            .into_iter()
+            .zip(scores)
+            .filter_map(|(c, s)| Some((c, s?)))
+            .filter(|(_, (plain, _))| *plain <= floor + PLAUSIBLE_MARGIN)
+            .min_by(|a, b| a.1.1.total_cmp(&b.1.1))
+            .map(|(c, _)| c)
             .unwrap_or_else(|| reading.to_string())
     }
 
@@ -595,6 +727,17 @@ mod plan_tests {
                 mid_end: 5
             }
         );
+    }
+
+    #[test]
+    fn append_after_full_japanese_chunk_reopens_it_once() {
+        // [あい] + "う": the cap cut it with nothing after; reopened so the
+        // phrase cut can see what follows.
+        let p = plan(&[2], "あい", "あいう", 2);
+        assert_eq!((p.lead_count, p.mid_start, p.mid_end), (0, 0, 3));
+        // [あい][う] + "え": the full chunk is no longer last, so it stays.
+        let p = plan(&[2, 1], "あいう", "あいうえ", 2);
+        assert_eq!((p.lead_count, p.mid_start, p.mid_end), (1, 2, 4));
     }
 
     #[test]
