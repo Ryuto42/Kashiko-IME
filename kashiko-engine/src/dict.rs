@@ -42,17 +42,133 @@ pub struct DictEntry {
     pub candidates: Vec<Candidate>,
 }
 
+/// A candidate as returned by a lookup: borrows from the dictionary's arena.
+///
+/// Distinct from the owned [`Candidate`], which is what builders work with.
+/// Lookups hand out borrowed text because the dictionary stores its strings in
+/// one flat buffer rather than as individual `String`s — see [`Dictionary`].
+#[derive(Debug, Clone, Copy)]
+pub struct CandidateRef<'a> {
+    pub surface: &'a str,
+    pub score: f32,
+}
+
 /// Result of a dictionary lookup, borrowing from the Dictionary.
 #[derive(Debug)]
 pub struct LookupResult<'a> {
     pub reading: &'a str,
-    pub candidates: &'a [Candidate],
+    pub candidates: Vec<CandidateRef<'a>>,
+}
+
+/// Where one reading's text and candidates live in the arena.
+///
+/// `u16` lengths because a reading or surface longer than 64KB cannot occur —
+/// the on-disk format stores them as `u16` too.
+#[derive(Debug, Clone, Copy)]
+struct EntrySpan {
+    reading_at: u32,
+    cands_at: u32,
+    reading_len: u16,
+    cands_len: u16,
+}
+
+/// Where one candidate's surface lives in the arena, and its score.
+#[derive(Debug, Clone, Copy)]
+struct CandSpan {
+    surface_at: u32,
+    score: f32,
+    surface_len: u16,
+    _pad: u16,
 }
 
 /// A double-array trie dictionary for kana-kanji conversion.
+///
+/// Text is held in one flat `blob` with `u32` offsets into it, not as owned
+/// `String`s. The system dictionary has ~2M readings and ~3M surfaces, and the
+/// owned layout needed a separate heap allocation for every one of them plus a
+/// `Vec` header per entry: measured on the real dictionary, a 196 MB file
+/// occupied 382 MB resident. The arena is three allocations instead of seven
+/// million, and holds the same bytes the file does.
 pub struct Dictionary {
     trie: DoubleArray<Vec<u8>>,
-    entries: Vec<DictEntry>,
+    blob: Box<[u8]>,
+    entries: Box<[EntrySpan]>,
+    cands: Box<[CandSpan]>,
+}
+
+impl Dictionary {
+    fn text(&self, at: u32, len: u16) -> &str {
+        let (at, len) = (at as usize, len as usize);
+        // Validated once when the arena was built.
+        std::str::from_utf8(&self.blob[at..at + len]).unwrap_or_default()
+    }
+
+    fn candidates_of(&self, span: &EntrySpan) -> Vec<CandidateRef<'_>> {
+        let at = span.cands_at as usize;
+        self.cands[at..at + span.cands_len as usize]
+            .iter()
+            .map(|c| CandidateRef {
+                surface: self.text(c.surface_at, c.surface_len),
+                score: c.score,
+            })
+            .collect()
+    }
+
+    fn lookup_at(&self, index: usize) -> Option<LookupResult<'_>> {
+        let span = self.entries.get(index)?;
+        Some(LookupResult {
+            reading: self.text(span.reading_at, span.reading_len),
+            candidates: self.candidates_of(span),
+        })
+    }
+
+    /// Every reading with its candidates, for the builders that need owned data
+    /// back (merge, dump, surface search).
+    fn iter_entries(&self) -> impl Iterator<Item = (&str, Vec<CandidateRef<'_>>)> {
+        self.entries
+            .iter()
+            .map(move |s| (self.text(s.reading_at, s.reading_len), self.candidates_of(s)))
+    }
+
+    /// Pack owned entries into the flat arena.
+    fn pack(entries: &[DictEntry]) -> (Box<[u8]>, Box<[EntrySpan]>, Box<[CandSpan]>) {
+        let text_len: usize = entries
+            .iter()
+            .map(|e| e.reading.len() + e.candidates.iter().map(|c| c.surface.len()).sum::<usize>())
+            .sum();
+        let cand_total: usize = entries.iter().map(|e| e.candidates.len()).sum();
+
+        let mut blob = Vec::with_capacity(text_len);
+        let mut spans = Vec::with_capacity(entries.len());
+        let mut cands = Vec::with_capacity(cand_total);
+
+        for e in entries {
+            let reading_at = blob.len() as u32;
+            blob.extend_from_slice(e.reading.as_bytes());
+            let cands_at = cands.len() as u32;
+            for c in &e.candidates {
+                let surface_at = blob.len() as u32;
+                blob.extend_from_slice(c.surface.as_bytes());
+                cands.push(CandSpan {
+                    surface_at,
+                    score: c.score,
+                    surface_len: c.surface.len() as u16,
+                    _pad: 0,
+                });
+            }
+            spans.push(EntrySpan {
+                reading_at,
+                cands_at,
+                reading_len: e.reading.len() as u16,
+                cands_len: e.candidates.len() as u16,
+            });
+        }
+        (
+            blob.into_boxed_slice(),
+            spans.into_boxed_slice(),
+            cands.into_boxed_slice(),
+        )
+    }
 }
 
 // JSON deserialization types
@@ -83,9 +199,12 @@ impl Dictionary {
         let trie_bytes = DoubleArrayBuilder::build(&keyset)
             .ok_or_else(|| DictError::Format("failed to build double-array trie".to_string()))?;
 
+        let (blob, spans, cands) = Self::pack(&entries);
         Ok(Dictionary {
             trie: DoubleArray::new(trie_bytes),
-            entries,
+            blob,
+            entries: spans,
+            cands,
         })
     }
 
@@ -160,16 +279,14 @@ impl Dictionary {
 
         // Entries
         w.write_all(&(self.entries.len() as u32).to_le_bytes())?;
-        for entry in &self.entries {
-            let reading_bytes = entry.reading.as_bytes();
-            w.write_all(&(reading_bytes.len() as u16).to_le_bytes())?;
-            w.write_all(reading_bytes)?;
+        for (reading, candidates) in self.iter_entries() {
+            w.write_all(&(reading.len() as u16).to_le_bytes())?;
+            w.write_all(reading.as_bytes())?;
 
-            w.write_all(&(entry.candidates.len() as u16).to_le_bytes())?;
-            for cand in &entry.candidates {
-                let surface_bytes = cand.surface.as_bytes();
-                w.write_all(&(surface_bytes.len() as u16).to_le_bytes())?;
-                w.write_all(surface_bytes)?;
+            w.write_all(&(candidates.len() as u16).to_le_bytes())?;
+            for cand in candidates {
+                w.write_all(&(cand.surface.len() as u16).to_le_bytes())?;
+                w.write_all(cand.surface.as_bytes())?;
                 w.write_all(&cand.score.to_le_bytes())?;
             }
         }
@@ -223,45 +340,78 @@ impl Dictionary {
                 num_entries, MAX_ENTRIES
             )));
         }
-        let mut entries = Vec::with_capacity(num_entries);
+        // Stream the entry section into a text-only arena: the file interleaves
+        // lengths and scores with the text, and those are already in the index
+        // arrays, so copying them into the blob would be dead weight. Streaming
+        // rather than reading the section whole also avoids a second copy of it
+        // being live at once during startup.
+        let section_len = std::fs::metadata(path.as_ref())
+            .map(|m| m.len() as usize)
+            .unwrap_or(0)
+            .saturating_sub(16 + trie_len);
+        let mut blob: Vec<u8> = Vec::with_capacity(section_len);
+        let mut spans: Vec<EntrySpan> = Vec::with_capacity(num_entries);
+        let mut cands: Vec<CandSpan> = Vec::new();
 
         let mut buf2 = [0u8; 2];
+        let mut scratch: Vec<u8> = Vec::with_capacity(256);
         for _ in 0..num_entries {
-            // Reading
             r.read_exact(&mut buf2)?;
             let reading_len = u16::from_le_bytes(buf2) as usize;
-            let mut reading_bytes = vec![0u8; reading_len];
-            r.read_exact(&mut reading_bytes)?;
-            let reading = String::from_utf8(reading_bytes)
+            let reading_at = blob.len();
+            scratch.resize(reading_len, 0);
+            r.read_exact(&mut scratch)?;
+            std::str::from_utf8(&scratch)
                 .map_err(|e| DictError::Format(format!("invalid UTF-8 in reading: {e}")))?;
+            blob.extend_from_slice(&scratch);
 
-            // Candidates
             r.read_exact(&mut buf2)?;
             let num_candidates = u16::from_le_bytes(buf2) as usize;
-            let mut candidates = Vec::with_capacity(num_candidates);
+            let cands_at = cands.len();
             for _ in 0..num_candidates {
                 r.read_exact(&mut buf2)?;
                 let surface_len = u16::from_le_bytes(buf2) as usize;
-                let mut surface_bytes = vec![0u8; surface_len];
-                r.read_exact(&mut surface_bytes)?;
-                let surface = String::from_utf8(surface_bytes)
+                let surface_at = blob.len();
+                scratch.resize(surface_len, 0);
+                r.read_exact(&mut scratch)?;
+                std::str::from_utf8(&scratch)
                     .map_err(|e| DictError::Format(format!("invalid UTF-8 in surface: {e}")))?;
+                blob.extend_from_slice(&scratch);
 
                 r.read_exact(&mut buf4)?;
-                let score = f32::from_le_bytes(buf4);
-                candidates.push(Candidate { surface, score });
+                cands.push(CandSpan {
+                    surface_at: surface_at as u32,
+                    score: f32::from_le_bytes(buf4),
+                    surface_len: surface_len as u16,
+                    _pad: 0,
+                });
             }
 
-            candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
-            entries.push(DictEntry {
-                reading,
-                candidates,
+            // Same ordering the owned layout produced: the index is sorted, the
+            // text stays where it was written.
+            cands[cands_at..].sort_by(|a, b| a.score.total_cmp(&b.score));
+            spans.push(EntrySpan {
+                reading_at: reading_at as u32,
+                cands_at: cands_at as u32,
+                reading_len: reading_len as u16,
+                cands_len: num_candidates as u16,
             });
         }
+        blob.shrink_to_fit();
+        tracing::debug!(
+            "dict arena: trie {:.1} MB, text {:.1} MB, entry index {:.1} MB, candidate index {:.1} MB ({} candidates)",
+            trie_len as f64 / 1048576.0,
+            blob.len() as f64 / 1048576.0,
+            (spans.len() * std::mem::size_of::<EntrySpan>()) as f64 / 1048576.0,
+            (cands.len() * std::mem::size_of::<CandSpan>()) as f64 / 1048576.0,
+            cands.len(),
+        );
 
         Ok(Dictionary {
             trie: DoubleArray::new(trie_bytes),
-            entries,
+            blob: blob.into_boxed_slice(),
+            entries: spans.into_boxed_slice(),
+            cands: cands.into_boxed_slice(),
         })
     }
 
@@ -269,24 +419,14 @@ impl Dictionary {
     pub fn common_prefix_search(&self, input: &str) -> Vec<LookupResult<'_>> {
         self.trie
             .common_prefix_search(input.as_bytes())
-            .filter_map(|(value, _len)| {
-                let entry = self.entries.get(value as usize)?;
-                Some(LookupResult {
-                    reading: &entry.reading,
-                    candidates: &entry.candidates,
-                })
-            })
+            .filter_map(|(value, _len)| self.lookup_at(value as usize))
             .collect()
     }
 
     /// Exact match search: returns the entry whose reading exactly matches `input`.
     pub fn exact_match_search(&self, input: &str) -> Option<LookupResult<'_>> {
         let value = self.trie.exact_match_search(input.as_bytes())?;
-        let entry = self.entries.get(value as usize)?;
-        Some(LookupResult {
-            reading: &entry.reading,
-            candidates: &entry.candidates,
-        })
+        self.lookup_at(value as usize)
     }
 
     /// Write all entries in the dictionary to `writer` (for inspection/debugging).
@@ -294,16 +434,21 @@ impl Dictionary {
     /// Each line is tab-separated: `reading\tsurface\tscore`.
     /// Returns the total number of entries written.
     pub fn dump_all(&self, writer: &mut dyn std::io::Write) -> std::io::Result<usize> {
-        for entry in &self.entries {
-            for cand in &entry.candidates {
+        for (reading, candidates) in self.iter_entries() {
+            for cand in candidates {
                 writeln!(
                     writer,
                     "{}\t{}\t{}",
-                    entry.reading, cand.surface, cand.score
+                    reading, cand.surface, cand.score
                 )?;
             }
         }
         Ok(self.entries.len())
+    }
+
+    /// Number of readings in the dictionary.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
     }
 
     /// Search entries by surface form (substring match).
@@ -311,10 +456,10 @@ impl Dictionary {
     /// Returns a list of (reading, surface, score) tuples where surface contains `query`.
     pub fn search_by_surface(&self, query: &str) -> Vec<(String, String, f32)> {
         let mut results = Vec::new();
-        for entry in &self.entries {
-            for cand in &entry.candidates {
+        for (reading, candidates) in self.iter_entries() {
+            for cand in candidates {
                 if cand.surface.contains(query) {
-                    results.push((entry.reading.clone(), cand.surface.clone(), cand.score));
+                    results.push((reading.to_string(), cand.surface.to_string(), cand.score));
                 }
             }
         }
@@ -434,14 +579,17 @@ impl Dictionary {
         let mut reading_order: Vec<String> = Vec::new();
 
         for dict in dicts {
-            for entry in dict.entries {
-                if !merged.contains_key(&entry.reading) {
-                    reading_order.push(entry.reading.clone());
+            for (reading, cands) in dict.iter_entries() {
+                if !merged.contains_key(reading) {
+                    reading_order.push(reading.to_string());
                 }
-                let candidates = merged.entry(entry.reading).or_default();
-                for cand in entry.candidates {
+                let candidates = merged.entry(reading.to_string()).or_default();
+                for cand in cands {
                     if !candidates.iter().any(|c| c.surface == cand.surface) {
-                        candidates.push(cand);
+                        candidates.push(Candidate {
+                            surface: cand.surface.to_string(),
+                            score: cand.score,
+                        });
                     }
                 }
             }
@@ -631,9 +779,10 @@ mod tests {
         let dict = Dictionary::build_from_json(json_file.path()).unwrap();
 
         // Readings should be converted to hiragana
-        assert!(dict.entries.iter().any(|e| e.reading == "きょう"));
-        assert!(dict.entries.iter().any(|e| e.reading == "きょうと"));
-        assert!(dict.entries.iter().any(|e| e.reading == "とうきょう"));
+        let readings: Vec<&str> = dict.iter_entries().map(|(r, _)| r).collect();
+        assert!(readings.contains(&"きょう"));
+        assert!(readings.contains(&"きょうと"));
+        assert!(readings.contains(&"とうきょう"));
     }
 
     #[test]

@@ -172,7 +172,7 @@ async fn api_search(
                 .iter()
                 .map(|c| SearchResult {
                     reading: result.reading.to_string(),
-                    surface: c.surface.clone(),
+                    surface: c.surface.to_string(),
                     score: c.score,
                 })
                 .collect(),
@@ -183,11 +183,16 @@ async fn api_search(
             .common_prefix_search(&query)
             .into_iter()
             .flat_map(|result| {
-                result.candidates.iter().map(move |c| SearchResult {
-                    reading: result.reading.to_string(),
-                    surface: c.surface.clone(),
-                    score: c.score,
-                })
+                let reading = result.reading.to_string();
+                result
+                    .candidates
+                    .into_iter()
+                    .map(move |c| SearchResult {
+                        reading: reading.clone(),
+                        surface: c.surface.to_string(),
+                        score: c.score,
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect(),
         SearchMode::Surface => state
@@ -271,7 +276,7 @@ async fn run_view(
                 eprintln!("No entries found with reading prefix \"{}\"", query);
             } else {
                 for result in &results {
-                    for cand in result.candidates {
+                    for cand in &result.candidates {
                         println!("{}\t{}\t{}", result.reading, cand.surface, cand.score);
                     }
                 }
@@ -280,7 +285,7 @@ async fn run_view(
         } else {
             match dict.exact_match_search(query) {
                 Some(result) => {
-                    for cand in result.candidates {
+                    for cand in &result.candidates {
                         println!("{}\t{}\t{}", result.reading, cand.surface, cand.score);
                     }
                     eprintln!("({} candidates)", result.candidates.len());

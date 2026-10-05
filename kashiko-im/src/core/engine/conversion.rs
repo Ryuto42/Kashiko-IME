@@ -1348,7 +1348,7 @@ impl InputMethodEngine {
     ///
     /// User dictionary results come first (higher priority), then system dictionary
     /// results sorted by score. Duplicates are removed via HashSet.
-    fn search_dictionaries(&self, reading: &str, limit: usize) -> Vec<AnnotatedCandidate> {
+    pub(super) fn search_dictionaries(&self, reading: &str, limit: usize) -> Vec<AnnotatedCandidate> {
         let mut candidates = Vec::new();
         let mut seen = HashSet::new();
 
@@ -1360,9 +1360,9 @@ impl InputMethodEngine {
                 if candidates.len() >= limit {
                     break;
                 }
-                if seen.insert(cand.surface.clone()) {
+                if seen.insert(cand.surface.to_string()) {
                     candidates.push(AnnotatedCandidate::new(
-                        cand.surface.clone(),
+                        cand.surface.to_string(),
                         CandidateSource::UserDictionary,
                     ));
                 }
@@ -1379,7 +1379,7 @@ impl InputMethodEngine {
                 if candidates.len() >= limit {
                     break;
                 }
-                if seen.insert(cand.surface.clone()) {
+                if seen.insert(cand.surface.to_string()) {
                     candidates.push(AnnotatedCandidate::new(
                         cand.surface,
                         CandidateSource::Dictionary,
@@ -2913,6 +2913,83 @@ impl InputMethodEngine {
     /// Each phrase is split at the kana it shares with its reading, so only the
     /// stem is substituted and inflection survives: `のります`/`乗ります` share
     /// the suffix `ります`, leaving the stem `の`/`乗` to swap.
+    /// Split a converted stem the dictionary doesn't hold as a whole
+    /// (`しこうちゅう`/`施工中`) into the dictionary words it is made of
+    /// (`しこう`/`施工` + `ちゅう`/`中`). `None` unless it splits into two or more.
+    fn split_compound_stem(&self, reading: &str, converted: &str) -> Option<Vec<(String, String)>> {
+        const MAX_PIECES: usize = 4;
+        fn go(
+            e: &InputMethodEngine,
+            r: &[char],
+            c: &str,
+            out: &mut Vec<(String, String)>,
+        ) -> bool {
+            if r.is_empty() {
+                return c.is_empty();
+            }
+            if out.len() >= MAX_PIECES {
+                return false;
+            }
+            let longest = if out.is_empty() { r.len() - 1 } else { r.len() };
+            for len in (1..=longest).rev() {
+                let piece: String = r[..len].iter().collect();
+                for cand in e.search_dictionaries(&piece, usize::MAX) {
+                    let Some(rest) = c.strip_prefix(cand.text.as_str()) else {
+                        continue;
+                    };
+                    if cand.text.is_empty() {
+                        continue;
+                    }
+                    out.push((piece.clone(), cand.text));
+                    if go(e, &r[len..], rest, out) {
+                        return true;
+                    }
+                    out.pop();
+                }
+            }
+            false
+        }
+        let r: Vec<char> = reading.chars().collect();
+        let mut out = Vec::new();
+        (r.len() >= 2 && go(self, &r, converted, &mut out)).then_some(out)
+    }
+
+    /// Phrase boundaries for segment navigation: the conversion's own phrases,
+    /// with any compound the dictionary lacks split into its words, so
+    /// `しこうちゅうの` (施工中の) can be focused as `しこう|ちゅうの`.
+    fn phrase_boundaries(&self, reading: &str, converted: &str) -> Option<Vec<usize>> {
+        let spans = kashiko_engine::segment::align(reading, converted)?;
+        let r: Vec<char> = reading.chars().collect();
+        let c: Vec<char> = converted.chars().collect();
+        let mut bounds = Vec::new();
+        for span in &spans {
+            let seg_reading: String = r[span.reading_start..span.reading_end].iter().collect();
+            let seg_converted: String = c[span.converted_start..span.converted_end].iter().collect();
+            let shared = seg_reading
+                .chars()
+                .rev()
+                .zip(seg_converted.chars().rev())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let stem_reading: String =
+                seg_reading.chars().take(seg_reading.chars().count() - shared).collect();
+            let stem_converted: String =
+                seg_converted.chars().take(seg_converted.chars().count() - shared).collect();
+            if !stem_reading.is_empty()
+                && self.search_dictionaries(&stem_reading, 1).is_empty()
+                && let Some(pieces) = self.split_compound_stem(&stem_reading, &stem_converted)
+            {
+                let mut at = span.reading_start;
+                for (piece, _) in &pieces[..pieces.len() - 1] {
+                    at += piece.chars().count();
+                    bounds.push(at);
+                }
+            }
+            bounds.push(span.reading_end);
+        }
+        Some(bounds)
+    }
+
     pub(super) fn dictionary_substitution_variants(&self, reading: &str, converted: &str) -> Vec<String> {
         /// Cap on generated variants: each one costs a scoring pass later.
         const MAX_VARIANTS: usize = 6;
@@ -2982,6 +3059,37 @@ impl InputMethodEngine {
                 lookups.push((form, Some(end)));
             }
             if lookups.is_empty() {
+                // A compound the dictionary lacks as a whole (`しこうちゅう` →
+                // 施工中) is swapped word by word: `しこう` → 思考/試行, `中` kept.
+                if self.search_dictionaries(&stem_reading, 1).is_empty()
+                    && let Some(pieces) = self.split_compound_stem(&stem_reading, &stem_converted)
+                {
+                    let head = take(&c, 0, span.converted_start);
+                    let tail = take(&c, span.converted_end - shared.min(span.converted_end), c.len());
+                    for (i, (piece_reading, piece_converted)) in pieces.iter().enumerate() {
+                        for cand in self.search_dictionaries(piece_reading, usize::MAX) {
+                            if out.len() >= MAX_VARIANTS {
+                                break;
+                            }
+                            if &cand.text == piece_converted
+                                || kashiko_engine::kana::is_all_kana(&cand.text)
+                                || cand.text.chars().any(|ch| ch.is_ascii_alphabetic())
+                            {
+                                continue;
+                            }
+                            let stem: String = pieces
+                                .iter()
+                                .enumerate()
+                                .map(|(j, (_, pc))| if j == i { cand.text.as_str() } else { pc.as_str() })
+                                .collect();
+                            let variant = format!("{head}{stem}{tail}");
+                            if variant != converted && !out.contains(&variant) {
+                                out.push(variant);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 lookups.push((stem_reading.clone(), None));
             }
 
@@ -3076,7 +3184,19 @@ impl InputMethodEngine {
         /// genuinely wrong.
         const SHORT_READING_CHARS: usize = 4;
 
+        /// A single phrase up to this length (`しこうちゅうの`, one word plus its
+        /// particle) is judged like a short reading: with no sentence around
+        /// it the model just prefers the commonest homophone (施工中の 0.05 vs
+        /// 思考中の 1.10), which says nothing about which one the user means.
+        /// Only candidates with a genuinely broken character are dropped.
+        const SINGLE_PHRASE_MAX_CHARS: usize = 8;
+
         let short_reading = reading.chars().count() <= SHORT_READING_CHARS;
+        let single_phrase = reading.chars().count() <= SINGLE_PHRASE_MAX_CHARS
+            && candidates
+                .first()
+                .and_then(|top| kashiko_engine::segment::align(reading, &top.text))
+                .is_some_and(|spans| spans.len() == 1);
         if reading.chars().count() < MIN_RERANK_READING_CHARS || self.converters.kanji.is_none() {
             return;
         }
@@ -3165,7 +3285,10 @@ impl InputMethodEngine {
                     score: detail
                         .map(|d| if learned { d.mean - LEARNED_SCORE_BONUS } else { d.mean }),
                     worst: detail.map(|d| d.worst),
-                    never_drop: learned || short_reading,
+                    never_drop: learned
+                        || short_reading
+                        || (single_phrase
+                            && detail.is_some_and(|d| d.worst <= QUALITY_WORST_TOKEN_NLL)),
                 }
             })
             .collect();
@@ -3236,7 +3359,7 @@ impl InputMethodEngine {
         // on the first arrow press, and reused for the rest of the navigation.
         if self.segment_bounds.is_empty() {
             self.segment_bounds =
-                kashiko_engine::segment::boundaries_from_conversion(&full_reading, &selected)
+                self.phrase_boundaries(&full_reading, &selected)
                     .unwrap_or_else(|| self.word_boundaries(&full_reading));
         }
         let boundaries = self.segment_bounds.clone();

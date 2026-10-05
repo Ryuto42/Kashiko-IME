@@ -499,3 +499,26 @@ fn selection_stays_responsive_while_inference_runs() {
     let applied = e.apply_deep_outcome(outcome);
     println!("applied: {}", applied.is_some());
 }
+
+#[test]
+#[ignore]
+fn a_compound_offers_each_words_homophones() {
+    // `しこうちゅう` isn't in the dictionary as a whole, so `施工中の` was
+    // treated as one opaque word: no 思考中の, and Right had nothing to split.
+    let mut e = real_engine();
+    let cands = candidates_for(&mut e, "", "しこうちゅうの");
+    println!("candidates={cands:?}");
+    assert!(cands.iter().any(|c| c == "思考中の"), "{cands:?}");
+
+    e.process_key(&press_key(Keysym::RIGHT));
+    let focused = match e.state() {
+        InputState::Conversion { candidates, .. } => candidates
+            .candidates()
+            .iter()
+            .map(|c| c.text.clone())
+            .collect::<Vec<_>>(),
+        other => panic!("expected Conversion state, got {other:?}"),
+    };
+    println!("focused={focused:?}");
+    assert!(focused.iter().any(|c| c == "思考"), "{focused:?}");
+}
