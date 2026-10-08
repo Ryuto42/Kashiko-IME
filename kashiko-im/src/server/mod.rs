@@ -18,7 +18,7 @@ use crate::core::state::InputState;
 
 use protocol::{
     Action, CandidateItem, InitResult, KeyResult, PROTOCOL_VERSION, PreeditAttr, ProcessKeyParams,
-    Request, Response, RpcError, SelectCandidateParams, StatusResult,
+    Request, Response, RpcError, SecureInputParams, SelectCandidateParams, StatusResult,
     SurroundingTextParams,
 };
 
@@ -85,6 +85,18 @@ impl ImServer {
         Some(serde_json::to_string(&resp).expect("response serialization"))
     }
 
+    /// Error response for a request whose handler panicked. The engine is
+    /// reset, since the panic may have left it mid-transition.
+    pub fn recover_from_panic(&mut self, line: &str) -> Option<String> {
+        self.engine.reset();
+        let id = serde_json::from_str::<Request>(line).ok()?.id?;
+        let resp = Response::failure(
+            id,
+            RpcError::new(RpcError::INTERNAL_ERROR, "internal error"),
+        );
+        Some(serde_json::to_string(&resp).expect("response serialization"))
+    }
+
     fn dispatch(&mut self, method: &str, params: Value) -> Result<Value, RpcError> {
         match method {
             "init" => self.handle_init(),
@@ -133,6 +145,11 @@ impl ImServer {
                 let params: SurroundingTextParams = parse_params(params)?;
                 self.engine
                     .set_surrounding_text_at(&params.text, params.cursor_pos);
+                Ok(json!({}))
+            }
+            "set_secure_input" => {
+                let params: SecureInputParams = parse_params(params)?;
+                self.engine.set_secure_input(params.active);
                 Ok(json!({}))
             }
 

@@ -663,8 +663,11 @@ impl InputMethodEngine {
 
         let strategy = self.determine_strategy(reading, num_candidates);
         debug!(
-            "convert: reading=\"{}\" api_context=\"{}\" candidates={} strategy={:?}",
-            reading, api_context, num_candidates, strategy
+            "convert: reading={} chars api_context={} chars candidates={} strategy={:?}",
+            reading.chars().count(),
+            api_context.chars().count(),
+            num_candidates,
+            strategy
         );
 
         let start = Instant::now();
@@ -1067,6 +1070,20 @@ impl InputMethodEngine {
         // context before anything is pinned on top, so the ordering reflects
         // the language model rather than the decoder's beam order.
         self.rerank_by_likelihood(&reading, &mut candidates);
+
+        // Words kept in Latin script might have been meant as kana; the
+        // all-Japanese reading goes just above the fallbacks.
+        if split_idx >= total_chars {
+            let alternatives = self.kana_alternatives();
+            let at = candidates
+                .iter()
+                .position(|c| c.source == CandidateSource::Fallback)
+                .unwrap_or(candidates.len());
+            let existing: HashSet<String> = candidates.iter().map(|c| c.text.clone()).collect();
+            let fresh: Vec<AnnotatedCandidate> =
+                alternatives.into_iter().filter(|c| !existing.contains(&c.text)).collect();
+            candidates.splice(at..at, fresh);
+        }
 
         // The live-conversion text leads the list unconditionally: it is what
         // the user was already looking at, so Space must never appear to throw
@@ -2590,6 +2607,9 @@ impl InputMethodEngine {
 
     /// Record a conversion selection in the learning cache.
     pub(super) fn record_learning(&mut self, reading: &str, surface: &str) {
+        if self.secure_input {
+            return;
+        }
         if let Some(cache) = &mut self.learning {
             cache.record(reading, surface);
         }
@@ -2621,12 +2641,16 @@ impl InputMethodEngine {
             None
         };
 
-        // Record learning for the committed segment
-        if self.input_mode != InputMode::Emoji {
+        // Record learning for the committed segment. A kana reading of words
+        // kept in Latin script is not a conversion of `reading` (which holds
+        // the Latin), so it teaches the English detection instead.
+        let kana_alternative = self.mixed.kana_alternatives.contains(&text);
+        if self.input_mode != InputMode::Emoji && !kana_alternative {
             if let Some(reading) = &reading {
                 self.record_learning(reading, &text);
             }
         }
+        self.learn_from_mixed_commit(&text);
 
         // Segments settled by sliding the focus right (Left/Right) commit
         // together with the focused one, ahead of it.
@@ -2880,7 +2904,9 @@ impl InputMethodEngine {
         // (`しいんほかん`: `試飲保管` out, `子音補完` in), which is short enough
         // to learn and applies wherever that reading turns up next, live
         // conversion included.
-        if let Some(survivor) = survivor {
+        if let Some(survivor) = survivor
+            && !self.secure_input
+        {
             for (span_reading, rejected, wanted) in differing_spans(&reading, &text, &survivor) {
                 cache.suppress(&span_reading, &rejected);
                 cache.record(&span_reading, &wanted);

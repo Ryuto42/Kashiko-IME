@@ -1,3 +1,4 @@
+import Carbon
 import Cocoa
 import InputMethodKit
 
@@ -54,6 +55,11 @@ class KashikoInputController: IMKInputController {
         guard event.type == .keyDown else { return false }
         guard let client = sender as? (any IMKTextInput) else { return false }
 
+        // Password fields and secure keyboard entry: nothing typed may be
+        // learned or read back as context.
+        let secureInput = IsSecureEventInputEnabled()
+        engineClient.setSecureInput(secureInput)
+
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         // Never swallow Command shortcuts.
         if flags.contains(.command) { return false }
@@ -85,7 +91,7 @@ class KashikoInputController: IMKInputController {
         // (0xff00 range): they can't start a composition, and the three
         // synchronous client IPCs in sendSurroundingText would otherwise
         // fire on every arrow-key repeat.
-        if !hasPreedit && key.keysym < 0xff00 {
+        if !secureInput && !hasPreedit && key.keysym < 0xff00 {
             sendSurroundingText(client: client)
         }
 

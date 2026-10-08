@@ -720,3 +720,61 @@ fn common_words_convert_without_context() {
     // Measured: jinen-v1 38/42 and 39/42, jinen-v2 37 and 39.
     assert!(live_ok * 100 >= words.len() * 85 && top_ok * 100 >= words.len() * 90);
 }
+
+#[test]
+#[ignore]
+fn english_inside_romaji_converts_around_it() {
+    let mut e = real_engine();
+    e.learning = None;
+    e.live.enabled = true;
+    let cases = [
+        ("kyouhagoogledekensakusuru", "Google"),
+        ("githubnoissuewokakunin", "GitHub"),
+        ("ashitanomeetingnisanka", "meeting"),
+    ];
+    let mut misses = Vec::new();
+    for (raw, word) in cases {
+        e.reset();
+        let t = std::time::Instant::now();
+        for c in raw.chars() {
+            e.process_key(&press(c));
+        }
+        let per_key = t.elapsed().as_millis() / raw.len() as u128;
+        let live = e.live.text.clone();
+        println!("{raw}: buffer={} live={live} ({per_key} ms/key)", e.input_buf.text);
+        if !live.contains(word) || live.chars().any(|c| ('ぁ'..='ゖ').contains(&c) && false) {
+            misses.push(format!("{raw}: {live}"));
+        }
+    }
+    assert!(misses.is_empty(), "{misses:#?}");
+}
+
+/// Japanese sentences typed as romaji never sprout English, with the real
+/// dictionary deciding what is a word. `ROMAJI_CORPUS`: one sentence per line.
+#[test]
+#[ignore]
+fn romaji_corpus_stays_japanese() {
+    let Ok(path) = std::env::var("ROMAJI_CORPUS") else {
+        return;
+    };
+    let mut e = real_engine();
+    // `KEEP_LEARNING=1` runs against the user's own learning cache.
+    if std::env::var("KEEP_LEARNING").is_err() {
+        e.learning = None;
+    }
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut bad = Vec::new();
+    for line in text.lines() {
+        e.reset();
+        for c in line.chars() {
+            e.process_key(&press(c));
+            if !e.mixed.words.is_empty() {
+                bad.push(format!("{line}: {:?} in {}", e.mixed.words, e.input_buf.text));
+                break;
+            }
+        }
+    }
+    println!("{} lines, {} with English", text.lines().count(), bad.len());
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+

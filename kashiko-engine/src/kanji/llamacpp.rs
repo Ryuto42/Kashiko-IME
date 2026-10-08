@@ -37,6 +37,17 @@ fn get_backend() -> Result<&'static LlamaBackend> {
 }
 
 /// Convert bytes to hex display format for partial UTF-8 sequences
+/// Reject token sequences that can't fit in the context before they reach
+/// llama.cpp, which may abort the whole process instead of returning an error.
+fn ensure_fits(n_tokens: usize, n_ctx: u32) -> Result<()> {
+    if n_tokens == 0 || n_tokens > n_ctx as usize {
+        return Err(KanjiError::Inference(
+            format!("{n_tokens} tokens do not fit in n_ctx {n_ctx}").into(),
+        ));
+    }
+    Ok(())
+}
+
 fn bytes_to_hex_display(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("<{:02X}>", b)).collect()
 }
@@ -345,6 +356,8 @@ impl LlamaCppModel {
         eos_token_id: Option<i32>,
         beam_size: usize,
     ) -> Result<Vec<(Vec<LlamaToken>, f32)>> {
+        ensure_fits(input_tokens.len() + 1, self.n_ctx)?;
+        let max_new_tokens = max_new_tokens.min(self.n_ctx as usize - input_tokens.len());
         let backend = get_backend()?;
 
         // Set n_batch and n_ubatch large enough to avoid batch splitting
@@ -500,6 +513,8 @@ impl LlamaCppModel {
         eos_token_id: Option<i32>,
         beam_size: usize,
     ) -> Result<Vec<(Vec<LlamaToken>, f32)>> {
+        ensure_fits(input_tokens.len() + 1, self.n_ctx)?;
+        let max_new_tokens = max_new_tokens.min(self.n_ctx as usize - input_tokens.len());
         let model_eos = self.model.token_eos();
 
         // Step 1: Get initial logits
@@ -610,6 +625,7 @@ impl LlamaCppModel {
     /// Creates a fresh context for each call. Used by true beam search where
     /// each beam needs independent evaluation.
     fn eval_sequence(&self, tokens: &[LlamaToken]) -> Result<Vec<f32>> {
+        ensure_fits(tokens.len(), self.n_ctx)?;
         let backend = get_backend()?;
         let ctx_params = self.context_params();
 
@@ -684,6 +700,8 @@ impl LlamaCppModel {
         eos_token_id: Option<i32>,
         mut sampler: LlamaSampler,
     ) -> Result<(Vec<LlamaToken>, f32)> {
+        ensure_fits(input_tokens.len() + 1, self.n_ctx)?;
+        let max_new_tokens = max_new_tokens.min(self.n_ctx as usize - input_tokens.len());
         let backend = get_backend()?;
         let ctx_params = self.context_params();
 
@@ -780,6 +798,7 @@ pub struct NllScorer<'a> {
     model: &'a LlamaCppModel,
     ctx: llama_cpp_2::context::LlamaContext<'a>,
     vocab_size: usize,
+    n_ctx: u32,
 }
 
 impl<'a> NllScorer<'a> {
@@ -802,6 +821,7 @@ impl<'a> NllScorer<'a> {
             model,
             ctx,
             vocab_size,
+            n_ctx,
         })
     }
 
@@ -832,6 +852,7 @@ impl<'a> NllScorer<'a> {
         if full_tokens.len() <= prompt_tokens.len() {
             return Ok(100.0);
         }
+        ensure_fits(full_tokens.len(), self.n_ctx)?;
         self.ctx.clear_kv_cache();
         let mut batch = LlamaBatch::new(full_tokens.len().max(512), 1);
         batch
@@ -878,6 +899,7 @@ impl<'a> NllScorer<'a> {
         }
 
         let n_tokens = full_tokens.len();
+        ensure_fits(n_tokens, self.n_ctx)?;
 
         self.ctx.clear_kv_cache();
 

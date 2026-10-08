@@ -14,6 +14,7 @@
 //! | `commit`               | `{}`                                     | [`KeyResult`]     |
 //! | `reset`                | `{}`                                     | `{}`              |
 //! | `set_surrounding_text` | [`SurroundingTextParams`]                | `{}`              |
+//! | `set_secure_input`     | [`SecureInputParams`]                    | `{}`              |
 //! | `save_learning`        | `{}`                                     | `{}`              |
 //! | `status`               | `{}`                                     | [`StatusResult`]  |
 //!
@@ -120,6 +121,12 @@ pub struct SurroundingTextParams {
     pub text: String,
     /// Cursor position within `text`, in Unicode scalar values.
     pub cursor_pos: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SecureInputParams {
+    /// Secure event input is on: stop learning and drop context.
+    pub active: bool,
 }
 
 // === Results ===

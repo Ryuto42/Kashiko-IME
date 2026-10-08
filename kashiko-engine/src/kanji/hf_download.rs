@@ -7,20 +7,31 @@ use super::error::KanjiError;
 use super::model_config::{ModelFamily, VariantConfig, registry};
 type Result<T> = super::error::Result<T>;
 use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
-use std::path::PathBuf;
+use ring::digest::{Context, SHA256};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
-/// Download a GGUF model from HuggingFace Hub
+/// Download a file from HuggingFace Hub at a pinned commit and verify its SHA-256
 ///
 /// Returns the local path to the downloaded file.
 /// The file is cached in the HuggingFace cache directory (~/.cache/huggingface/hub/).
+/// The cached file is re-verified on every call, so a tampered cache is
+/// rejected as well.
 ///
 /// # Arguments
 /// * `repo_id` - HuggingFace repository ID
+/// * `revision` - Commit SHA to download from
 /// * `filename` - Filename to download
+/// * `sha256` - Expected SHA-256 of the file (lowercase hex)
 ///
 /// # Environment Variables
 /// * `HF_TOKEN` - HuggingFace API token (required for private repositories)
-pub fn download_gguf(repo_id: &str, filename: &str) -> Result<PathBuf> {
+pub fn download_gguf(
+    repo_id: &str,
+    revision: &str,
+    filename: &str,
+    sha256: &str,
+) -> Result<PathBuf> {
     // Check for HF_TOKEN environment variable
     let mut builder = ApiBuilder::new();
     if let Ok(token) = std::env::var("HF_TOKEN") {
@@ -30,27 +41,76 @@ pub fn download_gguf(repo_id: &str, filename: &str) -> Result<PathBuf> {
         .build()
         .map_err(|e| KanjiError::Download(e.into()))?;
 
-    let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
+    let repo = api.repo(Repo::with_revision(
+        repo_id.to_string(),
+        RepoType::Model,
+        revision.to_string(),
+    ));
 
-    tracing::info!("Downloading {} from {}...", filename, repo_id);
+    tracing::info!("Downloading {} from {}@{}...", filename, repo_id, revision);
 
     let path = repo
         .get(filename)
         .map_err(|e| KanjiError::Download(e.into()))?;
+
+    verify_sha256(&path, sha256)?;
 
     tracing::info!("Downloaded to {:?}", path);
 
     Ok(path)
 }
 
+fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
+    let mut file = std::fs::File::open(path).map_err(|e| KanjiError::Download(e.into()))?;
+    let mut ctx = Context::new(&SHA256);
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| KanjiError::Download(e.into()))?;
+        if n == 0 {
+            break;
+        }
+        ctx.update(&buf[..n]);
+    }
+    let actual: String = ctx
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(KanjiError::Download(
+            format!(
+                "sha256 mismatch for {}: expected {}, got {}",
+                path.display(),
+                expected,
+                actual
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Get local path for a variant, downloading if not cached.
 pub fn get_variant_path(family: &ModelFamily, variant: &VariantConfig) -> Result<PathBuf> {
-    download_gguf(&family.repo_id, &variant.filename)
+    download_gguf(
+        &family.repo_id,
+        &family.revision,
+        &variant.filename,
+        &variant.sha256,
+    )
 }
 
 /// Get the local path to `tokenizer.json` for a model family, downloading if necessary.
 pub fn get_tokenizer_path(family: &ModelFamily) -> Result<PathBuf> {
-    download_gguf(&family.repo_id, "tokenizer.json")
+    download_gguf(
+        &family.repo_id,
+        &family.revision,
+        "tokenizer.json",
+        &family.tokenizer_sha256,
+    )
 }
 
 /// Convenience: look up a variant id in the global registry and return its local GGUF path.
@@ -113,6 +173,30 @@ mod tests {
                 id
             );
         }
+    }
+
+    #[test]
+    fn test_registry_entries_are_pinned() {
+        let is_hex = |s: &str, len: usize| {
+            s.len() == len && s.chars().all(|c| c.is_ascii_hexdigit())
+        };
+        for family in registry().models.values() {
+            assert!(is_hex(&family.revision, 40), "{}", family.repo_id);
+            assert!(is_hex(&family.tokenizer_sha256, 64), "{}", family.repo_id);
+            for variant in family.variants.values() {
+                assert!(is_hex(&variant.sha256, 64), "{}", variant.id);
+            }
+        }
+    }
+
+    #[test]
+    fn test_verify_sha256() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"abc").unwrap();
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(verify_sha256(&path, abc).is_ok());
+        assert!(verify_sha256(&path, &"0".repeat(64)).is_err());
     }
 
     #[test]

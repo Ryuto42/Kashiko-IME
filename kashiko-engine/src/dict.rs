@@ -96,6 +96,53 @@ pub struct Dictionary {
     cands: Box<[CandSpan]>,
 }
 
+/// yada indexes the trie with `get_unchecked`, so a malformed trie would read
+/// out of bounds. A builder-produced trie is whole 256-unit blocks and every
+/// transition from a non-leaf unit stays inside the block that `offset ^ id`
+/// selects, so checking that block for each unit bounds every lookup. The leaf
+/// checks keep yada's internal asserts from panicking on a corrupt file.
+fn validate_trie(bytes: &[u8], num_entries: usize) -> Result<()> {
+    const UNIT_SIZE: usize = 4;
+    const BLOCK_UNITS: usize = 256;
+    if bytes.is_empty() || bytes.len() % (UNIT_SIZE * BLOCK_UNITS) != 0 {
+        return Err(DictError::Format(format!(
+            "trie length {} is not a whole number of blocks",
+            bytes.len()
+        )));
+    }
+    let num_units = bytes.len() / UNIT_SIZE;
+    let unit = |i: usize| {
+        u32::from_le_bytes([
+            bytes[i * UNIT_SIZE],
+            bytes[i * UNIT_SIZE + 1],
+            bytes[i * UNIT_SIZE + 2],
+            bytes[i * UNIT_SIZE + 3],
+        ])
+    };
+    let is_leaf = |u: u32| u >> 31 == 1;
+    if is_leaf(unit(0)) {
+        return Err(DictError::Format("trie root is a leaf".to_string()));
+    }
+    for i in 0..num_units {
+        let u = unit(i);
+        if is_leaf(u) {
+            if (u & 0x7FFF_FFFF) as usize >= num_entries {
+                return Err(DictError::Format(format!("trie value out of range at unit {i}")));
+            }
+            continue;
+        }
+        let offset = (u >> 10) << ((u & (1 << 9)) >> 6);
+        let base = (offset ^ i as u32) as usize;
+        if base / BLOCK_UNITS >= num_units / BLOCK_UNITS {
+            return Err(DictError::Format(format!("trie transition out of bounds at unit {i}")));
+        }
+        if (u >> 8) & 1 == 1 && !is_leaf(unit(base)) {
+            return Err(DictError::Format(format!("trie leaf missing at unit {i}")));
+        }
+    }
+    Ok(())
+}
+
 impl Dictionary {
     fn text(&self, at: u32, len: u16) -> &str {
         let (at, len) = (at as usize, len as usize);
@@ -340,6 +387,7 @@ impl Dictionary {
                 num_entries, MAX_ENTRIES
             )));
         }
+        validate_trie(&trie_bytes, num_entries)?;
         // Stream the entry section into a text-only arena: the file interleaves
         // lengths and scores with the text, and those are already in the index
         // arrays, so copying them into the blob would be dead weight. Streaming
@@ -396,6 +444,10 @@ impl Dictionary {
                 reading_len: reading_len as u16,
                 cands_len: num_candidates as u16,
             });
+        }
+        // Offsets are stored as u32; a larger arena would have wrapped them.
+        if blob.len() > u32::MAX as usize || cands.len() > u32::MAX as usize {
+            return Err(DictError::Format("entry section too large".to_string()));
         }
         blob.shrink_to_fit();
         tracing::debug!(
@@ -834,6 +886,32 @@ mod tests {
 
         let results = loaded.common_prefix_search("きょうと");
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_load_rejects_corrupt_trie() {
+        let json_file = create_test_json();
+        let dict = Dictionary::build_from_json(json_file.path()).unwrap();
+        let bin_file = NamedTempFile::new().unwrap();
+        dict.save(bin_file.path()).unwrap();
+
+        // Root unit (right after magic, version, trie_len) pointing far past
+        // the end of the trie.
+        let mut bytes = std::fs::read(bin_file.path()).unwrap();
+        bytes[12..16].copy_from_slice(&(0x1F_FFFFu32 << 10).to_le_bytes());
+        std::fs::write(bin_file.path(), &bytes).unwrap();
+
+        assert!(matches!(
+            Dictionary::load(bin_file.path()),
+            Err(DictError::Format(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_trie_rejects_partial_block() {
+        assert!(validate_trie(&[0u8; 1020], 0).is_err());
+        assert!(validate_trie(&[], 0).is_err());
+        assert!(validate_trie(&[0u8; 1024], 0).is_ok());
     }
 
     #[test]

@@ -235,3 +235,22 @@ fn test_status_before_init() {
     assert_eq!(resp["result"]["initialized"], false);
     assert_eq!(resp["result"]["state"], "empty");
 }
+
+#[test]
+fn test_set_secure_input() {
+    let mut server = test_server();
+    let resp = request(
+        &mut server,
+        json!({"jsonrpc":"2.0","id":13,"method":"set_secure_input","params":{"active":true}}),
+    );
+    assert!(resp["error"].is_null());
+}
+
+#[test]
+fn test_recover_from_panic_returns_internal_error() {
+    let mut server = test_server();
+    let line = r#"{"jsonrpc":"2.0","id":14,"method":"process_key","params":{"keysym":97}}"#;
+    let resp: Value = serde_json::from_str(&server.recover_from_panic(line).unwrap()).unwrap();
+    assert_eq!(resp["id"], 14);
+    assert_eq!(resp["error"]["code"], -32603);
+}

@@ -94,7 +94,7 @@ struct EmojiTable {
 }
 
 static EMOJI_TABLE: LazyLock<EmojiTable> = LazyLock::new(|| {
-    let file: EmojiFile = serde_yaml::from_str(EMOJI_YAML).expect("emoji.yml must be valid YAML");
+    let file: EmojiFile = yaml_serde::from_str(EMOJI_YAML).expect("emoji.yml must be valid YAML");
 
     let mut by_reading: HashMap<String, Vec<String>> = HashMap::new();
     let mut triggers: Vec<(String, String)> = Vec::new();

@@ -222,7 +222,7 @@ impl InputMethodEngine {
     /// Append committed text to the fallback context tail, keeping only as much
     /// as conversion can actually use.
     pub(super) fn record_committed_context(&mut self, text: &str) {
-        if text.is_empty() || self.config.max_api_context_len == 0 {
+        if text.is_empty() || self.config.max_api_context_len == 0 || self.secure_input {
             return;
         }
         self.committed_tail.push_str(text);

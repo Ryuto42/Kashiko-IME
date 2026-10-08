@@ -158,12 +158,12 @@ fn test_alphabet_mode_uppercase_with_shift() {
     engine.process_key(&press_shift('A'));
     assert!(engine.input_mode == InputMode::Alphabet);
 
-    // Type lowercase 'a' → should be 'あ' (because alphabet mode is temporary)
+    // Lowercase after it continues the English word.
     engine.process_key(&press('a'));
-    assert_eq!(engine.preedit().unwrap().text(), "Aあ");
-    assert!(engine.input_mode == InputMode::Hiragana);
+    assert_eq!(engine.preedit().unwrap().text(), "Aa");
+    assert!(engine.input_mode == InputMode::Alphabet);
 
-    // Shift+a → uppercase 'A' (enters alphabet mode temporarily again)
+    // Shift+a → uppercase 'A'
     let event = KeyEvent::new(
         Keysym(0x0061), // lowercase keysym
         KeyModifiers::new().with_shift(true),
@@ -171,7 +171,39 @@ fn test_alphabet_mode_uppercase_with_shift() {
     );
     engine.process_key(&event);
     assert!(engine.input_mode == InputMode::Alphabet);
-    assert_eq!(engine.preedit().unwrap().text(), "AあA");
+    assert_eq!(engine.preedit().unwrap().text(), "AaA");
+}
+
+#[test]
+fn english_started_with_shift_lasts_until_enter() {
+    let mut engine = InputMethodEngine::new();
+    engine.process_key(&press_shift('H'));
+    for c in "ello".chars() {
+        engine.process_key(&press(c));
+    }
+    engine.process_key(&press_key(Keysym::SPACE));
+    for c in "world".chars() {
+        engine.process_key(&press(c));
+    }
+    assert_eq!(engine.preedit().unwrap().text(), "Hello world");
+    let result = engine.process_key(&press_key(Keysym::RETURN));
+    assert!(result
+        .actions
+        .iter()
+        .any(|a| matches!(a, EngineAction::Commit(t) if t == "Hello world")));
+    // Back to Japanese for the next word.
+    assert!(engine.input_mode == InputMode::Hiragana);
+    engine.process_key(&press('a'));
+    assert_eq!(engine.preedit().unwrap().text(), "あ");
+}
+
+#[test]
+fn escape_also_ends_english_started_with_shift() {
+    let mut engine = InputMethodEngine::new();
+    engine.process_key(&press_shift('O'));
+    engine.process_key(&press('k'));
+    engine.process_key(&press_key(Keysym::ESCAPE));
+    assert!(engine.input_mode == InputMode::Hiragana);
 }
 
 #[test]
@@ -222,13 +254,13 @@ fn test_mixed_hiragana_alphabet_input() {
     assert!(engine.input_mode == InputMode::Alphabet);
     assert_eq!(engine.preedit().unwrap().text(), "わたしはL");
 
-    // Continue typing without shift → fallback to hiragana mode
+    // Continue typing without shift → still English
     engine.process_key(&press('i'));
     engine.process_key(&press('n'));
     engine.process_key(&press('u'));
     engine.process_key(&press('x'));
-    assert_eq!(engine.preedit().unwrap().text(), "わたしはLいぬx");
-    assert!(engine.input_mode == InputMode::Hiragana);
+    assert_eq!(engine.preedit().unwrap().text(), "わたしはLinux");
+    assert!(engine.input_mode == InputMode::Alphabet);
 }
 
 #[test]

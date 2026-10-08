@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::{AllowOrigin, Any, CorsLayer},
     services::ServeDir,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -261,9 +261,13 @@ async fn main() {
         debug_mode: args.debug,
     };
 
-    // Setup CORS
+    // Setup CORS: loopback origins only (the bundled UI calls
+    // http://localhost:3000 even when opened via 127.0.0.1), so other sites
+    // open in the browser can't drive the server.
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
+            origin.to_str().is_ok_and(is_loopback_origin)
+        }))
         .allow_methods(Any)
         .allow_headers(Any);
 
@@ -731,4 +735,21 @@ async fn llamacpp_convert(
         candidate_tokens: candidate_viz,
         beam_search_type: Some(beam_search_type_used.to_string()),
     }))
+}
+
+fn is_loopback_origin(origin: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    ["localhost", "127.0.0.1", "[::1]"].iter().any(|host| {
+        rest.strip_prefix(host).is_some_and(|port| {
+            port.is_empty()
+                || port
+                    .strip_prefix(':')
+                    .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        })
+    })
 }

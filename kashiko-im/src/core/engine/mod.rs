@@ -11,6 +11,7 @@ mod display;
 mod init;
 mod input;
 mod input_buffer;
+mod mixed_input;
 mod mode;
 mod strategy;
 mod types;
@@ -140,8 +141,11 @@ pub struct InputMethodEngine {
     metrics: ConversionMetrics,
     /// Current input mode (Hiragana, Katakana, or Alphabet)
     input_mode: InputMode,
-    /// Whether alphabet mode was entered implicitly via Shift+Letter
+    /// Whether alphabet mode was entered implicitly via Shift+Letter; such a
+    /// mode lasts until the composition is committed or cancelled.
     shift_alphabet_active: bool,
+    /// English words detected in the current romaji composition.
+    mixed: mixed_input::MixedInput,
     /// Mode active immediately before entering [`InputMode::Emoji`],
     /// so commit/cancel/backspace-to-empty can put the user back where
     /// they were instead of dropping them in Hiragana every time. `None`
@@ -207,6 +211,9 @@ pub struct InputMethodEngine {
     /// that sits left of the cursor, so it stands in. Authoritative document
     /// context always wins when available; this is only a fallback.
     committed_tail: String,
+    /// Secure event input is on (password fields, terminals with secure
+    /// keyboard entry): nothing typed is learned or kept as context.
+    secure_input: bool,
     /// Converted text of the region *after* the focused segment, kept so the
     /// unfocused tail stays converted while the focus slides through the
     /// sentence. `None` means show the raw reading there instead — the
@@ -276,6 +283,7 @@ impl InputMethodEngine {
             metrics: ConversionMetrics::default(),
             input_mode: InputMode::Hiragana,
             shift_alphabet_active: false,
+            mixed: mixed_input::MixedInput::default(),
             pre_emoji_mode: None,
             input_buf: InputBuffer::new(),
             live: LiveConversion::default(),
@@ -291,6 +299,7 @@ impl InputMethodEngine {
             deep_round: 0,
             last_commit: None,
             committed_tail: String::new(),
+            secure_input: false,
             tail_text: None,
             segment_bounds: Vec::new(),
             decided: Vec::new(),
@@ -478,9 +487,14 @@ impl InputMethodEngine {
     /// right_context: text after cursor
     pub fn set_surrounding_context(&mut self, left_context: &str, right_context: &str) {
         debug!(
-            "set_surrounding_context: left=\"{}\" right=\"{}\"",
-            left_context, right_context
+            "set_surrounding_context: left={} chars, right={} chars",
+            left_context.chars().count(),
+            right_context.chars().count()
         );
+        if self.secure_input {
+            self.surrounding_context = None;
+            return;
+        }
 
         // Strip to current line: left = text after last newline.
         // If cursor is right after a newline, left context is empty.
@@ -687,6 +701,16 @@ impl InputMethodEngine {
         result
             .with_action(EngineAction::HideCandidates)
             .with_action(EngineAction::HideAuxText)
+    }
+
+    /// Enter or leave secure input. While on, conversions are neither learned
+    /// nor remembered as context; entering it drops the context gathered so far.
+    pub fn set_secure_input(&mut self, active: bool) {
+        self.secure_input = active;
+        if active {
+            self.surrounding_context = None;
+            self.committed_tail.clear();
+        }
     }
 
     /// Save the learning cache to disk if it has unsaved changes.

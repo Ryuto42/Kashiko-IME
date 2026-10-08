@@ -29,11 +29,13 @@ class EngineProcess {
         if let override = serverPathOverride {
             return override
         }
+        #if DEBUG
         // Development override: run the IME from `swift run` against a
         // locally built server without assembling the bundle.
         if let override = ProcessInfo.processInfo.environment["KASHIKO_IMSERVER"] {
             return override
         }
+        #endif
         return Bundle.main.bundlePath + "/Contents/MacOS/kashiko-imserver"
     }
 
@@ -52,9 +54,13 @@ class EngineProcess {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: path)
         var env = ProcessInfo.processInfo.environment
+        #if DEBUG
         if env["RUST_LOG"] == nil {
             env["RUST_LOG"] = "info"
         }
+        #else
+        env["RUST_LOG"] = "info"
+        #endif
         proc.environment = env
 
         let stdin = Pipe()

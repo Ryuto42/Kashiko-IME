@@ -6,6 +6,7 @@ pub mod kanji;
 pub mod learning;
 pub mod learning_file;
 pub mod loanword;
+pub mod mixed;
 pub mod rewriter;
 pub mod romaji;
 pub mod segment;

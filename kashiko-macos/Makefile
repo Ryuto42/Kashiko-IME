@@ -4,7 +4,13 @@ INSTALL_DIR = $(HOME)/Library/Input Methods
 CARGO_MANIFEST = ../Cargo.toml
 CARGO_TARGET = ../target
 DATA_DIR = $(HOME)/Library/Application Support/com.kashiko.kashiko-im
-DICT_URL = https://github.com/togatoga/kashiko/releases/latest/download/dict.tgz
+# Pinned release asset (never `latest`); DICT_TGZ is used when present.
+DICT_REPO ?= Ryuto42/Kashiko-IME
+DICT_RELEASE ?= dict-20260226
+DICT_URL ?=
+DICT_TGZ ?= dict.tgz
+DICT_TGZ_SHA256 = f194d2526bf826622bc5baf7c07e7525ad9bde2dc63896cd929045283a4aeccd
+DICT_BIN_SHA256 = d85fed3c7e408e67f4a5dbe2314338366ed6183e0498d2726bc5a4dcaf5bb83b
 
 .PHONY: all build build-universal bundle install install-dict install-models test fmt lint clean
 
@@ -43,18 +49,29 @@ bundle: build
 	cp .build/release/KashikoIME $(APP)/Contents/MacOS/
 	cp $(CARGO_TARGET)/release/kashiko-imserver $(APP)/Contents/MacOS/
 	cp -r resources/* $(APP)/Contents/Resources/
-	codesign --force --deep --sign - $(APP)
+	codesign --force --options runtime --sign - $(APP)/Contents/MacOS/kashiko-imserver
+	codesign --force --options runtime --sign - $(APP)
 
-# Download the prebuilt system dictionary unless one is already installed.
-# Non-fatal on failure (e.g. offline) — the IME works model-only without it.
+# Install the prebuilt system dictionary unless one is already installed.
+# Both the archive and the extracted dict.bin are verified against pinned
+# SHA-256 digests. Non-fatal on failure — the IME works model-only without it.
 install-dict:
 	@if [ -f "$(DATA_DIR)/dict.bin" ]; then \
 		echo "System dictionary already installed: $(DATA_DIR)/dict.bin (skipping download)"; \
 	else \
-		echo "Downloading system dictionary from $(DICT_URL) ..."; \
 		tmp=$$(mktemp -d) && \
-		( curl -fL --progress-bar -o "$$tmp/dict.tgz" "$(DICT_URL)" && \
-		  tar xzf "$$tmp/dict.tgz" -C "$$tmp" && \
+		( if [ -f "$(DICT_TGZ)" ]; then \
+		    cp "$(DICT_TGZ)" "$$tmp/dict.tgz"; \
+		  elif [ -n "$(DICT_URL)" ]; then \
+		    echo "Downloading system dictionary from $(DICT_URL) ..." && \
+		    curl -fL --proto '=https' --progress-bar -o "$$tmp/dict.tgz" "$(DICT_URL)"; \
+		  else \
+		    echo "Downloading system dictionary from $(DICT_REPO)@$(DICT_RELEASE) ..." && \
+		    gh release download "$(DICT_RELEASE)" -R "$(DICT_REPO)" -p dict.tgz -D "$$tmp"; \
+		  fi && \
+		  echo "$(DICT_TGZ_SHA256)  $$tmp/dict.tgz" | shasum -a 256 -c - && \
+		  tar xzf "$$tmp/dict.tgz" -C "$$tmp" dict.bin && \
+		  echo "$(DICT_BIN_SHA256)  $$tmp/dict.bin" | shasum -a 256 -c - && \
 		  mkdir -p "$(DATA_DIR)" && \
 		  cp "$$tmp/dict.bin" "$(DATA_DIR)/" && \
 		  echo "Installed system dictionary to $(DATA_DIR)/dict.bin" \

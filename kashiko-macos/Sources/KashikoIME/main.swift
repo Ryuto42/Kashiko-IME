@@ -31,14 +31,29 @@ private func setupApplicationMenu() {
     app.mainMenu = mainMenu
 }
 
+private let logDir = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Logs/KashikoIME")
+private let logFile = logDir.appendingPathComponent("kashiko-ime.log")
+
+/// Move the log aside once it exceeds the size cap (one generation kept).
+private func rotateLogIfNeeded() -> Bool {
+    let maxLogBytes: UInt64 = 5 * 1024 * 1024
+    guard
+        let size = (try? FileManager.default.attributesOfItem(atPath: logFile.path))?[.size]
+            as? UInt64, size > maxLogBytes
+    else { return false }
+    let rotated = logDir.appendingPathComponent("kashiko-ime.log.1")
+    try? FileManager.default.removeItem(at: rotated)
+    return (try? FileManager.default.moveItem(at: logFile, to: rotated)) != nil
+}
+
 private func setupLogging() {
-    let logDir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Logs/KashikoIME")
     try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
 
-    let logFile = logDir.appendingPathComponent("kashiko-ime.log")
+    _ = rotateLogIfNeeded()
     if !FileManager.default.fileExists(atPath: logFile.path) {
-        FileManager.default.createFile(atPath: logFile.path, contents: nil)
+        FileManager.default.createFile(
+            atPath: logFile.path, contents: nil, attributes: [.posixPermissions: 0o600])
     }
 
     if let handle = FileHandle(forWritingAtPath: logFile.path) {
@@ -52,10 +67,18 @@ private func connectionName() -> String {
     if let name = Bundle.main.object(forInfoDictionaryKey: "InputMethodConnectionName") as? String {
         return name
     }
-    return (Bundle.main.bundleIdentifier ?? "dev.togatoga.inputmethod.Kashiko") + "_Connection"
+    return (Bundle.main.bundleIdentifier ?? "io.github.ryuto42.inputmethod.Kashiko") + "_Connection"
 }
 
 setupLogging()
+// The IME runs for days; re-check the log size hourly. The server child keeps
+// its inherited stderr until it restarts.
+let logRotationTimer = DispatchSource.makeTimerSource(queue: .main)
+logRotationTimer.schedule(deadline: .now() + 3600, repeating: 3600)
+logRotationTimer.setEventHandler {
+    if rotateLogIfNeeded() { setupLogging() }
+}
+logRotationTimer.resume()
 setupApplicationMenu()
 NSLog("KashikoIME: starting")
 

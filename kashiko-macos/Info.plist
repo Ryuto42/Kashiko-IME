@@ -15,7 +15,7 @@
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
     <key>CFBundleIdentifier</key>
-    <string>dev.togatoga.inputmethod.Kashiko</string>
+    <string>io.github.ryuto42.inputmethod.Kashiko</string>
     <key>CFBundleIconFile</key>
     <string>kashiko.icns</string>
     <key>CFBundleShortVersionString</key>
@@ -29,7 +29,7 @@
     <true/>
 
     <key>InputMethodConnectionName</key>
-    <string>dev.togatoga.inputmethod.Kashiko_Connection</string>
+    <string>io.github.ryuto42.inputmethod.Kashiko_Connection</string>
     <key>InputMethodServerControllerClass</key>
     <string>KashikoInputController</string>
 
@@ -45,10 +45,10 @@
       <key>tsInputModeListKey</key>
       <dict>
 
-        <key>dev.togatoga.inputmethod.Kashiko.Japanese</key>
+        <key>io.github.ryuto42.inputmethod.Kashiko.Japanese</key>
         <dict>
           <key>TISInputSourceID</key>
-          <string>dev.togatoga.inputmethod.Kashiko.Japanese</string>
+          <string>io.github.ryuto42.inputmethod.Kashiko.Japanese</string>
           <key>TISIntendedLanguage</key>
           <string>ja</string>
           <key>tsInputModeScriptKey</key>
@@ -71,7 +71,7 @@
 
       <key>tsVisibleInputModeOrderedArrayKey</key>
       <array>
-        <string>dev.togatoga.inputmethod.Kashiko.Japanese</string>
+        <string>io.github.ryuto42.inputmethod.Kashiko.Japanese</string>
       </array>
     </dict>
 

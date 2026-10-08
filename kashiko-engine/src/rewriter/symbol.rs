@@ -90,7 +90,7 @@ struct SymbolTable {
 
 static SYMBOL_TABLE: LazyLock<SymbolTable> = LazyLock::new(|| {
     let file: SymbolFile =
-        serde_yaml::from_str(SYMBOLS_YAML).expect("symbols.yml must be valid YAML");
+        yaml_serde::from_str(SYMBOLS_YAML).expect("symbols.yml must be valid YAML");
     let variants = file
         .variants
         .into_iter()

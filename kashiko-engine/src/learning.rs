@@ -244,6 +244,39 @@ impl LearningCache {
             .any(|entries| entries.iter().any(|e| e.surface == surface))
     }
 
+    /// Latin words the user committed for their own keystrokes (lowercased,
+    /// mapped to the spelling they committed — reading `あぴ`, surface `api`),
+    /// and those they rejected there (✕ or chose the kana reading instead).
+    pub fn latin_word_choices(
+        &self,
+    ) -> (
+        std::collections::HashMap<String, String>,
+        std::collections::HashSet<String>,
+    ) {
+        let mut chosen = std::collections::HashMap::new();
+        let mut rejected = std::collections::HashSet::new();
+        for (reading, entries) in &self.entries {
+            for e in entries {
+                if e.surface.is_empty() || !e.surface.chars().all(|c| c.is_ascii_alphabetic()) {
+                    continue;
+                }
+                let word = e.surface.to_ascii_lowercase();
+                // Only a choice made for the word's own keystrokes counts.
+                // `You` picked as the conversion of ゆー says nothing about
+                // `you` typed as romaji, which is よう.
+                if *reading != crate::mixed::all_kana(&word) {
+                    continue;
+                }
+                if e.frequency == Self::SUPPRESSED_FREQUENCY {
+                    rejected.insert(word);
+                } else {
+                    chosen.insert(word, e.surface.clone());
+                }
+            }
+        }
+        (chosen, rejected)
+    }
+
     /// Highest-scoring `(surface, frequency)` for an exact reading match, if any.
     ///
     /// Used by live conversion to decide whether a learned entry is confident

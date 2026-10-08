@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Newline-delimited JSON-RPC 2.0 client for kashiko-imserver.
 ///
@@ -10,18 +11,10 @@ import Foundation
 class EngineClient {
     private let serverProcess: EngineProcess
     private var nextID = 1
-    private let requestQueue = DispatchQueue(label: "dev.togatoga.kashiko.jsonrpc.request")
+    private let requestQueue = DispatchQueue(label: "io.github.ryuto42.kashiko.jsonrpc.request")
 
-    private func debugLog(_ msg: String) {
-        let text = "\(Date()): \(msg)\n"
-        if let handle = FileHandle(forWritingAtPath: "/tmp/kashiko_debug.log") {
-            handle.seekToEndOfFile()
-            handle.write(text.data(using: .utf8)!)
-            handle.closeFile()
-        } else {
-            try? text.write(toFile: "/tmp/kashiko_debug.log", atomically: false, encoding: .utf8)
-        }
-    }
+    private let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "KashikoIME", category: "EngineClient")
 
     private let lock = NSLock()
     private var pendingRequests: [Int: (Data?) -> Void] = [:]
@@ -36,6 +29,8 @@ class EngineClient {
     init(serverProcess: EngineProcess, autoInit: Bool = true) {
         self.serverProcess = serverProcess
         self.serverProcess.onRestart = { [weak self] in
+            // A fresh server starts with secure input off.
+            self?.secureInputActive = false
             self?.startReaderLoop()
             if autoInit {
                 self?.initAsync()
@@ -98,6 +93,17 @@ class EngineClient {
         ) { _ in }
     }
 
+    /// Last secure-input state sent to the server. Main queue only.
+    private var secureInputActive = false
+
+    /// Tell the server to stop (or resume) learning and context capture.
+    /// Sent only on change; queued ahead of the key that triggered it.
+    func setSecureInput(_ active: Bool) {
+        guard active != secureInputActive else { return }
+        secureInputActive = active
+        sendRequest(method: "set_secure_input", params: ["active": active]) { _ in }
+    }
+
     private func keyResultSync(method: String, params: [String: Any], timeout: TimeInterval)
         -> KeyResult?
     {
@@ -107,8 +113,7 @@ class EngineClient {
         do {
             return try makeProtocolDecoder().decode(KeyResult.self, from: data)
         } catch {
-            debugLog("failed to decode \(method) result: \(error)")
-            NSLog("KashikoIME: failed to decode \(method) result: \(error)")
+            logger.error("failed to decode \(method, privacy: .public) result: \(String(describing: error), privacy: .private)")
             return nil
         }
     }
@@ -118,7 +123,7 @@ class EngineClient {
     func startReaderLoop() {
         guard let stdout = serverProcess.stdoutPipe else { return }
 
-        let queue = DispatchQueue(label: "dev.togatoga.kashiko.jsonrpc.reader")
+        let queue = DispatchQueue(label: "io.github.ryuto42.kashiko.jsonrpc.reader")
         queue.async { [weak self] in
             let handle = stdout.fileHandleForReading
             var buffer = Data()
@@ -171,8 +176,7 @@ class EngineClient {
             do {
                 try stdin.fileHandleForWriting.write(contentsOf: data)
             } catch {
-                self.debugLog("failed to write request: \(error)")
-                NSLog("KashikoIME: failed to write request: \(error)")
+                self.logger.error("failed to write request: \(error.localizedDescription, privacy: .public)")
                 self.takePending(id: id)?(nil)
             }
         }
@@ -187,8 +191,7 @@ class EngineClient {
             semaphore.signal()
         }
         if semaphore.wait(timeout: .now() + timeout) == .timedOut {
-            self.debugLog("\(method) timed out after \(timeout)s")
-            NSLog("KashikoIME: \(method) timed out after \(timeout)s")
+            self.logger.error("\(method, privacy: .public) timed out after \(timeout)s")
             takePending(id: id)?(nil)
             return nil
         }
@@ -199,8 +202,7 @@ class EngineClient {
         guard
             let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any]
         else {
-            self.debugLog("unparsable response line: \(String(data: lineData, encoding: .utf8) ?? "")")
-            NSLog("KashikoIME: unparsable response line")
+            self.logger.error("unparsable response line (\(lineData.count) bytes)")
             return
         }
         guard let id = json["id"] as? Int else {
@@ -214,23 +216,22 @@ class EngineClient {
                 onUpdateCandidates?(decoded.actions)
                 return
             }
-            self.debugLog("response without id: \(json)")
-            NSLog("KashikoIME: response without id: \(json)")
+            self.logger.error("response without id (\(lineData.count) bytes)")
             return
         }
         if let error = json["error"] as? [String: Any] {
-            self.debugLog("engine error for request \(id): \(error)")
-            NSLog("KashikoIME: engine error for request \(id): \(error)")
+            let code = error["code"] as? Int ?? 0
+            self.logger.error("engine error for request \(id): code \(code)")
             takePending(id: id)?(nil)
             return
         }
         guard let result = json["result"] else {
-            self.debugLog("no result in response for \(id): \(json)")
+            self.logger.error("no result in response for \(id)")
             takePending(id: id)?(nil)
             return
         }
         guard let data = try? JSONSerialization.data(withJSONObject: result, options: .fragmentsAllowed) else {
-            self.debugLog("JSONSerialization.data failed for \(id): \(result)")
+            self.logger.error("JSONSerialization.data failed for \(id)")
             takePending(id: id)?(nil)
             return
         }

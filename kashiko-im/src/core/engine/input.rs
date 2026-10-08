@@ -265,12 +265,12 @@ impl InputMethodEngine {
             let is_shift_alpha =
                 ch.is_ascii_uppercase() || (shift_active && ch.is_ascii_alphabetic());
 
+            // Shift+letter starts an English word: alphabet mode lasts through
+            // the lowercase letters after it, until Enter / Esc returns to
+            // hiragana (see `end_shift_alphabet`).
             if is_shift_alpha && self.input_mode != InputMode::Alphabet {
                 self.input_mode = InputMode::Alphabet;
                 self.shift_alphabet_active = true;
-            } else if !is_shift_alpha && self.input_mode == InputMode::Alphabet && self.shift_alphabet_active && ch.is_ascii_alphabetic() {
-                self.input_mode = InputMode::Hiragana;
-                self.shift_alphabet_active = false;
             }
             let ch = if self.input_mode == InputMode::Alphabet && is_shift_alpha {
                 ch.to_ascii_uppercase()
@@ -289,8 +289,10 @@ impl InputMethodEngine {
         self.converters.romaji.reset();
         self.input_buf.clear();
         self.input_buf.raw_keys.push(ch);
+        self.mixed = super::mixed_input::MixedInput::default();
 
         if self.input_mode == InputMode::Alphabet {
+            self.input_buf.raw_synced = false;
             self.input_buf.insert(&ch.to_string());
         } else {
             let prev_output_len = 0;
@@ -406,9 +408,6 @@ impl InputMethodEngine {
                         self.shift_alphabet_active = true;
                         self.flush_romaji_to_composed();
                         self.live.text.clear();
-                    } else if !is_shift_alpha && self.input_mode == InputMode::Alphabet && self.shift_alphabet_active && ch.is_ascii_alphabetic() {
-                        self.input_mode = InputMode::Hiragana;
-                        self.shift_alphabet_active = false;
                     }
                     let ch = if self.input_mode == InputMode::Alphabet && is_shift_alpha {
                         ch.to_ascii_uppercase()
@@ -462,6 +461,7 @@ impl InputMethodEngine {
         self.last_key_was_backspace = false;
         self.input_buf.raw_keys.push(ch);
         if matches!(self.input_mode, InputMode::Alphabet | InputMode::Emoji) {
+            self.input_buf.raw_synced = false;
             self.input_buf.insert(&ch.to_string());
             return self.refresh_input_state();
         }
@@ -484,6 +484,7 @@ impl InputMethodEngine {
                 .collect();
             self.input_buf.insert(&new_chars);
         }
+        self.apply_auto_english();
 
         // PassThrough chars no longer auto-commit. They accumulate in the preedit
         // alongside hiragana, allowing users to compose `「」`, type `'word'`,
@@ -548,6 +549,8 @@ impl InputMethodEngine {
         self.chunks.clear();
         self.state = InputState::Empty;
         self.exit_emoji_mode();
+        self.end_shift_alphabet();
+        self.mixed = super::mixed_input::MixedInput::default();
 
         // HideCandidates is required here: the auto-suggest/live-conversion
         // window may be open while Composing, and the macOS frontend's
@@ -558,6 +561,16 @@ impl InputMethodEngine {
             .with_action(EngineAction::Commit(text))
             .with_action(EngineAction::HideCandidates)
             .with_action(EngineAction::HideAuxText)
+    }
+
+    /// Back to hiragana after an English word started with Shift+letter.
+    fn end_shift_alphabet(&mut self) {
+        if self.shift_alphabet_active {
+            self.shift_alphabet_active = false;
+            if self.input_mode == InputMode::Alphabet {
+                self.input_mode = InputMode::Hiragana;
+            }
+        }
     }
 
     /// Cancel the current input
@@ -601,6 +614,8 @@ impl InputMethodEngine {
         // whatever mode they were in before typing `:` so their next
         // word doesn't unexpectedly stay in ASCII-passthrough mode.
         self.exit_emoji_mode();
+        self.end_shift_alphabet();
+        self.mixed = super::mixed_input::MixedInput::default();
 
         let mut result = EngineResult::consumed()
             .with_action(EngineAction::UpdatePreedit(Preedit::new()))

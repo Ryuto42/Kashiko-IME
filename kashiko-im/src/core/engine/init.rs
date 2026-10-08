@@ -246,7 +246,7 @@ impl InputMethodEngine {
                 if db_path.exists() {
                     let out_path = dir.join("00_macos_dict.tsv");
                     let query = "SELECT ZSHORTCUT, ZPHRASE FROM ZTEXTREPLACEMENTENTRY WHERE ZWASDELETED = 0 AND ZSHORTCUT IS NOT NULL AND ZPHRASE IS NOT NULL;";
-                    if let Ok(output) = std::process::Command::new("sqlite3")
+                    if let Ok(output) = std::process::Command::new("/usr/bin/sqlite3")
                         .arg(&db_path)
                         .arg("-separator")
                         .arg("\t")
@@ -254,8 +254,22 @@ impl InputMethodEngine {
                         .output()
                     {
                         if output.status.success() {
-                            let _ = std::fs::write(&out_path, &output.stdout);
-                            debug!("Synced macOS Text Replacements to {:?}", out_path);
+                            use std::io::Write;
+                            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                            let written = std::fs::OpenOptions::new()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .mode(0o600)
+                                .open(&out_path)
+                                .and_then(|mut f| {
+                                    // `mode` only applies to a newly created file.
+                                    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                                    f.write_all(&output.stdout)
+                                });
+                            if written.is_ok() {
+                                debug!("Synced macOS Text Replacements to {:?}", out_path);
+                            }
                         }
                     }
                 }

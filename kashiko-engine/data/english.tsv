@@ -1,0 +1,527 @@
+# English words recognized inside romaji input.
+#
+# Tab-separated: the word as typed (lowercase, matched case-insensitively
+# against the keystrokes), its kind, and optionally its usual spelling, which
+# replaces what was typed (`github` → `GitHub`).
+#   p  proper noun or product name: kept in Latin script even when the
+#      keystrokes also read as romaji (`amazon` is not あまぞん).
+#   c  common word: kept in Latin script only when the keystrokes don't read
+#      as plain romaji (`hello` would need the small-kana spelling へっぉ), or
+#      when the text around the cursor is English. `make`, `name`, `time` read
+#      as まけ・なめ・ちめ and stay Japanese otherwise.
+# The katakana loanword table (loanwords.tsv) contributes its single-word
+# English spellings as `c` entries too.
+adobe	p	Adobe
+airbnb	p	Airbnb
+amazon	p	Amazon
+android	p	Android
+apple	p	Apple
+asana	p	Asana
+aws	p	AWS
+azure	p	Azure
+bing	p	Bing
+bitbucket	p	Bitbucket
+bluesky	p	Bluesky
+chatgpt	p	ChatGPT
+chrome	p	Chrome
+chromium	p	Chromium
+claude	p	Claude
+cloudflare	p	Cloudflare
+codex	p	Codex
+copilot	p	Copilot
+cursor	p	Cursor
+discord	p	Discord
+docker	p	Docker
+dropbox	p	Dropbox
+edge	p	Edge
+excel	p	Excel
+facebook	p	Facebook
+figma	p	Figma
+firebase	p	Firebase
+firefox	p	Firefox
+gemini	p	Gemini
+git	p	Git
+github	p	GitHub
+gitlab	p	GitLab
+gmail	p	Gmail
+google	p	Google
+heroku	p	Heroku
+instagram	p	Instagram
+intel	p	Intel
+iphone	p	iPhone
+ipad	p	iPad
+java	p	Java
+javascript	p	JavaScript
+jira	p	Jira
+kotlin	p	Kotlin
+kubernetes	p	Kubernetes
+line	c
+linkedin	p	LinkedIn
+linux	p	Linux
+macbook	p	MacBook
+macos	p	macOS
+microsoft	p	Microsoft
+mysql	p	MySQL
+netflix	p	Netflix
+nextjs	p	Next.js
+nginx	p	nginx
+nodejs	p	Node.js
+notion	p	Notion
+npm	p	npm
+nvidia	p	NVIDIA
+openai	p	OpenAI
+outlook	p	Outlook
+paypal	p	PayPal
+php	p	PHP
+postgres	p	Postgres
+postgresql	p	PostgreSQL
+powerpoint	p	PowerPoint
+python	p	Python
+react	p	React
+redis	p	Redis
+rust	p	Rust
+safari	p	Safari
+salesforce	p	Salesforce
+slack	p	Slack
+spotify	p	Spotify
+sql	p	SQL
+stripe	p	Stripe
+swift	p	Swift
+teams	p	Teams
+tiktok	p	TikTok
+twitter	p	Twitter
+typescript	p	TypeScript
+ubuntu	p	Ubuntu
+unity	p	Unity
+vercel	p	Vercel
+vim	p	Vim
+vscode	p	VS Code
+whatsapp	p	WhatsApp
+windows	p	Windows
+wordpress	p	WordPress
+xcode	p	Xcode
+youtube	p	YouTube
+zoom	p	Zoom
+about	c
+access	c
+account	c
+action	c
+add	c
+admin	c
+after	c
+again	c
+agent	c
+all	c
+also	c
+always	c
+and	c
+answer	c
+any	c
+app	c
+apply	c
+approve	c
+are	c
+array	c
+ask	c
+async	c
+await	c
+back	c
+backend	c
+backup	c
+bad	c
+because	c
+before	c
+best	c
+better	c
+big	c
+bold	c
+book	c
+boolean	c
+both	c
+branch	c
+break	c
+browser	c
+buffer	c
+bug	c
+build	c
+button	c
+but	c
+by	c
+cache	c
+call	c
+can	c
+cancel	c
+check	c
+class	c
+clean	c
+clear	c
+click	c
+client	c
+clone	c
+close	c
+cloud	c
+code	c
+color	c
+column	c
+command	c
+comment	c
+commit	c
+compile	c
+component	c
+config	c
+console	c
+const	c
+contact	c
+content	c
+context	c
+continue	c
+copy	c
+could	c
+count	c
+create	c
+css	c	CSS
+current	c
+data	c
+database	c
+date	c
+day	c
+debug	c
+default	c
+delete	c
+deploy	c
+design	c
+dev	c
+did	c
+diff	c
+display	c
+do	c
+docs	c
+does	c
+done	c
+download	c
+draft	c
+driver	c
+edit	c
+editor	c
+else	c
+email	c
+empty	c
+enable	c
+end	c
+engine	c
+enter	c
+entry	c
+enum	c
+env	c
+error	c
+event	c
+every	c
+example	c
+except	c
+export	c
+false	c
+feature	c
+fetch	c
+field	c
+file	c
+filter	c
+find	c
+first	c
+fix	c
+flag	c
+float	c
+folder	c
+follow	c
+font	c
+for	c
+format	c
+from	c
+frontend	c
+function	c
+get	c
+global	c
+go	c
+good	c
+graph	c
+great	c
+group	c
+hash	c
+has	c
+have	c
+he	c
+header	c
+hello	c
+help	c
+her	c
+here	c
+him	c
+his	c
+home	c
+hook	c
+host	c
+how	c
+html	c	HTML
+http	c	HTTP
+https	c	HTTPS
+icon	c
+id	c
+if	c
+image	c
+import	c
+in	c
+index	c
+info	c
+input	c
+insert	c
+install	c
+int	c
+interface	c
+into	c
+is	c
+issue	c
+it	c
+item	c
+its	c
+job	c
+join	c
+json	c	JSON
+just	c
+key	c
+know	c
+label	c
+last	c
+layout	c
+level	c
+library	c
+like	c
+link	c
+list	c
+local	c
+lock	c
+log	c
+login	c
+logout	c
+look	c
+loop	c
+love	c
+main	c
+make	c
+map	c
+markdown	c
+match	c
+me	c
+memo	c
+memory	c
+menu	c
+merge	c
+message	c
+method	c
+mock	c
+mode	c
+model	c
+module	c
+more	c
+most	c
+much	c
+must	c
+my	c
+name	c
+need	c
+network	c
+new	c
+news	c
+next	c
+nice	c
+node	c
+not	c
+note	c
+now	c
+null	c
+number	c
+object	c
+of	c
+off	c
+ok	c
+okay	c
+old	c
+on	c
+one	c
+only	c
+open	c
+option	c
+or	c
+order	c
+other	c
+our	c
+out	c
+output	c
+over	c
+owner	c
+package	c
+page	c
+panel	c
+param	c
+parse	c
+password	c
+patch	c
+path	c
+please	c
+plugin	c
+point	c
+pointer	c
+port	c
+post	c
+print	c
+private	c
+process	c
+product	c
+profile	c
+project	c
+prompt	c
+public	c
+pull	c
+push	c
+query	c
+queue	c
+quick	c
+read	c
+readme	c	README
+ready	c
+really	c
+rebase	c
+record	c
+refactor	c
+release	c
+remote	c
+remove	c
+reply	c
+repo	c
+report	c
+request	c
+reset	c
+response	c
+rest	c
+result	c
+return	c
+review	c
+right	c
+role	c
+root	c
+route	c
+router	c
+row	c
+run	c
+save	c
+schema	c
+screen	c
+script	c
+search	c
+see	c
+select	c
+send	c
+server	c
+service	c
+session	c
+set	c
+setting	c
+setup	c
+she	c
+shell	c
+should	c
+show	c
+sign	c
+size	c
+skill	c
+skip	c
+so	c
+some	c
+sort	c
+source	c
+spec	c
+stack	c
+start	c
+state	c
+status	c
+step	c
+stop	c
+store	c
+string	c
+struct	c
+style	c
+submit	c
+support	c
+switch	c
+sync	c
+system	c
+table	c
+tag	c
+task	c
+team	c
+test	c
+text	c
+than	c
+thank	c
+thanks	c
+that	c
+the	c
+their	c
+them	c
+then	c
+there	c
+these	c
+they	c
+thing	c
+think	c
+this	c
+thread	c
+time	c
+title	c
+to	c
+today	c
+todo	c	TODO
+token	c
+tool	c
+true	c
+try	c
+type	c
+undo	c
+update	c
+upload	c
+url	c	URL
+use	c
+user	c
+value	c
+var	c
+version	c
+very	c
+view	c
+want	c
+was	c
+watch	c
+we	c
+web	c
+well	c
+were	c
+what	c
+when	c
+where	c
+which	c
+while	c
+who	c
+why	c
+widget	c
+will	c
+window	c
+with	c
+word	c
+work	c
+world	c
+would	c
+write	c
+xml	c	XML
+yaml	c	YAML
+year	c
+yes	c
+yet	c
+you	c
+your	c

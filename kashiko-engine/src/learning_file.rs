@@ -16,7 +16,7 @@
 //! Existing plaintext caches are read as-is and rewritten encrypted on the next
 //! save, so upgrading loses nothing.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -35,16 +35,40 @@ pub fn key_path(cache_path: &Path) -> PathBuf {
     cache_path.with_extension("key")
 }
 
-/// Read the install's key, generating and storing one if there isn't one yet.
-fn load_or_create_key(cache_path: &Path) -> Result<[u8; KEY_LEN]> {
+/// The install's key, if one has been stored. A key file of the wrong size is
+/// an error, not a reason to start over: replacing it would orphan the cache.
+fn load_key(cache_path: &Path) -> Result<Option<[u8; KEY_LEN]>> {
     let path = key_path(cache_path);
-    if let Ok(bytes) = std::fs::read(&path)
-        && bytes.len() == KEY_LEN
-    {
-        let mut key = [0u8; KEY_LEN];
-        key.copy_from_slice(&bytes);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading key {path:?}")),
+    };
+    let key: [u8; KEY_LEN] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("learning-cache key {path:?} is malformed"))?;
+    Ok(Some(key))
+}
+
+fn is_encrypted_cache(path: &Path) -> bool {
+    let mut head = [0u8; MAGIC.len()];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .is_ok()
+        && &head[..] == MAGIC
+}
+
+/// Key for writing `cache_path`. A new key is generated only when no encrypted
+/// cache would be orphaned by it: the first save, or migrating a plaintext one.
+fn key_for_write(cache_path: &Path) -> Result<[u8; KEY_LEN]> {
+    if let Some(key) = load_key(cache_path)? {
         return Ok(key);
     }
+    if is_encrypted_cache(cache_path) {
+        bail!("learning-cache key is missing; refusing to overwrite the encrypted cache");
+    }
+    let path = key_path(cache_path);
     let mut key = [0u8; KEY_LEN];
     SystemRandom::new()
         .fill(&mut key)
@@ -56,17 +80,37 @@ fn load_or_create_key(cache_path: &Path) -> Result<[u8; KEY_LEN]> {
     Ok(key)
 }
 
-/// Write `bytes` to `path` readable only by the current user.
+/// Atomically replace `path` with `bytes`, readable only by the current user:
+/// written to a `0600` temp file beside it, then renamed over it, so a crash
+/// mid-save leaves the previous file intact.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = std::fs::File::create(path)?;
+    let mut tmp_name = path
+        .file_name()
+        .with_context(|| format!("{path:?} has no file name"))?
+        .to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    // A leftover from a crashed save may carry other permissions.
+    let _ = std::fs::remove_file(&tmp);
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    file.write_all(bytes)?;
-    file.flush()?;
-    Ok(())
+    let result = (|| -> Result<()> {
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn sealing_key(key: &[u8; KEY_LEN]) -> Result<LessSafeKey> {
@@ -77,7 +121,7 @@ fn sealing_key(key: &[u8; KEY_LEN]) -> Result<LessSafeKey> {
 
 /// Encrypt `plaintext` and write it to `path`, creating the key if needed.
 pub fn write_encrypted(path: &Path, plaintext: &str) -> Result<()> {
-    let key = load_or_create_key(path)?;
+    let key = key_for_write(path)?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
     SystemRandom::new()
         .fill(&mut nonce_bytes)
@@ -116,7 +160,7 @@ pub fn read_maybe_encrypted(path: &Path) -> Result<String> {
     let mut nonce = [0u8; NONCE_LEN];
     nonce.copy_from_slice(nonce_bytes);
 
-    let key = load_or_create_key(path)?;
+    let key = load_key(path)?.context("learning-cache key is missing")?;
     let mut buf = ciphertext.to_vec();
     let plaintext = sealing_key(&key)?
         .open_in_place(
@@ -177,6 +221,41 @@ mod tests {
         bytes[last] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
         assert!(read_maybe_encrypted(&path).is_err());
+    }
+
+    #[test]
+    fn a_missing_key_never_orphans_an_encrypted_cache() {
+        let path = temp_dir().join("lost-key.tsv");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(key_path(&path));
+        write_encrypted(&path, "あ\t亜\t1\t1700000000\n").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        std::fs::remove_file(key_path(&path)).unwrap();
+
+        assert!(read_maybe_encrypted(&path).is_err());
+        assert!(write_encrypted(&path, "い\t伊\t1\t1700000000\n").is_err());
+        assert!(!key_path(&path).exists());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_malformed_key_is_an_error() {
+        let path = temp_dir().join("bad-key.tsv");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(key_path(&path));
+        write_encrypted(&path, "あ\t亜\t1\t1700000000\n").unwrap();
+        std::fs::write(key_path(&path), b"short").unwrap();
+        assert!(read_maybe_encrypted(&path).is_err());
+        assert!(write_encrypted(&path, "い\t伊\t1\t1700000000\n").is_err());
+    }
+
+    #[test]
+    fn a_plaintext_cache_migrates_without_a_key() {
+        let path = temp_dir().join("migrate.tsv");
+        let _ = std::fs::remove_file(key_path(&path));
+        std::fs::write(&path, "# kashiko learning cache v1\n").unwrap();
+        write_encrypted(&path, "あ\t亜\t1\t1700000000\n").unwrap();
+        assert_eq!(read_maybe_encrypted(&path).unwrap(), "あ\t亜\t1\t1700000000\n");
     }
 
     #[cfg(unix)]

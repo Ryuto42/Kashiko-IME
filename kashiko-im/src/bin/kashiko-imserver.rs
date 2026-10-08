@@ -23,6 +23,12 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    // The default hook prints the panic message, which can quote the text
+    // being converted (e.g. a slicing panic shows the whole string).
+    std::panic::set_hook(Box::new(|info| {
+        tracing::error!("panic at {:?}", info.location());
+    }));
+
     if std::env::args().any(|arg| arg == "--prefetch-models") {
         let settings = kashiko_im::config::Settings::load().unwrap_or_default();
         let default = kashiko_engine::kanji::registry().default_model.clone();
@@ -121,7 +127,11 @@ fn main() {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(response) = server.handle_line(&line)
+        let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            server.handle_line(&line)
+        }))
+        .unwrap_or_else(|_| server.recover_from_panic(&line));
+        if let Some(response) = response
             && writeln!(stdout, "{response}")
                 .and_then(|_| stdout.flush())
                 .is_err()

@@ -39,6 +39,11 @@ pub fn english_for(reading: &str) -> Option<&'static str> {
     table().get(hiragana_to_katakana(reading).as_str()).copied()
 }
 
+/// Every English spelling in the table.
+pub fn all_english() -> impl Iterator<Item = &'static str> {
+    table().values().copied()
+}
+
 /// How many loanwords are listed. Exposed so a test can catch a data file that
 /// silently failed to parse.
 pub fn len() -> usize {

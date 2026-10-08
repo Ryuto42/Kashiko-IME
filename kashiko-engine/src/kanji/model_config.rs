@@ -20,6 +20,10 @@ pub struct ModelRegistry {
 #[derive(Debug, Deserialize)]
 pub struct ModelFamily {
     pub repo_id: String,
+    /// Commit SHA the repo is pinned to
+    pub revision: String,
+    /// SHA-256 of `tokenizer.json` at `revision`
+    pub tokenizer_sha256: String,
     pub display_name: String,
     #[serde(default)]
     pub pre_tokenizer_override: Option<String>,
@@ -37,6 +41,8 @@ pub struct VariantConfig {
     pub id: String,
     /// GGUF filename in the HuggingFace repo
     pub filename: String,
+    /// SHA-256 of the GGUF file at the family's `revision`
+    pub sha256: String,
     /// Human-readable name shown in UI
     pub display_name: String,
 }

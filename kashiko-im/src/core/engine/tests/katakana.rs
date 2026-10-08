@@ -171,7 +171,7 @@ fn test_katakana_baked_on_switch_to_alphabet() {
     engine.process_key(&press('n'));
     engine.process_key(&press('u'));
     engine.process_key(&press('x'));
-    assert_eq!(engine.preedit().unwrap().text(), "アイウエオLいぬx");
+    assert_eq!(engine.preedit().unwrap().text(), "アイウエオLinux");
 }
 
 #[test]

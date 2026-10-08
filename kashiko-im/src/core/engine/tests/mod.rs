@@ -14,6 +14,7 @@ mod katakana;
 mod latin_word;
 mod learning;
 mod live_conversion;
+mod mixed_input;
 mod mode_toggle;
 mod passthrough;
 mod real_model;
