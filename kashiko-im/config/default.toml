@@ -28,7 +28,7 @@ model = "jinen-v2-small-q5"
 # Beam search model for Space conversion (uses default model only if unset)
 light_model = "jinen-v2-xsmall-q5"
 # 推論スレッド数（0 = 全コア使用）
-n_threads = 4
+n_threads = 2
 # 起動時にライブ変換を有効にする（Ctrl+Shift+L で実行中も切替可能）
 live_conversion = true
 # ユーザー辞書: ~/Library/Application Support/com.kashiko.kashiko-im/user_dicts/ に辞書ファイルを配置（Mozc TSV or KRKN binary）

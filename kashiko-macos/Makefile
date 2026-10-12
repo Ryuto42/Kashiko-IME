@@ -5,9 +5,13 @@ CARGO_MANIFEST = ../Cargo.toml
 CARGO_TARGET = ../target
 DATA_DIR = $(HOME)/Library/Application Support/com.kashiko.kashiko-im
 # Pinned release asset (never `latest`); DICT_TGZ is used when present.
+# With RELEASE_REPO set (the public distribution repository) it is fetched
+# over plain HTTPS, otherwise from the private source repository via `gh`,
+# which needs a GitHub login with access to it.
+RELEASE_REPO ?=
 DICT_REPO ?= Ryuto42/Kashiko-IME
 DICT_RELEASE ?= dict-20260226
-DICT_URL ?=
+DICT_URL ?= $(if $(RELEASE_REPO),https://github.com/$(RELEASE_REPO)/releases/download/$(DICT_RELEASE)/dict.tgz,)
 DICT_TGZ ?= dict.tgz
 DICT_TGZ_SHA256 = f194d2526bf826622bc5baf7c07e7525ad9bde2dc63896cd929045283a4aeccd
 DICT_BIN_SHA256 = d85fed3c7e408e67f4a5dbe2314338366ed6183e0498d2726bc5a4dcaf5bb83b
@@ -49,6 +53,7 @@ bundle: build
 	cp .build/release/KashikoIME $(APP)/Contents/MacOS/
 	cp $(CARGO_TARGET)/release/kashiko-imserver $(APP)/Contents/MacOS/
 	cp -r resources/* $(APP)/Contents/Resources/
+	xattr -cr $(APP)
 	codesign --force --options runtime --sign - $(APP)/Contents/MacOS/kashiko-imserver
 	codesign --force --options runtime --sign - $(APP)
 

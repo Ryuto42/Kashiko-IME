@@ -76,6 +76,16 @@ impl ImServer {
 
         let id = request.id.clone();
         let result = self.dispatch(&request.method, request.params);
+        // A background search only serves the conversion it was started for;
+        // once that is committed or cancelled, stop spending CPU on it.
+        if !matches!(self.engine.state(), InputState::Conversion { .. }) {
+            self.engine.cancel_deep_search();
+        }
+        // Nothing being typed: the live-conversion context isn't needed until
+        // the next composition starts.
+        if matches!(self.engine.state(), InputState::Empty) {
+            self.engine.release_idle_caches();
+        }
 
         let id = id?; // notification: execute but don't respond
         let resp = match result {

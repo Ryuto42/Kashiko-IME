@@ -230,6 +230,9 @@ impl InputMethodEngine {
         //    the next chunk instead of being converted without its ending.
         let middle = &text[plan.mid_start..plan.mid_end];
         let right = self.right_context();
+        // The chunk being reopened (typing at its end) converts to nearly what
+        // it did a keystroke ago.
+        self.live_draft = (trail_start > 0).then(|| old[0].converted.clone());
         let mut pos = 0;
         while pos < middle.len() {
             let chunk = group_chunks(&middle[pos..], chunk_len)[0];
@@ -240,6 +243,7 @@ impl InputMethodEngine {
                 .as_deref()
                 .filter(|_| next >= middle.len() && plan.trail_count == 0);
             let mut new = self.convert_new_chunk(reading, &base_ctx, &combined, before);
+            self.live_draft = None;
             if chunk.len() == chunk_len
                 && next < middle.len()
                 && is_japanese(chunk[0])

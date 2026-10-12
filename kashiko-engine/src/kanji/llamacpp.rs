@@ -70,8 +70,23 @@ struct BeamState {
     score: f32,
 }
 
+/// The context live conversion keeps between keystrokes, and the tokens its
+/// KV cache holds, so a keystroke only evaluates what changed since the last.
+#[derive(Default)]
+struct LiveCache {
+    /// Borrows `LlamaCppModel::model`; the `'static` only hides that from the
+    /// borrow checker. It is declared before `model` so it is dropped first,
+    /// and it never leaves the owning `LlamaCppModel`.
+    ctx: Option<llama_cpp_2::context::LlamaContext<'static>>,
+    kv: Vec<LlamaToken>,
+}
+
+// SAFETY: the context is only touched under `LlamaCppModel::live`'s mutex.
+unsafe impl Send for LiveCache {}
+
 /// llama.cpp based GPT-2 model for GGUF inference
 pub struct LlamaCppModel {
+    live: std::sync::Mutex<LiveCache>,
     model: LlamaModel,
     n_ctx: u32,
     /// External HuggingFace tokenizer (always required).
@@ -98,6 +113,7 @@ impl LlamaCppModel {
         let external_tokenizer = load_tokenizer(tokenizer_json)?;
 
         Ok(Self {
+            live: Default::default(),
             model,
             n_ctx: 256,
             external_tokenizer,
@@ -142,6 +158,7 @@ impl LlamaCppModel {
         let external_tokenizer = load_tokenizer(tokenizer_json)?;
 
         Ok(Self {
+            live: Default::default(),
             model,
             n_ctx: 256,
             external_tokenizer,
@@ -165,6 +182,7 @@ impl LlamaCppModel {
         let external_tokenizer = load_tokenizer(tokenizer_json)?;
 
         Ok(Self {
+            live: Default::default(),
             model,
             n_ctx,
             external_tokenizer,
@@ -175,8 +193,15 @@ impl LlamaCppModel {
 
     /// Set the number of threads for inference.
     /// 0 means use llama.cpp default (typically all cores).
+    /// Free the context live conversion keeps between keystrokes (its KV cache
+    /// and compute buffers); the next conversion creates it again.
+    pub fn release_live_cache(&self) {
+        *self.live.lock().unwrap_or_else(|e| e.into_inner()) = LiveCache::default();
+    }
+
     pub fn set_n_threads(&mut self, n: u32) {
         self.n_threads = n;
+        *self.live.get_mut().unwrap_or_else(|e| e.into_inner()) = LiveCache::default();
     }
 
     pub fn set_nfkc(&mut self, nfkc: bool) {
@@ -295,6 +320,129 @@ impl LlamaCppModel {
         )
     }
 
+    /// As [`Self::generate_greedy_scored`], with `draft` as a guess of the
+    /// output (the previous keystroke's conversion). The whole draft is checked
+    /// in one batch; the longest prefix greedy decoding agrees with is taken
+    /// without generating it token by token, and decoding goes on from there.
+    /// The result is exactly what plain greedy decoding produces.
+    pub fn generate_greedy_scored_draft(
+        &self,
+        input_tokens: &[LlamaToken],
+        max_new_tokens: usize,
+        eos_token_id: Option<i32>,
+        draft: &[LlamaToken],
+    ) -> Result<(Vec<LlamaToken>, f32)> {
+        let mut cache = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let result =
+            self.greedy_draft_cached(&mut cache, input_tokens, max_new_tokens, eos_token_id, draft);
+        if result.is_err() {
+            *cache = LiveCache::default();
+        }
+        result
+    }
+
+    fn greedy_draft_cached(
+        &self,
+        cache: &mut LiveCache,
+        input_tokens: &[LlamaToken],
+        max_new_tokens: usize,
+        eos_token_id: Option<i32>,
+        draft: &[LlamaToken],
+    ) -> Result<(Vec<LlamaToken>, f32)> {
+        ensure_fits(input_tokens.len() + 1, self.n_ctx)?;
+        let max_new_tokens = max_new_tokens.min(self.n_ctx as usize - input_tokens.len());
+        let draft = &draft[..draft.len().min(max_new_tokens.saturating_sub(1))];
+        let p = input_tokens.len();
+        let model_eos = self.model.token_eos();
+        let is_end = |t: LlamaToken| {
+            eos_token_id.is_some_and(|eos| t.0 == eos) || t == model_eos || self.model.is_eog_token(t)
+        };
+        let argmax = |logits: &[f32]| {
+            let best = logits
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |b, (i, &x)| if x > b.1 { (i, x) } else { b });
+            LlamaToken(best.0 as i32)
+        };
+
+        if cache.ctx.is_none() {
+            let ctx = self
+                .model
+                .new_context(get_backend()?, self.context_params())
+                .map_err(|e| KanjiError::Inference(e.into()))?;
+            // SAFETY: see `LiveCache::ctx`.
+            cache.ctx = Some(unsafe {
+                std::mem::transmute::<
+                    llama_cpp_2::context::LlamaContext<'_>,
+                    llama_cpp_2::context::LlamaContext<'static>,
+                >(ctx)
+            });
+            cache.kv.clear();
+        }
+        let ctx = cache.ctx.as_mut().expect("just created");
+
+        // Keep what the cache already holds of prompt + draft. The prompt's
+        // last token is always re-evaluated: its logits predict the output.
+        let target: Vec<LlamaToken> = input_tokens.iter().chain(draft).copied().collect();
+        let common = cache.kv.iter().zip(&target).take_while(|(a, b)| a == b).count();
+        let keep = common.min(p - 1);
+        ctx.clear_kv_cache_seq(Some(0), Some(keep as u32), None)
+            .map_err(|e| KanjiError::Inference(e.into()))?;
+        cache.kv.truncate(keep);
+        let mut batch = LlamaBatch::new(target.len() - keep, 1);
+        for (offset, token) in target[keep..].iter().enumerate() {
+            let pos = keep + offset;
+            batch
+                .add(*token, pos as i32, &[0], pos + 1 >= p)
+                .map_err(|e| KanjiError::Inference(e.into()))?;
+        }
+        ctx.decode(&mut batch)
+            .map_err(|e| KanjiError::Inference(e.into()))?;
+        cache.kv.extend_from_slice(&target[keep..]);
+
+        let mut generated = input_tokens.to_vec();
+        let mut total_log_prob = 0.0f32;
+        // Logits predicting output token `i` sit at position p - 1 + i.
+        let mut next = None;
+        for i in 0..=draft.len() {
+            let logits = ctx.get_logits_ith((p - 1 + i - keep) as i32);
+            let token = argmax(logits);
+            if is_end(token) {
+                return Ok((generated, total_log_prob));
+            }
+            total_log_prob += log_prob_of(logits, token.0 as usize, logits.len());
+            generated.push(token);
+            if i == draft.len() || token != draft[i] {
+                next = Some(token);
+                break;
+            }
+        }
+        // Drop the cached draft past the point of disagreement, then continue
+        // as plain greedy decoding from the last chosen token.
+        let accepted = generated.len() - p - 1;
+        ctx.clear_kv_cache_seq(Some(0), Some((p + accepted) as u32), None)
+            .map_err(|e| KanjiError::Inference(e.into()))?;
+        cache.kv.truncate(p + accepted);
+        let mut token = next.expect("loop always picks a token or returns");
+        while generated.len() - p < max_new_tokens {
+            batch.clear();
+            batch
+                .add(token, (generated.len() - 1) as i32, &[0], true)
+                .map_err(|e| KanjiError::Inference(e.into()))?;
+            ctx.decode(&mut batch)
+                .map_err(|e| KanjiError::Inference(e.into()))?;
+            cache.kv.push(token);
+            let logits = ctx.get_logits_ith(0);
+            token = argmax(logits);
+            if is_end(token) {
+                break;
+            }
+            total_log_prob += log_prob_of(logits, token.0 as usize, logits.len());
+            generated.push(token);
+        }
+        Ok((generated, total_log_prob))
+    }
+
     /// Generate multiple candidates using true beam search algorithm
     ///
     /// This implements proper beam search that tracks cumulative probabilities
@@ -314,7 +462,20 @@ impl LlamaCppModel {
         eos_token_id: Option<i32>,
         beam_size: usize,
     ) -> Result<Vec<(Vec<LlamaToken>, f32)>> {
-        self.generate_beam_search_impl(input_tokens, max_new_tokens, eos_token_id, beam_size)
+        self.generate_beam_search_impl(input_tokens, max_new_tokens, eos_token_id, beam_size, None)
+    }
+
+    /// As [`Self::generate_beam_search`], stopping at the next step once
+    /// `cancel` is set.
+    pub fn generate_beam_search_cancellable(
+        &self,
+        input_tokens: &[LlamaToken],
+        max_new_tokens: usize,
+        eos_token_id: Option<i32>,
+        beam_size: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<(Vec<LlamaToken>, f32)>> {
+        self.generate_beam_search_impl(input_tokens, max_new_tokens, eos_token_id, beam_size, cancel)
     }
 
     /// Generate multiple candidates using depth-1 beam selection followed by greedy decoding
@@ -512,13 +673,27 @@ impl LlamaCppModel {
         max_new_tokens: usize,
         eos_token_id: Option<i32>,
         beam_size: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<Vec<(Vec<LlamaToken>, f32)>> {
         ensure_fits(input_tokens.len() + 1, self.n_ctx)?;
         let max_new_tokens = max_new_tokens.min(self.n_ctx as usize - input_tokens.len());
         let model_eos = self.model.token_eos();
 
+        // One context for the whole search. The prompt is evaluated once and
+        // stays in the KV cache; each beam then only evaluates the tokens that
+        // differ from what the cache already holds after the prompt — usually
+        // just its last token, since sibling beams share everything before it.
+        // (Evaluating every beam from scratch in a fresh context made one
+        // search cost hundreds of full-sentence passes.)
+        let backend = get_backend()?;
+        let mut ctx = self
+            .model
+            .new_context(backend, self.context_params())
+            .map_err(|e| KanjiError::Inference(e.into()))?;
+        let mut cached: Vec<LlamaToken> = Vec::new();
+
         // Step 1: Get initial logits
-        let initial_logits = self.eval_sequence(input_tokens)?;
+        let initial_logits = Self::eval_after_prompt(&mut ctx, input_tokens, &mut cached, &[], true)?;
         let (top_tokens, top_log_probs) = self.get_top_k_tokens(&initial_logits, beam_size);
 
         // Initialize beams, partitioning EOS tokens into finished
@@ -543,7 +718,9 @@ impl LlamaCppModel {
 
         // Step 2: Main beam search loop
         for _step in 0..(max_new_tokens - 1) {
-            if beams.is_empty() {
+            if beams.is_empty()
+                || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            {
                 break;
             }
 
@@ -566,12 +743,8 @@ impl LlamaCppModel {
             let mut candidates: Vec<BeamState> = Vec::new();
 
             for beam in &beams {
-                // Build full sequence: input_tokens + beam.tokens
-                let mut full_seq: Vec<LlamaToken> = input_tokens.to_vec();
-                full_seq.extend(&beam.tokens);
-
-                // Get logits for this sequence
-                let logits = self.eval_sequence(&full_seq)?;
+                let logits =
+                    Self::eval_after_prompt(&mut ctx, input_tokens, &mut cached, &beam.tokens, false)?;
                 let (top_tokens, top_log_probs) = self.get_top_k_tokens(&logits, expand_k);
 
                 // Create candidates
@@ -620,31 +793,39 @@ impl LlamaCppModel {
         Ok(all_results)
     }
 
-    /// Process a token sequence and return the logits at the last position.
-    ///
-    /// Creates a fresh context for each call. Used by true beam search where
-    /// each beam needs independent evaluation.
-    fn eval_sequence(&self, tokens: &[LlamaToken]) -> Result<Vec<f32>> {
-        ensure_fits(tokens.len(), self.n_ctx)?;
-        let backend = get_backend()?;
-        let ctx_params = self.context_params();
-
-        let mut ctx = self
-            .model
-            .new_context(backend, ctx_params)
-            .map_err(|e| KanjiError::Inference(e.into()))?;
-
-        let mut batch = LlamaBatch::new(512, 1);
+    /// Logits after `prompt` + `suffix` in `ctx`, evaluating only what the KV
+    /// cache doesn't already hold. `cached` tracks the suffix currently in the
+    /// cache after the prompt; `first` evaluates the prompt itself.
+    fn eval_after_prompt(
+        ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
+        prompt: &[LlamaToken],
+        cached: &mut Vec<LlamaToken>,
+        suffix: &[LlamaToken],
+        first: bool,
+    ) -> Result<Vec<f32>> {
+        let (start, tokens): (usize, &[LlamaToken]) = if first {
+            (0, prompt)
+        } else {
+            let common = cached.iter().zip(suffix).take_while(|(a, b)| a == b).count();
+            // Re-evaluate at least the last token: its logits are the output.
+            let keep = common.min(suffix.len().saturating_sub(1));
+            ctx.clear_kv_cache_seq(Some(0), Some((prompt.len() + keep) as u32), None)
+                .map_err(|e| KanjiError::Inference(e.into()))?;
+            cached.truncate(keep);
+            (prompt.len() + keep, &suffix[keep..])
+        };
+        let mut batch = LlamaBatch::new(tokens.len().max(1), 1);
         for (i, token) in tokens.iter().enumerate() {
-            let is_last = i == tokens.len() - 1;
             batch
-                .add(*token, i as i32, &[0], is_last)
+                .add(*token, (start + i) as i32, &[0], i + 1 == tokens.len())
                 .map_err(|e| KanjiError::Inference(e.into()))?;
         }
         ctx.decode(&mut batch)
             .map_err(|e| KanjiError::Inference(e.into()))?;
-
-        Ok(ctx.get_logits().to_vec())
+        if !first {
+            cached.extend_from_slice(tokens);
+        }
+        Ok(ctx.get_logits_ith(batch.n_tokens() - 1).to_vec())
     }
 
     /// Get top-k tokens from logits with log probabilities
@@ -799,6 +980,9 @@ pub struct NllScorer<'a> {
     ctx: llama_cpp_2::context::LlamaContext<'a>,
     vocab_size: usize,
     n_ctx: u32,
+    /// Tokens the KV cache holds. Candidates scored against one prompt share
+    /// it, so only each candidate's own tokens are evaluated.
+    kv: Vec<LlamaToken>,
 }
 
 impl<'a> NllScorer<'a> {
@@ -806,7 +990,7 @@ impl<'a> NllScorer<'a> {
     pub fn new(model: &'a LlamaCppModel, n_ctx: u32) -> Result<Self> {
         let backend = get_backend()?;
 
-        let ctx_params = LlamaContextParams::default().with_n_ctx(Some(
+        let ctx_params = model.context_params().with_n_ctx(Some(
             NonZeroU32::new(n_ctx).expect("n_ctx must be non-zero"),
         ));
 
@@ -822,7 +1006,33 @@ impl<'a> NllScorer<'a> {
             ctx,
             vocab_size,
             n_ctx,
+            kv: Vec::new(),
         })
+    }
+
+    /// Evaluate `tokens`, reusing whatever prefix the KV cache already holds
+    /// and computing logits from position `first_logit` on. Returns the
+    /// position of batch index 0, to map positions to logit indices.
+    fn decode_from(&mut self, tokens: &[LlamaToken], first_logit: usize) -> Result<usize> {
+        ensure_fits(tokens.len(), self.n_ctx)?;
+        let common = self.kv.iter().zip(tokens).take_while(|(a, b)| a == b).count();
+        let keep = common.min(first_logit);
+        self.ctx
+            .clear_kv_cache_seq(Some(0), Some(keep as u32), None)
+            .map_err(|e| KanjiError::Inference(e.into()))?;
+        self.kv.truncate(keep);
+        let mut batch = LlamaBatch::new(tokens.len() - keep, 1);
+        for (offset, token) in tokens[keep..].iter().enumerate() {
+            let pos = keep + offset;
+            batch
+                .add(*token, pos as i32, &[0], pos >= first_logit)
+                .map_err(|e| KanjiError::Inference(e.into()))?;
+        }
+        self.ctx
+            .decode(&mut batch)
+            .map_err(|e| KanjiError::Inference(e.into()))?;
+        self.kv.extend_from_slice(&tokens[keep..]);
+        Ok(keep)
     }
 
     /// Compute per-character NLL for a single (reading, surface) pair.
@@ -852,20 +1062,13 @@ impl<'a> NllScorer<'a> {
         if full_tokens.len() <= prompt_tokens.len() {
             return Ok(100.0);
         }
-        ensure_fits(full_tokens.len(), self.n_ctx)?;
-        self.ctx.clear_kv_cache();
-        let mut batch = LlamaBatch::new(full_tokens.len().max(512), 1);
-        batch
-            .add_sequence(&full_tokens, 0, true)
-            .map_err(|e| KanjiError::Inference(e.into()))?;
-        self.ctx
-            .decode(&mut batch)
-            .map_err(|e| KanjiError::Inference(e.into()))?;
+        let base = self.decode_from(&full_tokens, prompt_tokens.len() - 1)?;
         let mut total = 0.0f32;
         for pos in prompt_tokens.len() - 1..full_tokens.len() - 1 {
             let target = full_tokens[pos + 1].0 as usize;
             if target < self.vocab_size {
-                total -= log_prob_of(self.ctx.get_logits_ith(pos as i32), target, self.vocab_size);
+                let logits = self.ctx.get_logits_ith((pos - base) as i32);
+                total -= log_prob_of(logits, target, self.vocab_size);
             }
         }
         Ok(total / following.chars().count().max(1) as f32)
@@ -899,27 +1102,16 @@ impl<'a> NllScorer<'a> {
         }
 
         let n_tokens = full_tokens.len();
-        ensure_fits(n_tokens, self.n_ctx)?;
-
-        self.ctx.clear_kv_cache();
-
-        let mut batch = LlamaBatch::new(n_tokens.max(512), 1);
-        batch
-            .add_sequence(&full_tokens, 0, true)
-            .map_err(|e| KanjiError::Inference(e.into()))?;
-
-        self.ctx
-            .decode(&mut batch)
-            .map_err(|e| KanjiError::Inference(e.into()))?;
-
         let start_pos = prompt_tokens.len() - 1;
+        let base = self.decode_from(&full_tokens, start_pos)?;
+
         let end_pos = n_tokens - 1;
         let mut total_nll: f32 = 0.0;
         let mut worst: f32 = 0.0;
         let mut n_scored = 0;
 
         for pos in start_pos..end_pos {
-            let logits = self.ctx.get_logits_ith(pos as i32);
+            let logits = self.ctx.get_logits_ith((pos - base) as i32);
 
             let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let log_sum_exp: f32 = logits

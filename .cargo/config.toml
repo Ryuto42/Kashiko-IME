@@ -1,0 +1,2 @@
+[env]
+CMAKE_PROJECT_INCLUDE_BEFORE = { value = "kashiko-engine/cmake/ggml-cpu-only.cmake", relative = true }

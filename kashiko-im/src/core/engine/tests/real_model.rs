@@ -778,3 +778,70 @@ fn romaji_corpus_stays_japanese() {
     assert!(bad.is_empty(), "{bad:#?}");
 }
 
+
+
+/// The focused segment's candidates after `rights` presses of Right.
+fn segment_after(e: &mut InputMethodEngine, reading: &str, rights: usize) -> (String, Vec<String>) {
+    e.reset();
+    e.input_buf.insert(reading);
+    if let Some(live) = e.chunked_auto_suggest() {
+        e.live.text = live;
+    }
+    e.start_conversion(false, None, 0);
+    for _ in 0..rights {
+        e.process_key(&press_key(Keysym::RIGHT));
+    }
+    match e.state() {
+        InputState::Conversion { candidates, segment_start, split_index, .. } => (
+            reading.chars().skip(*segment_start).take(split_index - segment_start).collect(),
+            candidates.candidates().iter().map(|c| c.text.clone()).collect(),
+        ),
+        other => panic!("expected Conversion state, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore]
+fn a_focused_segment_is_ranked_in_its_sentence() {
+    // Judged alone, `はしで` has no reason to prefer 箸で; between `ご飯を`
+    // and `食べた` it does. And `ご飯`/`お茶` used to be cut after their first
+    // kana (`かれはご|はんを`).
+    let mut e = real_engine();
+    e.learning = None;
+    let cases = [
+        ("かれはごはんをはしでたべた", 2, "ごはんを", "ご飯を"),
+        ("かれはごはんをはしでたべた", 3, "はしで", "箸で"),
+        ("あついおちゃをのみたい", 2, "おちゃを", "お茶を"),
+        ("えーあいのしこうかていをみる", 2, "しこう", "思考"),
+        ("えーあいのしこうかていをみる", 3, "かていを", "過程を"),
+    ];
+    let mut failures = Vec::new();
+    for (reading, rights, segment, want) in cases {
+        let (seg, cands) = segment_after(&mut e, reading, rights);
+        println!("{reading} [{seg}] {cands:?}");
+        if seg != segment || cands.first().map(String::as_str) != Some(want) {
+            failures.push(format!("{reading}: [{seg}] {cands:?}, want [{segment}] {want}"));
+        }
+        // Model guesses that break the sentence are gone.
+        if let Some(bad) = cands.iter().find(|c| c.contains('〜') || c.ends_with("ヲ") && c.chars().any(|ch| ('一'..='龯').contains(&ch))) {
+            failures.push(format!("{reading}: still offers {bad}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+#[ignore]
+fn variant_kanji_of_names_are_offered() {
+    let mut e = real_engine();
+    e.learning = None;
+    let mut failures = Vec::new();
+    for (reading, want) in [("たかはし", "髙橋"), ("さいとう", "齊藤"), ("はまだ", "濵田"), ("よしだ", "𠮷田"), ("たか", "髙")] {
+        let cands = candidates_for(&mut e, "", reading);
+        println!("{reading}: {cands:?}");
+        if !cands.iter().any(|c| c == want) {
+            failures.push(format!("{reading}: no {want} in {cands:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

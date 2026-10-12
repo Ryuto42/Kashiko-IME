@@ -192,6 +192,14 @@ impl InputMethodEngine {
 
     /// Truncate context to safe size for API calls
     pub(super) fn truncate_context_for_api(&self) -> String {
+        let base = self.document_context();
+        match &self.segment_prefix {
+            Some(prefix) => self.truncate_context(&format!("{base}{prefix}")),
+            None => base,
+        }
+    }
+
+    fn document_context(&self) -> String {
         let from_document = self
             .surrounding_context
             .as_ref()

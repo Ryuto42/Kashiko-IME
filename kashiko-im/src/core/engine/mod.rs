@@ -146,6 +146,9 @@ pub struct InputMethodEngine {
     shift_alphabet_active: bool,
     /// English words detected in the current romaji composition.
     mixed: mixed_input::MixedInput,
+    /// The previous conversion of the chunk being reconverted, used as a draft
+    /// so live conversion only generates what the new keystroke changed.
+    live_draft: Option<String>,
     /// Mode active immediately before entering [`InputMode::Emoji`],
     /// so commit/cancel/backspace-to-empty can put the user back where
     /// they were instead of dropping them in Hiragana every time. `None`
@@ -230,6 +233,10 @@ pub struct InputMethodEngine {
     /// preedit can show settled conversions ahead of the focused segment and
     /// commit them together. Empty whenever the focus is at the start.
     decided: Vec<(usize, String)>,
+    /// The settled segments' text while a focused segment is being converted,
+    /// so its candidates are generated with the sentence to their left as
+    /// context (see `truncate_context_for_api`).
+    segment_prefix: Option<String>,
 }
 
 /// What the post-response deep search should look for.
@@ -284,6 +291,7 @@ impl InputMethodEngine {
             input_mode: InputMode::Hiragana,
             shift_alphabet_active: false,
             mixed: mixed_input::MixedInput::default(),
+            live_draft: None,
             pre_emoji_mode: None,
             input_buf: InputBuffer::new(),
             live: LiveConversion::default(),
@@ -303,6 +311,7 @@ impl InputMethodEngine {
             tail_text: None,
             segment_bounds: Vec::new(),
             decided: Vec::new(),
+            segment_prefix: None,
         }
     }
 
@@ -359,6 +368,16 @@ impl InputMethodEngine {
     /// Get the current candidates
     pub fn candidates(&self) -> Option<&CandidateList> {
         self.state.candidates()
+    }
+
+    /// Free memory that only speeds up typing; called once input is idle.
+    pub fn release_idle_caches(&self) {
+        if let Some(converter) = &self.converters.kanji {
+            converter.release_live_cache();
+        }
+        if let Some(converter) = &self.converters.light_kanji {
+            converter.release_live_cache();
+        }
     }
 
     /// Reset the engine state

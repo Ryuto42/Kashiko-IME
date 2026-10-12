@@ -490,5 +490,28 @@ mod llamacpp_tests {
             );
         }
     }
-}
 
+    #[test]
+    fn greedy_with_a_draft_matches_plain_greedy() {
+        // The draft (and the context kept between calls) may only make it
+        // faster, never change the result.
+        let model = load_model().expect("Failed to load");
+        let eos = Some(model.eos_token_id().0);
+        let cases = [
+            ("キョウハイイテンキデスネ", ""),
+            ("キョウハイイテンキデス", "今日はいい天気です"),
+            ("キョウハイイテンキデスネ", "今日はいい天気です"),
+            ("キョウハイイテンキ", "今日はいい天気ですね"),
+            ("ワタシハガクセイデス", "全然違う下書き"),
+            ("ワタシハガクセイデス", ""),
+        ];
+        for (reading, draft) in cases {
+            let tokens = model.tokenize(&build_prompt(reading)).unwrap();
+            let plain = model.generate_greedy_scored(&tokens, 64, eos).unwrap();
+            let draft_tokens = if draft.is_empty() { vec![] } else { model.tokenize(draft).unwrap() };
+            let fast = model.generate_greedy_scored_draft(&tokens, 64, eos, &draft_tokens).unwrap();
+            assert_eq!(fast.0, plain.0, "{reading} with draft {draft:?}");
+            assert!((fast.1 - plain.1).abs() < 1e-2, "{reading}: {} vs {}", fast.1, plain.1);
+        }
+    }
+}

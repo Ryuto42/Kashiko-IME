@@ -110,7 +110,9 @@ fn job_convert(job: &DeepSearchJob, reading: &str, ctx: &str, n: usize) -> Vec<S
         return vec![];
     }
     let katakana = kashiko_engine::hiragana_to_katakana(reading);
-    job.converter.convert(&katakana, ctx, n).unwrap_or_default()
+    job.converter
+        .convert_cancellable(&katakana, ctx, n, Some(&job.cancel))
+        .unwrap_or_default()
 }
 
 /// Execute one task, appending clean findings to the job.
@@ -714,7 +716,7 @@ impl InputMethodEngine {
                     // Single-candidate = the live/auto-suggest path: use the
                     // self-checking conversion (see `convert_live`).
                     light_converter
-                        .convert_live(reading, api_context)
+                        .convert_live_draft(reading, api_context, self.live_draft.as_deref())
                         .map(|t| vec![t])
                         .unwrap_or_default()
                 } else {
@@ -724,7 +726,7 @@ impl InputMethodEngine {
                 }
             }
             ConversionStrategy::MainModelOnly if num_candidates == 1 => converter
-                .convert_live(reading, api_context)
+                .convert_live_draft(reading, api_context, self.live_draft.as_deref())
                 .map(|t| vec![t])
                 .unwrap_or_default(),
             ConversionStrategy::MainModelOnly => converter
@@ -1070,6 +1072,7 @@ impl InputMethodEngine {
         // context before anything is pinned on top, so the ordering reflects
         // the language model rather than the decoder's beam order.
         self.rerank_by_likelihood(&reading, &mut candidates);
+        Self::place_variants(&mut candidates);
 
         // Words kept in Latin script might have been meant as kana; the
         // all-Japanese reading goes just above the fallbacks.
@@ -1973,6 +1976,7 @@ impl InputMethodEngine {
         let converter = self.converters.kanji.clone()?;
         // A fresh flag per job: the previous one may still belong to a job in
         // flight, and cancelling that must not cancel this.
+        self.deep_cancel.store(true, Ordering::Relaxed);
         self.deep_cancel = Arc::new(AtomicBool::new(false));
         // Resolved here rather than in the worker: it comes from the live
         // conversion's chunk cache, which is engine state.
@@ -2825,43 +2829,76 @@ impl InputMethodEngine {
         self.navigate_candidate(CandidateList::prev_page)
     }
 
-    /// Word-boundary positions (in chars, ascending; the last one equals the
-    /// reading length) from greedy longest-match dictionary segmentation.
-    /// Consecutive characters with no dictionary entry (okurigana tails,
-    /// interjections, ...) are merged into a single segment so the
-    /// boundaries stay word-sized instead of degrading to per-character.
+    /// Phrase boundaries (in chars, ascending; the last one equals the
+    /// reading length) from the dictionary alone, for when no conversion can
+    /// be aligned with the reading.
+    ///
+    /// The fewest dictionary words that cover the reading, longer words winning
+    /// ties: greedy longest-match read `…のしこうかてい` as `のし|こうか|てい`
+    /// (熨斗), where it is `の|しこう|かてい`. A run no word covers is one
+    /// segment, and particles join the word before them, so each segment is a
+    /// phrase (`しこうかていを`).
     pub(super) fn word_boundaries(&self, reading: &str) -> Vec<usize> {
+        /// A character no dictionary word covers counts as this many words.
+        const UNKNOWN_CHAR_COST: u32 = 3;
+        const PARTICLES: &[&str] = &[
+            "の", "を", "に", "は", "が", "で", "と", "へ", "も", "や", "か", "ね", "よ", "から",
+            "まで", "より", "ので", "のに", "けど", "など", "だ", "です", "ます", "た", "て",
+        ];
         let chars: Vec<char> = reading.chars().collect();
-        let longest_at = |pos: usize| -> usize {
+        let n = chars.len();
+        let words_at = |pos: usize| -> Vec<usize> {
             let rest: String = chars[pos..].iter().collect();
-            let mut best = 0usize;
-            for dict in [self.dicts.user.as_ref(), self.dicts.system.as_ref()]
+            let mut lens: Vec<usize> = [self.dicts.user.as_ref(), self.dicts.system.as_ref()]
                 .into_iter()
                 .flatten()
-            {
-                for res in dict.common_prefix_search(&rest) {
-                    best = best.max(res.reading.chars().count());
-                }
-            }
-            best
+                .flat_map(|d| d.common_prefix_search(&rest))
+                .map(|res| res.reading.chars().count())
+                .collect();
+            lens.sort_unstable();
+            lens.dedup();
+            lens
         };
-
-        let mut boundaries = Vec::new();
-        let mut pos = 0usize;
-        while pos < chars.len() {
-            let matched = longest_at(pos);
-            if matched > 0 {
-                pos += matched;
-            } else {
-                // Swallow the run of unmatched chars into one segment.
-                pos += 1;
-                while pos < chars.len() && longest_at(pos) == 0 {
-                    pos += 1;
+        // best[i]: (cost, -Σ len², previous position, is a dictionary word)
+        let mut best: Vec<Option<(u32, i64, usize, bool)>> = vec![None; n + 1];
+        best[0] = Some((0, 0, 0, true));
+        for i in 0..n {
+            let Some((cost, neg_sq, _, _)) = best[i] else {
+                continue;
+            };
+            let mut relax = |to: usize, step: u32, len: usize, known: bool| {
+                let cand = (cost + step, neg_sq - (len * len) as i64, i, known);
+                if best[to].is_none_or(|b| (cand.0, cand.1) < (b.0, b.1)) {
+                    best[to] = Some(cand);
                 }
+            };
+            for len in words_at(i) {
+                relax(i + len, 1, len, true);
             }
-            boundaries.push(pos.min(chars.len()));
+            relax(i + 1, UNKNOWN_CHAR_COST, 1, false);
         }
-        boundaries
+        let mut segments: Vec<(usize, usize, bool)> = Vec::new();
+        let mut at = n;
+        while at > 0 {
+            let (_, _, from, known) = best[at].expect("every position is reachable");
+            segments.push((from, at, known));
+            at = from;
+        }
+        segments.reverse();
+
+        let mut phrases: Vec<(usize, usize)> = Vec::new();
+        let mut prev_unknown = false;
+        for (from, to, known) in segments {
+            let text: String = chars[from..to].iter().collect();
+            match phrases.last_mut() {
+                Some(last) if (!known && prev_unknown) || (known && PARTICLES.contains(&text.as_str())) => {
+                    last.1 = to;
+                }
+                _ => phrases.push((from, to)),
+            }
+            prev_unknown = !known;
+        }
+        phrases.into_iter().map(|(_, to)| to).collect()
     }
 
     /// Forget the learned candidate at `page_index` on the current page and
@@ -3003,9 +3040,10 @@ impl InputMethodEngine {
     /// with any compound the dictionary lacks split into its words, so
     /// `しこうちゅうの` (施工中の) can be focused as `しこう|ちゅうの`.
     fn phrase_boundaries(&self, reading: &str, converted: &str) -> Option<Vec<usize>> {
-        let spans = kashiko_engine::segment::align(reading, converted)?;
         let r: Vec<char> = reading.chars().collect();
         let c: Vec<char> = converted.chars().collect();
+        let spans =
+            self.attach_kana_prefixes(&r, &c, kashiko_engine::segment::align(reading, converted)?);
         let mut bounds = Vec::new();
         for span in &spans {
             let seg_reading: String = r[span.reading_start..span.reading_end].iter().collect();
@@ -3033,6 +3071,62 @@ impl InputMethodEngine {
             bounds.push(span.reading_end);
         }
         Some(bounds)
+    }
+
+    /// Kana anchors cut a word that starts with kana off from its kanji:
+    /// `ご飯` aligns as `かれはご|はんを`, `お茶` as `お|ちゃを`. Move the last
+    /// one or two kana of a phrase onto the next one when, together with that
+    /// phrase's stem, they make a dictionary word as converted (`ごはん` → ご飯).
+    fn attach_kana_prefixes(
+        &self,
+        r: &[char],
+        c: &[char],
+        mut spans: Vec<kashiko_engine::segment::Span>,
+    ) -> Vec<kashiko_engine::segment::Span> {
+        let is_kana = |ch: char| ('\u{3041}'..='\u{3096}').contains(&ch);
+        for i in 0..spans.len().saturating_sub(1) {
+            let (a, b) = (spans[i].clone(), spans[i + 1].clone());
+            let b_reading: String = r[b.reading_start..b.reading_end].iter().collect();
+            let b_converted: String = c[b.converted_start..b.converted_end].iter().collect();
+            let shared = b_reading
+                .chars()
+                .rev()
+                .zip(b_converted.chars().rev())
+                .take_while(|(x, y)| x == y)
+                .count();
+            let stem_reading: String =
+                b_reading.chars().take(b_reading.chars().count() - shared).collect();
+            let stem_converted: String =
+                b_converted.chars().take(b_converted.chars().count() - shared).collect();
+            if stem_converted.chars().next().is_none_or(is_kana) {
+                continue;
+            }
+            for k in [2usize, 1] {
+                if a.reading_end - a.reading_start < k || a.converted_end - a.converted_start < k {
+                    continue;
+                }
+                let moved_r = &r[a.reading_end - k..a.reading_end];
+                let moved_c = &c[a.converted_end - k..a.converted_end];
+                if moved_r != moved_c || !moved_c.iter().all(|&ch| is_kana(ch)) {
+                    continue;
+                }
+                let word_reading: String = moved_r.iter().chain(stem_reading.chars().collect::<Vec<_>>().iter()).collect();
+                let word_surface = format!("{}{stem_converted}", moved_c.iter().collect::<String>());
+                if self
+                    .search_dictionaries(&word_reading, usize::MAX)
+                    .iter()
+                    .any(|cand| cand.text == word_surface)
+                {
+                    spans[i].reading_end -= k;
+                    spans[i].converted_end -= k;
+                    spans[i + 1].reading_start -= k;
+                    spans[i + 1].converted_start -= k;
+                    break;
+                }
+            }
+        }
+        spans.retain(|s| s.reading_end > s.reading_start);
+        spans
     }
 
     pub(super) fn dictionary_substitution_variants(&self, reading: &str, converted: &str) -> Vec<String> {
@@ -3522,6 +3616,157 @@ impl InputMethodEngine {
         }
     }
 
+    /// Put variant kanji (`高` → `髙`, `吉田` → `𠮷田`) right after the leading
+    /// word candidates they come from: names are written with them, and the
+    /// dictionary has only some. Runs after ranking, so each variant stays
+    /// next to its original.
+    pub(super) fn place_variants(candidates: &mut Vec<AnnotatedCandidate>) {
+        const SOURCES: usize = 10;
+        const MAX_VARIANTS: usize = 4;
+        let mut seen: HashSet<String> = candidates.iter().map(|c| c.text.clone()).collect();
+        let mut added = 0;
+        let mut i = 0;
+        let mut sources = 0;
+        while i < candidates.len() && sources < SOURCES && added < MAX_VARIANTS {
+            if !matches!(candidates[i].source, CandidateSource::Model | CandidateSource::Dictionary) {
+                i += 1;
+                continue;
+            }
+            sources += 1;
+            let variants = kashiko_engine::variant::variants(&candidates[i].text, MAX_VARIANTS - added);
+            let mut at = i + 1;
+            for text in variants {
+                if seen.insert(text.clone()) {
+                    let mut ac = AnnotatedCandidate::new(text, CandidateSource::Rewriter);
+                    ac.description = Some("異体字".to_string());
+                    candidates.insert(at, ac);
+                    at += 1;
+                    added += 1;
+                }
+            }
+            i = at;
+        }
+    }
+
+    /// Order a focused segment's candidates by how the whole sentence reads
+    /// with each in place: `prefix` (the settled segments) + candidate + `tail`,
+    /// scored as the conversion of `full_reading`. Judged alone, `はしで` has
+    /// no reason to prefer 箸で over 橋で; inside `彼はご飯を…食べた` it does.
+    /// The hiragana/katakana fallbacks and rewriter variants keep their
+    /// places. Model guesses that break the sentence (`お茶を〜`, `飲みタイ`: a
+    /// character scoring 9.5–15.7, against 3.5 for `呑みたい` and 5.0 for
+    /// `橋で`) are removed; dictionary words never are.
+    fn rank_in_sentence(
+        &self,
+        full_reading: &str,
+        prefix: &str,
+        tail: &str,
+        candidates: &mut Vec<AnnotatedCandidate>,
+    ) {
+        /// Scoring budget: one pass over the sentence's differing tail each.
+        /// Dictionary words past it are dropped: inside a sentence, the
+        /// seventieth homophone of `しこう` (厠坑, 司寇) is noise.
+        const MAX_RANKED: usize = 20;
+        const MODEL_WORST_TOKEN_NLL: f32 = 7.0;
+        /// The worst character can sit in the prefix or tail, shared by every
+        /// candidate (`エーアイの` reads badly to the model), so a candidate is
+        /// only broken if it is also this much worse than the best one there.
+        const MODEL_WORST_TOKEN_MARGIN: f32 = 3.0;
+        if prefix.is_empty() && tail.is_empty() {
+            return;
+        }
+        let Some(converter) = self.converters.kanji.as_ref() else {
+            return;
+        };
+        let slots: Vec<usize> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                matches!(
+                    c.source,
+                    CandidateSource::Model | CandidateSource::Dictionary | CandidateSource::Learning
+                )
+            })
+            .map(|(i, _)| i)
+            .take(MAX_RANKED)
+            .collect();
+        if slots.len() < 2 {
+            return;
+        }
+        let sentences: Vec<String> = slots
+            .iter()
+            .map(|&i| format!("{prefix}{}{tail}", candidates[i].text))
+            .collect();
+        let ctx = self.truncate_context_for_api();
+        let Ok(scores) = converter.score_candidates_detailed(full_reading, &ctx, &sentences) else {
+            return;
+        };
+        let best_worst = scores
+            .iter()
+            .flatten()
+            .map(|d| d.worst)
+            .fold(f32::INFINITY, f32::min);
+        let limit = MODEL_WORST_TOKEN_NLL.max(best_worst + MODEL_WORST_TOKEN_MARGIN);
+        // `過程ヲ` next to `過程を`: the same word in another script.
+        let texts: HashSet<&str> = candidates.iter().map(|c| c.text.as_str()).collect();
+        let script_variant = |c: &AnnotatedCandidate| {
+            let hira = kashiko_engine::katakana_to_hiragana(&c.text);
+            hira != c.text && texts.contains(hira.as_str())
+        };
+        let mut broken: HashSet<usize> = slots
+            .iter()
+            .zip(&scores)
+            .filter(|(i, d)| {
+                let c = &candidates[**i];
+                c.source == CandidateSource::Model
+                    && (d.is_some_and(|d| d.worst > limit) || script_variant(c))
+            })
+            .map(|(i, _)| *i)
+            .collect();
+        let ranked: HashSet<usize> = slots.iter().copied().collect();
+        broken.extend(
+            candidates
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| c.source == CandidateSource::Dictionary && !ranked.contains(i))
+                .map(|(i, _)| i),
+        );
+        let mut order: Vec<(usize, f32)> = slots
+            .iter()
+            .zip(scores)
+            .map(|(&i, d)| {
+                let bonus = if candidates[i].source == CandidateSource::Learning {
+                    LEARNED_SCORE_BONUS
+                } else {
+                    0.0
+                };
+                (i, d.map_or(f32::INFINITY, |d| d.mean - bonus))
+            })
+            .collect();
+        order.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let moved: Vec<(bool, AnnotatedCandidate)> = order
+            .iter()
+            .map(|&(i, _)| (broken.contains(&i), candidates[i].clone()))
+            .collect();
+        let mut drop: HashSet<usize> =
+            broken.iter().copied().filter(|i| !ranked.contains(i)).collect();
+        for (&slot, (is_broken, cand)) in slots.iter().zip(moved) {
+            candidates[slot] = cand;
+            if is_broken {
+                drop.insert(slot);
+            }
+        }
+        // Never empty the scored block entirely.
+        if slots.iter().any(|i| !drop.contains(i)) {
+            let mut i = 0;
+            candidates.retain(|_| {
+                let keep = !drop.contains(&i);
+                i += 1;
+                keep
+            });
+        }
+    }
+
     /// Convert `full_reading[start..end]` and focus it, leaving already-decided
     /// segments and the raw tail around it untouched.
     fn convert_focused_segment(
@@ -3541,13 +3786,34 @@ impl InputMethodEngine {
         // The latin-word candidate covers the whole composition, so it is only
         // valid when the focus spans everything (the wrap-around case).
         let allow_latin = start == 0 && end >= full_reading.chars().count();
-        let candidates = self.build_conversion_candidates(
+        let prefix: String = self.decided.iter().map(|(_, t)| t.as_str()).collect();
+        self.segment_prefix = (!prefix.is_empty()).then(|| prefix.clone());
+        let mut candidates = self.build_conversion_candidates(
             &reading,
             self.config.num_candidates,
             false,
             None,
             allow_latin,
         );
+        // Keep the tail converted rather than reverting it to hiragana: moving
+        // the focus is navigation within an already-converted sentence, so only
+        // the focused segment should look unsettled. Converted after what
+        // precedes it, the focused segment's best guess included.
+        let tail_reading: String = full_reading.chars().skip(end).collect();
+        self.tail_text = if tail_reading.is_empty() {
+            None
+        } else {
+            let top = candidates.first().map(|c| c.text.as_str()).unwrap_or(&reading);
+            let ctx = self.lctx_for(&self.truncate_context_for_api(), top);
+            self.run_kana_kanji_conversion(&tail_reading, &ctx, 1)
+                .into_iter()
+                .next()
+                .filter(|t| t != &tail_reading)
+        };
+        self.segment_prefix = None;
+        let tail = self.tail_text.clone().unwrap_or(tail_reading);
+        self.rank_in_sentence(full_reading, &prefix, &tail, &mut candidates);
+        Self::place_variants(&mut candidates);
         let list = CandidateList::new(
             candidates
                 .into_iter()
@@ -3566,19 +3832,6 @@ impl InputMethodEngine {
         if list.is_empty() {
             return EngineResult::consumed();
         }
-        // Keep the tail converted rather than reverting it to hiragana: moving
-        // the focus is navigation within an already-converted sentence, so only
-        // the focused segment should look unsettled.
-        let tail_reading: String = full_reading.chars().skip(end).collect();
-        self.tail_text = if tail_reading.is_empty() {
-            None
-        } else {
-            let ctx = self.truncate_context_for_api();
-            self.run_kana_kanji_conversion(&tail_reading, &ctx, 1)
-                .into_iter()
-                .next()
-                .filter(|t| t != &tail_reading)
-        };
         // Focus moves are user-driven navigation, not a fresh conversion, so
         // no deep search is scheduled for them.
         self.deep_search = None;

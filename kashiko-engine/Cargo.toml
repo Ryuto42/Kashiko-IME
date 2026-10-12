@@ -28,6 +28,7 @@ toml.workspace = true
 # llama.cpp bindings for GGUF inference
 llama-cpp-2 = "0.1"
 yada = "0.5"
+memmap2 = "0.9"
 
 # HuggingFace model download
 hf-hub = "0.4"

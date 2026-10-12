@@ -117,6 +117,11 @@ impl KanaKanjiConverter {
         })
     }
 
+    /// Free memory kept only to speed up the next keystroke's conversion.
+    pub fn release_live_cache(&self) {
+        self.model.release_live_cache();
+    }
+
     /// Set the number of threads for inference (0 = default).
     pub fn set_n_threads(&mut self, n: u32) {
         self.model.set_n_threads(n);
@@ -136,6 +141,18 @@ impl KanaKanjiConverter {
         reading: &str,
         context: &str,
         num_candidates: usize,
+    ) -> Result<Vec<String>> {
+        self.convert_cancellable(reading, context, num_candidates, None)
+    }
+
+    /// As [`Self::convert`]; a set `cancel` flag stops a beam search early
+    /// (its partial result is returned and expected to be discarded).
+    pub fn convert_cancellable(
+        &self,
+        reading: &str,
+        context: &str,
+        num_candidates: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<Vec<String>> {
         // Convert hiragana to katakana (model expects katakana input)
         let katakana = hiragana_to_katakana(reading);
@@ -163,11 +180,12 @@ impl KanaKanjiConverter {
             }
         } else {
             // Multiple candidates: use beam search
-            let results = self.model.generate_beam_search(
+            let results = self.model.generate_beam_search_cancellable(
                 &tokens,
                 self.config.max_new_tokens,
                 eos,
                 num_candidates,
+                cancel,
             )?;
 
             for (output_tokens, _score) in results {
@@ -223,14 +241,33 @@ impl KanaKanjiConverter {
     /// Returns the conversion, or the reading itself when nothing usable came
     /// out (matching `convert`'s fallback).
     pub fn convert_live(&self, reading: &str, context: &str) -> Result<String> {
+        self.convert_live_draft(reading, context, None)
+    }
+
+    /// As [`Self::convert_live`], with the conversion of the previous
+    /// keystroke as `draft`: the greedy pass then only generates what changed
+    /// (see `generate_greedy_scored_draft`), with the same result.
+    pub fn convert_live_draft(
+        &self,
+        reading: &str,
+        context: &str,
+        draft: Option<&str>,
+    ) -> Result<String> {
         let katakana = hiragana_to_katakana(reading);
         let prompt = build_jinen_prompt(&katakana, context);
         let tokens = self.model.tokenize(&prompt)?;
         let eos = Some(self.model.eos_token_id().0);
 
-        let (out_tokens, log_prob) =
-            self.model
-                .generate_greedy_scored(&tokens, self.config.max_new_tokens, eos)?;
+        let draft_tokens = match draft {
+            Some(d) if !d.is_empty() => self.model.tokenize(d)?,
+            _ => Vec::new(),
+        };
+        let (out_tokens, log_prob) = self.model.generate_greedy_scored_draft(
+            &tokens,
+            self.config.max_new_tokens,
+            eos,
+            &draft_tokens,
+        )?;
         let generated = &out_tokens[tokens.len()..];
         let greedy = self.restore_width(reading, clean_model_output(&self.model.decode(generated, true)?));
 

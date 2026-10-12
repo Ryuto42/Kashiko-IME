@@ -30,7 +30,7 @@ cd kashiko-macos && make install
 
 その後、macOSからログアウトして再ログインし（新しいIMEを認識させるために必要）、`システム設定` > `キーボード` > `入力ソース` を編集 > `+` > 「日本語」から **Kashiko** を追加してください。
 
-`make install` 時に `models.toml` の全モデルを Hugging Face からダウンロードしてキャッシュに配置します。失敗した場合は初回変換時に自動でダウンロードされますが、完了まで候補が出るのに時間がかかります。
+`make install` 時に設定中のモデル（メインと補助）を Hugging Face からダウンロードしてキャッシュに配置します。失敗した場合は初回変換時に自動でダウンロードされますが、完了まで候補が出るのに時間がかかります。
 
 ### 開発版の更新
 
@@ -49,6 +49,18 @@ make install && killall KashikoIME
 ```bash
 make test
 ```
+
+### 配布物の作成
+
+ソースのリポジトリは非公開のため、ソースを持たない人向けには配布物を別の公開リポジトリのリリースに置きます。
+
+```bash
+scripts/package-release.sh <公開リポジトリ> <タグ>   # 例: Ryuto42/Kashiko-IME-releases v0.1.0
+```
+
+`dist/` にアプリの zip（Apple Silicon 用、ライセンス文書同梱）、`dict.tgz`、`install.sh`、`SHA256SUMS` ができます。zip と `install.sh` はタグのリリースに、`dict.tgz` は Makefile の `DICT_RELEASE`（`dict-20260226`）のリリースに置いてください。利用者は `install.sh` を実行するだけで、SHA-256 を照合しながらアプリ・辞書・モデルを入れられます。
+
+`make install` の辞書取得は、`RELEASE_REPO=<公開リポジトリ>` を指定すると公開リリースから HTTPS で取得します。未指定の場合は、非公開リポジトリから `gh` で取得します（アクセス権のある GitHub ログインが必要です）。
 
 ## システム辞書
 

@@ -17,6 +17,7 @@ build/
 out/
 kashiko-macos/.build/
 kashiko-macos/out/
+kashiko-macos/dist/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
 *.pbxuser

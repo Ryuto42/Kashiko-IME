@@ -11,6 +11,7 @@ pub mod rewriter;
 pub mod romaji;
 pub mod segment;
 pub mod typo;
+pub mod variant;
 
 pub use dict::{Candidate as DictCandidate, DictEntry, Dictionary, LookupResult};
 pub use kana::{

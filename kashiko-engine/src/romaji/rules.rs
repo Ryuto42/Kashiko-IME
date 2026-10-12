@@ -352,6 +352,8 @@ pub fn build_rules() -> TrieNode {
     // Brackets
     trie.insert("[", "「");
     trie.insert("]", "」");
+    trie.insert("(", "（");
+    trie.insert(")", "）");
 
     // Z-special symbols (Google Japanese Input style)
     trie.insert("z/", "・");
@@ -564,6 +566,8 @@ mod tests {
         let trie = build_rules();
         assert_eq!(trie.search_longest("[").output.unwrap(), "「");
         assert_eq!(trie.search_longest("]").output.unwrap(), "」");
+        assert_eq!(trie.search_longest("(").output.unwrap(), "（");
+        assert_eq!(trie.search_longest(")").output.unwrap(), "）");
         assert_eq!(trie.search_longest(",").output.unwrap(), "、");
         assert_eq!(trie.search_longest(".").output.unwrap(), "。");
         assert_eq!(trie.search_longest("-").output.unwrap(), "ー");

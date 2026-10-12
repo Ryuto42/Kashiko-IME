@@ -166,7 +166,7 @@ impl InputMethodEngine {
             return;
         }
 
-        match Dictionary::load(&path) {
+        match Dictionary::load_mapped(&path) {
             Ok(dict) => {
                 debug!("System dictionary loaded from {:?}", path);
                 self.dicts.system = Some(dict);

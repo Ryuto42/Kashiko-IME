@@ -47,6 +47,8 @@ Kashiko IME は macOS 向けの日本語入力システムです。ローカル�
 
 ### 手順
 
+リポジトリは非公開のため、取得にはアクセス権のある GitHub アカウントが必要です。ソースを持たない人向けの配布方法は [kashiko-macos の README](kashiko-macos/README.md#配布物の作成) を参照してください。
+
 ```bash
 git clone https://github.com/Ryuto42/Kashiko-IME.git
 ```

@@ -7,7 +7,8 @@
 //! terminating it.
 //!
 //! `--prefetch-models` downloads the configured conversion models (main and
-//! light) into the HuggingFace cache and exits (used by `make install`
+//! light) into the HuggingFace cache, builds the mapped dictionary cache, and
+//! exits (used by `make install`
 //! to avoid a multi-minute download on first launch).
 
 use std::io::{BufRead, Write};
@@ -41,6 +42,18 @@ fn main() {
             tracing::error!("model prefetch failed: {e}");
             std::process::exit(1);
         }
+        // Build the mapped dictionary cache now rather than on the IME's first
+        // launch, whose process would keep the memory used to build it.
+        let dict = settings
+            .conversion
+            .dict_path
+            .map(std::path::PathBuf::from)
+            .or_else(|| kashiko_im::config::Settings::data_dir().map(|d| d.join("dict.bin")));
+        if let Some(dict) = dict.filter(|d| d.exists())
+            && let Err(e) = kashiko_engine::Dictionary::load_mapped(&dict)
+        {
+            tracing::warn!("dictionary cache not built: {e}");
+        }
         return;
     }
 
@@ -59,6 +72,9 @@ fn main() {
     enum Msg {
         Request(String),
         DeepDone(kashiko_im::DeepSearchOutcome),
+        /// stdin closed. Sent explicitly: the worker keeps its sender alive,
+        /// so `recv` alone would never report the end.
+        Eof,
     }
 
     let (tx, rx) = std::sync::mpsc::channel::<Msg>();
@@ -79,6 +95,7 @@ fn main() {
                 }
             }
         }
+        let _ = stdin_tx.send(Msg::Eof);
     });
 
     // The deep-search worker. It holds its own handle on the (immutable) model
@@ -122,6 +139,7 @@ fn main() {
                 continue;
             }
             Msg::Request(line) => line,
+            Msg::Eof => break,
         };
 
         if line.trim().is_empty() {

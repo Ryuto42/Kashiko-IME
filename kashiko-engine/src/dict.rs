@@ -65,6 +65,7 @@ pub struct LookupResult<'a> {
 /// `u16` lengths because a reading or surface longer than 64KB cannot occur —
 /// the on-disk format stores them as `u16` too.
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 struct EntrySpan {
     reading_at: u32,
     cands_at: u32,
@@ -74,6 +75,7 @@ struct EntrySpan {
 
 /// Where one candidate's surface lives in the arena, and its score.
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 struct CandSpan {
     surface_at: u32,
     score: f32,
@@ -90,10 +92,65 @@ struct CandSpan {
 /// occupied 382 MB resident. The arena is three allocations instead of seven
 /// million, and holds the same bytes the file does.
 pub struct Dictionary {
-    trie: DoubleArray<Vec<u8>>,
-    blob: Box<[u8]>,
-    entries: Box<[EntrySpan]>,
-    cands: Box<[CandSpan]>,
+    trie: DoubleArray<Store<u8>>,
+    blob: Store<u8>,
+    entries: Store<EntrySpan>,
+    cands: Store<CandSpan>,
+}
+
+/// A section of the dictionary: built in memory, or a slice of a mapped cache
+/// file (see [`Dictionary::load_mapped`]). Mapped pages are file-backed — they
+/// are read in only when a lookup touches them and the system can drop them at
+/// any time, so they don't count against the process's memory.
+enum Store<T: 'static> {
+    Owned(Box<[T]>),
+    Mapped {
+        map: std::sync::Arc<memmap2::Mmap>,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl<T: Copy> std::ops::Deref for Store<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        match self {
+            Store::Owned(items) => items,
+            // SAFETY: `open_mapped` checked that `offset..offset + len * size`
+            // lies inside the map and is aligned for `T`; `T` is a `repr(C)`
+            // plain-data type for which any bit pattern is valid.
+            Store::Mapped { map, offset, len } => unsafe {
+                std::slice::from_raw_parts(map.as_ptr().add(*offset).cast::<T>(), *len)
+            },
+        }
+    }
+}
+
+const MAPPED_MAGIC: &[u8; 8] = b"KSHKDMAP";
+const MAPPED_VERSION: u64 = 1;
+/// Magic, version, source fingerprint (2), and offset/count for 4 sections.
+const MAPPED_HEADER_LEN: usize = 8 + 3 * 8 + 4 * 2 * 8;
+const MAPPED_ALIGN: usize = 16;
+
+fn align_up(n: usize) -> usize {
+    n.div_ceil(MAPPED_ALIGN) * MAPPED_ALIGN
+}
+
+/// Size and modification time of the source dictionary: a replaced
+/// `dict.bin` (a new download) invalidates the cache built from the old one.
+fn source_fingerprint(path: &Path) -> Result<(u64, u64)> {
+    let meta = std::fs::metadata(path)?;
+    let modified = meta
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    Ok((meta.len(), modified))
+}
+
+fn as_bytes<T: Copy>(items: &[T]) -> &[u8] {
+    // SAFETY: `T` is a `repr(C)` plain-data span type without padding bytes.
+    unsafe { std::slice::from_raw_parts(items.as_ptr().cast::<u8>(), std::mem::size_of_val(items)) }
 }
 
 /// yada indexes the trie with `get_unchecked`, so a malformed trie would read
@@ -248,10 +305,10 @@ impl Dictionary {
 
         let (blob, spans, cands) = Self::pack(&entries);
         Ok(Dictionary {
-            trie: DoubleArray::new(trie_bytes),
-            blob,
-            entries: spans,
-            cands,
+            trie: DoubleArray::new(Store::Owned(trie_bytes.into_boxed_slice())),
+            blob: Store::Owned(blob),
+            entries: Store::Owned(spans),
+            cands: Store::Owned(cands),
         })
     }
 
@@ -460,10 +517,115 @@ impl Dictionary {
         );
 
         Ok(Dictionary {
-            trie: DoubleArray::new(trie_bytes),
-            blob: blob.into_boxed_slice(),
-            entries: spans.into_boxed_slice(),
-            cands: cands.into_boxed_slice(),
+            trie: DoubleArray::new(Store::Owned(trie_bytes.into_boxed_slice())),
+            blob: Store::Owned(blob.into_boxed_slice()),
+            entries: Store::Owned(spans.into_boxed_slice()),
+            cands: Store::Owned(cands.into_boxed_slice()),
+        })
+    }
+
+    /// Load `path` through a memory-mapped cache next to it (`*.mmap`),
+    /// writing that cache first when it is missing or was made from a
+    /// different `path`. Falls back to [`Self::load`] if the cache can't be
+    /// written or mapped.
+    pub fn load_mapped(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let cache = path.with_extension("mmap");
+        let source = source_fingerprint(path)?;
+        match Self::open_mapped(&cache, source) {
+            Ok(dict) => return Ok(dict),
+            Err(e) => tracing::info!("building dictionary cache {}: {e}", cache.display()),
+        }
+        let dict = Self::load(path)?;
+        if let Err(e) = dict.write_mapped(&cache, source) {
+            tracing::warn!("could not write dictionary cache {}: {e}", cache.display());
+            return Ok(dict);
+        }
+        // Free the in-memory copy before mapping; reload it only if mapping fails.
+        drop(dict);
+        Self::open_mapped(&cache, source).or_else(|e| {
+            tracing::warn!("could not map dictionary cache {}: {e}", cache.display());
+            Self::load(path)
+        })
+    }
+
+    fn write_mapped(&self, cache: &Path, source: (u64, u64)) -> Result<()> {
+        let trie: &[u8] = &self.trie.0;
+        let sections: [(&[u8], usize); 4] = [
+            (trie, trie.len()),
+            (&self.blob, self.blob.len()),
+            (as_bytes(&self.entries), self.entries.len()),
+            (as_bytes(&self.cands), self.cands.len()),
+        ];
+        let mut header = Vec::with_capacity(MAPPED_HEADER_LEN);
+        header.extend_from_slice(MAPPED_MAGIC);
+        for v in [MAPPED_VERSION, source.0, source.1] {
+            header.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut offset = MAPPED_HEADER_LEN;
+        for (bytes, count) in &sections {
+            header.extend_from_slice(&(offset as u64).to_le_bytes());
+            header.extend_from_slice(&(*count as u64).to_le_bytes());
+            offset = align_up(offset + bytes.len());
+        }
+        let tmp = cache.with_extension("mmap.tmp");
+        {
+            let mut w = BufWriter::new(File::create(&tmp)?);
+            w.write_all(&header)?;
+            let mut written = MAPPED_HEADER_LEN;
+            for (bytes, _) in &sections {
+                w.write_all(bytes)?;
+                written += bytes.len();
+                let padded = align_up(written);
+                w.write_all(&vec![0u8; padded - written])?;
+                written = padded;
+            }
+            w.flush()?;
+            w.get_ref().sync_all()?;
+        }
+        std::fs::rename(&tmp, cache)?;
+        Ok(())
+    }
+
+    fn open_mapped(cache: &Path, source: (u64, u64)) -> Result<Self> {
+        let file = File::open(cache)?;
+        // SAFETY: the cache is only ever replaced by rename, never rewritten in
+        // place, so the mapped file's contents don't change underneath us.
+        let map = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file)? });
+        let bad = |why: &str| DictError::Format(format!("dictionary cache: {why}"));
+        if map.len() < MAPPED_HEADER_LEN || &map[..8] != MAPPED_MAGIC {
+            return Err(bad("not a dictionary cache"));
+        }
+        let word = |i: usize| u64::from_le_bytes(map[8 + i * 8..16 + i * 8].try_into().unwrap());
+        if word(0) != MAPPED_VERSION {
+            return Err(bad("unsupported version"));
+        }
+        if (word(1), word(2)) != source {
+            return Err(bad("made from a different dictionary"));
+        }
+        let section = |i: usize, size: usize| -> Result<(usize, usize)> {
+            let (offset, count) = (word(3 + i * 2) as usize, word(4 + i * 2) as usize);
+            let end = count
+                .checked_mul(size)
+                .and_then(|n| n.checked_add(offset))
+                .ok_or_else(|| bad("section overflows"))?;
+            if offset % MAPPED_ALIGN != 0 || end > map.len() {
+                return Err(bad("section out of range"));
+            }
+            Ok((offset, count))
+        };
+        let (trie_at, trie_len) = section(0, 1)?;
+        let (blob_at, blob_len) = section(1, 1)?;
+        let (entries_at, entries_len) = section(2, std::mem::size_of::<EntrySpan>())?;
+        let (cands_at, cands_len) = section(3, std::mem::size_of::<CandSpan>())?;
+        // yada reads the trie unchecked; it must be validated like any file.
+        validate_trie(&map[trie_at..trie_at + trie_len], entries_len)?;
+        let store = |offset, len| Store::Mapped { map: map.clone(), offset, len };
+        Ok(Dictionary {
+            trie: DoubleArray::new(store(trie_at, trie_len)),
+            blob: store(blob_at, blob_len),
+            entries: Store::Mapped { map: map.clone(), offset: entries_at, len: entries_len },
+            cands: Store::Mapped { map: map.clone(), offset: cands_at, len: cands_len },
         })
     }
 
@@ -823,6 +985,80 @@ mod tests {
         f.write_all(json.as_bytes()).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    fn lookups(dict: &Dictionary) -> Vec<(String, Vec<String>)> {
+        ["きょう", "きょうと", "とうきょう", "なし"]
+            .iter()
+            .map(|r| {
+                let cands = dict
+                    .exact_match_search(r)
+                    .map(|l| l.candidates.iter().map(|c| c.surface.to_string()).collect())
+                    .unwrap_or_default();
+                (r.to_string(), cands)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mapped_cache_answers_like_the_loaded_dictionary() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("dict.bin");
+        Dictionary::build_from_json(create_test_json().path())
+            .unwrap()
+            .save(&bin)
+            .unwrap();
+        let loaded = Dictionary::load(&bin).unwrap();
+        let mapped = Dictionary::load_mapped(&bin).unwrap();
+        assert!(matches!(mapped.blob, Store::Mapped { .. }));
+        assert!(dir.path().join("dict.mmap").exists());
+        assert_eq!(lookups(&mapped), lookups(&loaded));
+        assert_eq!(
+            mapped.common_prefix_search("きょうとし").len(),
+            loaded.common_prefix_search("きょうとし").len()
+        );
+        // Second load maps the existing cache.
+        let again = Dictionary::load_mapped(&bin).unwrap();
+        assert_eq!(lookups(&again), lookups(&loaded));
+    }
+
+    #[test]
+    fn a_replaced_dictionary_rebuilds_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("dict.bin");
+        Dictionary::build_from_json(create_test_json().path())
+            .unwrap()
+            .save(&bin)
+            .unwrap();
+        Dictionary::load_mapped(&bin).unwrap();
+        let replacement = Dictionary::build_from_entries(vec![DictEntry {
+            reading: "あめ".into(),
+            candidates: vec![Candidate { surface: "雨".into(), score: 1.0 }],
+        }])
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        replacement.save(&bin).unwrap();
+        let mapped = Dictionary::load_mapped(&bin).unwrap();
+        assert!(mapped.exact_match_search("あめ").is_some());
+        assert!(mapped.exact_match_search("きょう").is_none());
+    }
+
+    #[test]
+    fn a_corrupt_cache_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("dict.bin");
+        Dictionary::build_from_json(create_test_json().path())
+            .unwrap()
+            .save(&bin)
+            .unwrap();
+        Dictionary::load_mapped(&bin).unwrap();
+        let cache = dir.path().join("dict.mmap");
+        let len = std::fs::metadata(&cache).unwrap().len();
+        std::fs::OpenOptions::new().write(true).open(&cache).unwrap().set_len(len / 2).unwrap();
+        let source = source_fingerprint(&bin).unwrap();
+        assert!(Dictionary::open_mapped(&cache, source).is_err());
+        // Loading falls back to rebuilding it.
+        assert!(Dictionary::load_mapped(&bin).unwrap().exact_match_search("きょう").is_some());
     }
 
     #[test]
