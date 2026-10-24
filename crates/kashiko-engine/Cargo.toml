@@ -31,7 +31,7 @@ yada = "0.5"
 memmap2 = "0.9"
 
 # HuggingFace model download
-hf-hub = "0.4"
+hf-hub = "1.0"
 
 # Authenticated encryption for the learning cache at rest (ChaCha20-Poly1305).
 # Already in the dependency graph via the HuggingFace download path.
