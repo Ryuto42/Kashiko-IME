@@ -6,7 +6,7 @@ kashiko IME はユーザー辞書をサポートしています。ユーザー�
 
 ### Mozc/Google IME TSV 形式
 
-タブ区切りのテキストファイルです。Google 日本語入力やMozcからエクスポートした辞書をそのまま使用できます。
+タブ区切りのテキストファイルです。Google 日本語入力やMozcからエクスポートした辞書、Microsoft IME の「テキストファイルで出力」したファイル（UTF-16）をそのまま使用できます。
 
 ```
 # コメント行（#で始まる行は無視されます）
@@ -28,8 +28,7 @@ Mozc TSV 形式のまま読み込むと、IME起動時にダブル配列の構�
 バイナリ形式ならダブル配列が構築済みなので瞬時に読み込めます。
 
 ```bash
-# Mozc TSV から バイナリを作成（kashiko-cli ディレクトリで実行）
-cd kashiko-cli
+# Mozc TSV から バイナリを作成（リポジトリ直下で実行）
 cargo run --release --bin kashiko-dict -- build --format mozc input.tsv -o user_dict.bin
 ```
 
@@ -38,7 +37,7 @@ cargo run --release --bin kashiko-dict -- build --format mozc input.tsv -o user_
 ユーザー辞書ディレクトリに辞書ファイルを配置するだけで自動的に読み込まれます。
 
 ```
-~/Library/Application Support/com.kashiko.kashiko-im/user_dicts/
+~/Library/Application Support/Kashiko/user_dicts/
 ├── my_dict.txt          ← Mozc TSV 形式
 ├── nico_dict.bin        ← KRKN バイナリ形式
 └── another.txt          ← ファイルを置くだけで有効
@@ -65,45 +64,32 @@ cargo run --release --bin kashiko-dict -- build --format mozc input.tsv -o user_
 
 ```bash
 # ディレクトリ作成
-mkdir -p ~/Library/"Application Support"/com.kashiko.kashiko-im/user_dicts
+mkdir -p ~/Library/"Application Support"/Kashiko/user_dicts
 
 # ダウンロードして配置
-curl -L -o ~/Library/Application Support/com.kashiko.kashiko-im/user_dicts/nico_dict.txt \
+curl -L -o "$HOME/Library/Application Support/Kashiko/user_dicts/nico_dict.txt" \
   https://raw.githubusercontent.com/ncaq/dic-nico-intersection-pixiv/master/public/dic-nico-intersection-pixiv-google.txt
 ```
 
-## 辞書の確認 (kashiko-dict view)
+## 辞書の確認 (kashiko-dict search)
 
-`kashiko-dict view` コマンドで辞書の内容を検索・確認できます。CLI検索モードとWeb UIモードの2つがあります:
-
-### CLI検索モード
+`kashiko-dict search` コマンドで辞書の内容を検索・確認できます。リポジトリ直下で実行します。
 
 ```bash
-cd kashiko-cli
-
 # ヨミで検索（完全一致）
-cargo run --release --bin kashiko-dict -- view -q きょう user_dict.txt
+cargo run --release --bin kashiko-dict -- search -q きょう user_dict.txt
 
 # ヨミで前方一致検索
-cargo run --release --bin kashiko-dict -- view -q きょう -p user_dict.txt
+cargo run --release --bin kashiko-dict -- search -q きょう -p user_dict.txt
 
 # 表層形で検索（部分一致）
-cargo run --release --bin kashiko-dict -- view -q 京都 -s user_dict.txt
+cargo run --release --bin kashiko-dict -- search -q 京都 -s user_dict.txt
 
 # 全エントリをダンプ
-cargo run --release --bin kashiko-dict -- view -a user_dict.txt
-```
+cargo run --release --bin kashiko-dict -- search -a user_dict.txt
 
-### Web UIモード
-
-```bash
-cd kashiko-cli
-
-# Webサーバーを起動（デフォルト: http://127.0.0.1:8080）
-cargo run --release --bin kashiko-dict -- view user_dict.txt
-
-# 複数辞書をマージして表示
-cargo run --release --bin kashiko-dict -- view dict1.bin dict2.txt
+# 複数の辞書をまとめて検索
+cargo run --release --bin kashiko-dict -- search -q きょう dict1.bin dict2.txt
 ```
 
 ## 辞書ビルダー (kashiko-dict build)
@@ -111,8 +97,6 @@ cargo run --release --bin kashiko-dict -- view dict1.bin dict2.txt
 テキスト辞書を高速なバイナリ形式に変換します:
 
 ```bash
-cd kashiko-cli
-
 # JSON 形式から（デフォルト）
 cargo run --release --bin kashiko-dict -- build input.json -o dict.bin
 

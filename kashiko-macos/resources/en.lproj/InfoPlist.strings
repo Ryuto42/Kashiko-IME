@@ -1,5 +1,0 @@
-/* Display names for the input source and its input modes (keys are
-   TISInputSourceIDs). Without these the input menu shows the raw IDs. */
-"io.github.ryuto42.inputmethod.Kashiko" = "Kashiko";
-"io.github.ryuto42.inputmethod.Kashiko.Japanese" = "Hiragana (Kashiko)";
-"io.github.ryuto42.inputmethod.Kashiko.Roman" = "Alphanumeric (Kashiko)";

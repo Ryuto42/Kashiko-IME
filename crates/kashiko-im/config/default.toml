@@ -1,0 +1,40 @@
+# Kashiko IME デフォルト設定
+# このファイルは ~/Library/Application Support/Kashiko/config.toml にコピーして使用してください
+
+[conversion]
+# 変換ストラテジー: adaptive（動的切替）, light（軽量モデルのみ）, main（メインモデルのみ）
+strategy = "adaptive"
+# 変換候補数（Space押下時）
+num_candidates = 9
+# 周辺テキスト（カーソル左側の確定済みテキスト）を変換時のコンテキストとして使用する
+use_context = true
+# 変換に渡す周辺テキスト（カーソル左側の確定済みテキスト）の最大文字数。
+# 同音語の判別は直前の文に依存するため（「雑誌に載る」/「車に乗る」）、
+# 前の一文が入る程度の長さが必要。長くすると毎回のプロンプトが伸びる。
+max_context_length = 32
+# ライブ変換で1回のGPT2変換が扱う読みの最大文字数。
+# 入力をこの長さごとのチャンクに内部分割し、各チャンクを個別に変換することで
+# 長文入力でも1キーあたりの変換レイテンシを一定以内に抑える。
+# 各チャンクの左コンテキストは直前までのチャンクの変換結果になる。
+composing_chunk_len = 30
+# ビームサーチを使うトークン数の上限（それ以上はgreedy）
+short_input_threshold = 10
+# 短い入力のビーム幅
+beam_width = 3
+# メインモデルの推論がこの時間(ms)を超えたらlight_modelに自動切替(0で無効)
+max_latency_ms = 100
+# Model variant id or GGUF path (uses registry default if unset)
+model = "jinen-v2-small-q8"
+# Beam search model for Space conversion (uses default model only if unset)
+light_model = "jinen-v2-xsmall-q5"
+# 推論スレッド数（0 = 全コア使用）
+n_threads = 2
+# 起動時にライブ変換を有効にする（Ctrl+Shift+L で実行中も切替可能）
+live_conversion = true
+# ユーザー辞書: ~/Library/Application Support/Kashiko/user_dicts/ に辞書ファイルを配置（Mozc TSV or KRKN binary）
+
+[learning]
+# 変換学習を有効にする
+enabled = true
+# 学習エントリの最大数
+max_entries = 10000

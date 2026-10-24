@@ -12,12 +12,14 @@ Kashiko IME は macOS 向けの日本語入力システムです。ローカル�
 **変換**
 
 - **ニューラルかな漢字変換** — 辞書ベースだけでなく、文脈を理解するモデルによる変換
-- **ライブ変換** — 入力と同時に変換結果を表示。スペースキーを押す回数を減らします
+- **ライブ変換** — 入力と同時に変換結果を表示。入力が止まると裏でより広く探索し直して表示を直すので、スペースキーを押す回数を減らせます
 - **前後の文脈を読んだ変換** — 直前の文を手がかりに同音語を判別。文脈を読み取れないアプリでは、このIME自身の確定履歴で代用します
 - **同音語の補完** — 変換結果を読みに整列させ、辞書が持つ別の読み方を文中に差し込んだ候補を補います
 - **数字＋助数詞** — 数詞と助数詞に分解できる読みを、数字を使った表記でも提示します
 - **外来語の英語表記** — カタカナ借用語の英語表記を候補に出します（エンジニアリング・ビジネス系の用語のみ）
 - **英単語の復元** — ローマ字変換で崩れた英単語を打鍵内容から復元します
+- **英単語の自動判定** — ローマ字のまま打っても英単語は英字で残ります（`kyouhagoogledekensaku` → 今日はGoogleで検索）。サービス名は正式な表記に整えます
+- **異体字** — 人名の異体字（髙橋・𠮷田・齊藤など）を元の候補の後ろに出します
 
 **候補の質**
 
@@ -32,47 +34,86 @@ Kashiko IME は macOS 向けの日本語入力システムです。ローカル�
 - **推論ボタン** — 候補ウィンドウ下部のボタンで、押すたびに探索を広げます。候補が少ないときは押さなくても自動で探索します
 - **候補の削除** — 候補行の ✕ で、その候補を今後出さないようにできます。食い違う文節を学習するため、同じ文だけでなくその語が出てくる場所すべてに効きます
 - **文節単位の変換操作** — 変換中の矢印キーで変換対象の文節を移動・伸縮できます
-- **確定取り消し（再変換）** — 確定直後に `Ctrl+Backspace` で変換モードに戻せます
+- **確定取り消し（再変換）** — 確定直後に `Ctrl+Backspace` で変換モードに戻せます。その確定で学習した内容も取り消します
+- **文字種の変換** — `F6` ひらがな、`F7` カタカナ、`F8` 半角カタカナ、`F9` 全角英数、`F10` 半角英数（`F9`/`F10` は続けて押すと大文字・小文字を切り替え）
+- **Shift で英字入力** — Shift を押しながら英字を打つと、そのまま英字入力になり、Enter で確定すると日本語入力に戻ります
+- **数字の後の記号** — 数字の直後の `.` `,` `-` は半角のまま（`3.14`、`1,000`、`03-1234`）
+- **設定画面** — 入力メニューの「設定…」から、ライブ変換・候補数・モデル・推論スレッド数・学習・アップデートなどを変更できます
+- **プライベートモード** — 入力メニューから、学習を一時停止したり学習履歴を消去したりできます
+- **ユーザー辞書** — Google 日本語入力・Microsoft IME から書き出した単語一覧をそのまま読み込めます
 
 ---
 
 ## インストール
 
-### 前提条件
+Apple Silicon（M1 以降）の Mac、macOS 13 (Ventura) 以降が対象です。
 
-- macOS 13 (Ventura) 以降
-- Xcode または Swift コマンドラインツール
-- Rust ツールチェーン
-- GNU Make
+```bash
+curl -fsSL https://github.com/Ryuto42/Kashiko-IME/releases/latest/download/install.sh | bash
+```
 
-### 手順
+アプリ、システム辞書、変換モデルを取得して、それぞれ SHA-256 を照合してから入れます（合計約340MB）。管理者権限は不要です。中身を確認してから実行したい場合は、[Releases](https://github.com/Ryuto42/Kashiko-IME/releases/latest) から `install.sh` をダウンロードして `bash install.sh` で実行してください。
 
-リポジトリは非公開のため、取得にはアクセス権のある GitHub アカウントが必要です。ソースを持たない人向けの配布方法は [kashiko-macos の README](kashiko-macos/README.md#配布物の作成) を参照してください。
+完了したらログアウトして再ログインし、`システム設定` > `キーボード` > `テキスト入力` の `入力ソース` で `編集…` > `+` > 「日本語」から **Kashiko** を追加します。
+
+アプリは Apple の公証を受けていません（開発者IDの署名なし）。`install.sh` を使えば問題なく動きますが、Releases の zip をブラウザでダウンロードして手で入れた場合は、macOS に起動をブロックされます。その場合は次を実行してください。
+
+```bash
+xattr -dr com.apple.quarantine ~/Library/Input\ Methods/Kashiko.app
+```
+
+### アップデート
+
+1日1回、IME を使い始めたときに新しい版を確認し、あれば知らせます。メニューバーの入力メニューから「アップデートを確認…」で手動でも確認でき、自動確認は同じメニューで切り替えられます。更新はダウンロードした zip を `SHA256SUMS` と照合し、署名とアプリのIDを確かめてから入れ替えます。
+
+### アンインストール
+
+```bash
+rm -rf ~/Library/Input\ Methods/Kashiko.app \
+  ~/Library/Application\ Support/Kashiko \
+  ~/Library/Logs/Kashiko \
+  ~/.cache/huggingface/hub/models--togatogah--jinen-v2-*
+```
+
+入力ソースから Kashiko を削除してからログアウトしてください。2行目は学習データとユーザー辞書を含みます。残したい場合は除いてください。
+
+### ソースからビルドする
+
+Intel Mac の場合や、開発する場合はソースからビルドします。前提は Xcode Command Line Tools、Rust（安定版）、CMake（`brew install cmake`）、GNU Make です。
 
 ```bash
 git clone https://github.com/Ryuto42/Kashiko-IME.git
+cd Kashiko-IME && make install
 ```
 
-```bash
-cd Kashiko-IME/kashiko-macos && make install
-```
-
-初回はRustのコンパイルとモデル（GGUF）のダウンロードのため数分〜数十分かかります。
-
-完了後、Macからログアウトして再ログインし、`システム設定` > `キーボード` > `テキスト入力` > `入力ソース` > `編集` から「日本語」の **Kashiko** を追加してください。
+初回は Rust のコンパイルとモデルのダウンロードのため数分〜十数分かかります。詳しくは [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
 
 ---
 
 ## 構成
 
-Rustのバックエンドと Swift のフロントエンド（InputMethodKit）から成ります。
+Rust の変換エンジンと、Swift（InputMethodKit）の入力メソッドから成ります。両者は JSON-RPC で通信し、アクティビティモニタではそれぞれ「Kashiko IME」「Kashiko IME Engine」と表示されます。
 
-| クレート | 役割 |
+```text
+Kashiko-IME/
+├── crates/
+│   ├── kashiko-im/      変換エンジンのコア（入力ステートマシン、候補生成、学習、JSON-RPC サーバー）
+│   ├── kashiko-engine/  モデル推論（llama.cpp）、辞書、ローマ字変換、学習キャッシュ
+│   └── kashiko-tools/   開発用ツール（辞書のビルド、精度評価）。IME の動作には不要
+├── macos/               macOS の入力メソッド（Swift）。候補ウィンドウ、設定画面、アップデート
+├── scripts/             リリース作成、インストーラー、データ生成のスクリプト
+├── docs/                ユーザー辞書の説明、辞書のライセンス
+└── Makefile             ビルドとインストール（`make install`）
+```
+
+| ディレクトリ | 説明 |
 |---|---|
-| [kashiko-im](kashiko-im/) | 変換エンジンのコア。入力ステートマシン、ローマ字変換、学習、候補生成 |
-| [kashiko-engine](kashiko-engine/) | llama.cpp によるモデル推論、辞書、学習キャッシュ |
-| [kashiko-macos](kashiko-macos/) | InputMethodKit を使ったUI。RustとはJSON-RPCで通信 |
-| [kashiko-cli](kashiko-cli/) | エンジン単体を試すための開発用ツール（IMEの動作には不要） |
+| [crates/kashiko-im](crates/kashiko-im/) | キー操作、変換、候補、学習の詳細 |
+| [crates/kashiko-engine](crates/kashiko-engine/) | 推論、辞書、メモリと負荷の設計 |
+| [crates/kashiko-tools](crates/kashiko-tools/) | 辞書の作り方、精度評価 |
+| [macos](macos/) | 入力メソッドの構成とリリース手順 |
+
+利用者のデータは `~/Library/Application Support/Kashiko/`（設定、辞書、学習）と `~/Library/Logs/Kashiko/`（ログ）にあります。
 
 ---
 
@@ -80,17 +121,18 @@ Rustのバックエンドと Swift のフロントエンド（InputMethodKit）�
 
 ローカル完結で動作し、入力内容や学習データを外部に送信しません。
 
-- **保存先** — ユーザー辞書と学習キャッシュは `~/Library/Application Support/com.kashiko.kashiko-im/` 配下のみ
+- **保存先** — ユーザー辞書と学習キャッシュは `~/Library/Application Support/Kashiko/` 配下のみ
 - **学習キャッシュの暗号化** — 入力内容の記録なので ChaCha20-Poly1305 で暗号化して保存します（鍵は同ディレクトリに `0600` で保存）。バックアップやインデクサに平文で拾われることを防ぐためのもので、アカウント権限を持つ相手からの保護ではありません
 - **変換** — llama.cpp によるローカル推論のみ。テレメトリ・クラッシュレポート送信はありません
-- **ネットワーク通信** — 初回ビルド時にモデルとシステム辞書をダウンロードするのみ
+- **ネットワーク通信** — インストール時にモデルとシステム辞書を取得するのと、1日1回の新しい版の確認（GitHub の公開APIに現在の版を問い合わせるだけ）とアップデートのダウンロードのみ。自動確認は入力メニューでオフにできます
 - **前後の文脈** — 文脈判定のためカーソル周辺のテキストをアプリから読み取りますが、ローカルのエンジンプロセスに渡すだけで保存も送信もしません
 - **ログ** — 入力内容が出るのは `debug`/`trace` レベルのみで、既定では出力されません
+- **プライベートモード** — 入力メニューでオンにすると、その間は何も学習しません。「学習履歴を消去…」で学習データを消せます
 
 ## ライセンス
 
 MIT OR Apache-2.0 のデュアルライセンスです（[MIT](LICENSE-MIT) / [Apache-2.0](LICENSE-APACHE)）。
 
-本プロジェクトは [togatoga/kashiko](https://github.com/togatoga/kashiko)（MIT OR Apache-2.0）の派生物です。MITライセンスの要求に従い、原著作権表示は [LICENSE-MIT](LICENSE-MIT) に本フォークの表示と併記して保持しています。
+本プロジェクトは [togatoga/karukan](https://github.com/togatoga/karukan)（MIT OR Apache-2.0）の2026年7月時点のコードを元にしたフォークです。名前を Kashiko に変え、macOS 専用に絞ったうえで、変換・学習・配布の仕組みを大きく作り変えています。karukan の作者とは関係のない非公式のフォークで、不具合や要望は本リポジトリに報告してください。原著作権表示は [LICENSE-MIT](LICENSE-MIT) に本フォークの表示と併記して保持しています。
 
 第三者素材の帰属は [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES) に一覧しています。主なものは記号・絵文字データ（Mozc / BSD 3-Clause）、システム辞書（SudachiDict / Apache-2.0）、ニューラルモデル（jinen-v1/v2シリーズ / CC BY-SA 4.0）です。モデルとシステム辞書はリポジトリに含まれず、ビルド時に取得されます。

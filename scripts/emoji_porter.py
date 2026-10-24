@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Port Mozc + Unicode CLDR emoji data into kashiko-engine/data/emoji.yml.
+"""Port Mozc + Unicode CLDR emoji data into crates/kashiko-engine/data/emoji.yml.
 
 Two upstream sources feed the file:
 
@@ -45,7 +45,7 @@ Usage:
     python3 scripts/emoji_porter.py \
         --mozc /path/to/google/mozc \
         --emoji-test /path/to/emoji-test.txt \
-        --out kashiko-engine/data/emoji.yml
+        --out crates/kashiko-engine/data/emoji.yml
 """
 
 from __future__ import annotations

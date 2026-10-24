@@ -1,10 +1,11 @@
 [workspace]
-members = ["kashiko-engine", "kashiko-cli", "kashiko-im"]
+members = ["crates/kashiko-engine", "crates/kashiko-im", "crates/kashiko-tools"]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
 rust-version = "1.92"
+authors = ["Ryuto42", "togatoga"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Ryuto42/Kashiko-IME"
 homepage = "https://github.com/Ryuto42/Kashiko-IME"
@@ -22,8 +23,8 @@ toml = "0.8"
 thiserror = "2"
 
 # Internal crates
-kashiko-engine = { path = "kashiko-engine" }
-kashiko-im = { path = "kashiko-im" }
+kashiko-engine = { path = "crates/kashiko-engine" }
+kashiko-im = { path = "crates/kashiko-im" }
 
 # Dev dependencies shared
 tempfile = "3"

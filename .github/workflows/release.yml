@@ -1,0 +1,28 @@
+name: Release
+
+# Push a tag `vX.Y.Z` matching CFBundleShortVersionString in
+# macos/Info.plist to build and publish the app.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release assets
+        run: scripts/package-release.sh "${{ github.repository }}" "${{ github.ref_name }}"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            dist/Kashiko-*-macos-arm64.zip \
+            dist/install.sh \
+            dist/SHA256SUMS \
+            --title "Kashiko ${{ github.ref_name }}" --generate-notes

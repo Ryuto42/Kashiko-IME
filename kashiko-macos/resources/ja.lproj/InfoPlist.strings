@@ -1,5 +1,0 @@
-/* 入力ソース・入力モードの表示名(キーはTISInputSourceID)。
-   これが無いと入力メニューにIDがそのまま表示される。 */
-"io.github.ryuto42.inputmethod.Kashiko" = "Kashiko";
-"io.github.ryuto42.inputmethod.Kashiko.Japanese" = "ひらがな（Kashiko）";
-"io.github.ryuto42.inputmethod.Kashiko.Roman" = "英数（Kashiko）";

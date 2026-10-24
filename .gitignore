@@ -15,9 +15,9 @@ target/
 .build/
 build/
 out/
-kashiko-macos/.build/
-kashiko-macos/out/
-kashiko-macos/dist/
+macos/.build/
+/build/
+/dist/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
 *.pbxuser
@@ -81,7 +81,7 @@ secret/
 
 # Except for tracked static data
 data/
-!kashiko-engine/data/
+!crates/kashiko-engine/data/
 
 # Secrets / Environment / Security
 .env
