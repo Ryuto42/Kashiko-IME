@@ -26,7 +26,9 @@ tracing-subscriber.workspace = true
 toml.workspace = true
 
 # llama.cpp bindings for GGUF inference
-llama-cpp-2 = "0.1"
+# Pinned: 0.1.x releases change the API, and every upgrade has to be measured
+# for speed, memory and accuracy before it is taken.
+llama-cpp-2 = "=0.1.135"
 yada = "0.5"
 memmap2 = "0.9"
 
